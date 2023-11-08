@@ -7,9 +7,10 @@ use log::{info, error};
 
 
 use std::convert::TryInto;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::array::TryFromSliceError;
+use crate::model::{SearchKey, SortedMapEntry, SortedMapKey};
 use crate::wal::model::*;
 
 mod model;
@@ -90,6 +91,31 @@ impl<W: Write> WalStorage<W> {
         increment_offset(w_lock.offset.borrow_mut(), &put_action);
 
         key_value.owned_key_value()
+    }
+
+    pub fn store_put_to_map_event(&self, key: Vec<u8>, search_key: SearchKey, element: Vec<u8>) -> (Vec<u8>, SearchKey, Vec<u8>) {
+        let mut w_lock = self.wal_state.write().unwrap();
+
+        let entry = SortedMapEntry::new(key, search_key, element);
+        let put_action = StoredAction::put_to_sorted_map(w_lock.offset.borrow(), &entry);
+
+        write(w_lock.writer.borrow_mut(), &put_action);
+        increment_offset(w_lock.offset.borrow_mut(), &put_action);
+
+        entry.entry()
+    }
+
+    pub fn store_remove_from_sorted_map_event(&self, key: Vec<u8>, search_key: SearchKey) -> (Vec<u8>, SearchKey) {
+        let mut w_lock = self.wal_state.write().unwrap();
+
+        let sorted_map_key = SortedMapKey::new(key, search_key);
+        let put_action = StoredAction::remove_from_sorted_map(w_lock.offset.borrow(), &sorted_map_key);
+
+
+        write(w_lock.writer.borrow_mut(), &put_action);
+        increment_offset(w_lock.offset.borrow_mut(), &put_action);
+
+        sorted_map_key.owned()
     }
 }
 
@@ -178,6 +204,54 @@ pub fn read_for_set(bytes: &[u8]) -> HashMap<Vec<u8>, HashSet<Vec<u8>>> {
                 match result.get_mut(&key) {
                     None => {}
                     Some(hashset) => { hashset.remove(&value); }
+                }
+            }
+            _ => { panic!("not supported action type: {}", stored_action.act_type()) }
+        }
+    }
+    result
+}
+
+pub fn read_for_map(bytes: &[u8]) -> HashMap<Vec<u8>, BTreeMap<SearchKey, Vec<u8>>> {
+    let mut result = HashMap::new();
+    if bytes.is_empty() {
+        return result;
+    }
+    let mut offset = 0;
+
+    while offset < bytes.len() {
+        let stored_action = build_action(&mut offset, bytes);
+
+        let actual_crc = model::crc(stored_action.data());
+        if actual_crc != *stored_action.crc() {
+            panic!("wrong crc !!"); // todo: better error handling
+        }
+
+        match *stored_action.act_type() {
+            DELETE_ACT => {
+                result.remove(stored_action.data());
+            }
+            MAP_PUT_ACT => {
+                let put_action: SortedMapEntry = bincode::deserialize(stored_action.data()).expect("SortedMapEntry should be deserialized");
+                let (key, search_key, element) = put_action.entry();
+
+                match result.get_mut(&key) {
+                    None => {
+                        let mut map = BTreeMap::new();
+                        map.insert(search_key, element);
+                        result.insert(key, map);
+                    }
+                    Some(map) => {
+                        map.insert(search_key, element);
+                    }
+                }
+            }
+            MAP_REMOVE_ACT => {
+                let remove_action: SortedMapKey = bincode::deserialize(stored_action.data()).expect("SortedMapEntry should be deserialized");
+                let (key, search_key) = remove_action.owned();
+                match result.get_mut(&key) {
+                    None => {}
+                    Some(map) => { map.remove(&search_key); }
                 }
             }
             _ => { panic!("not supported action type: {}", stored_action.act_type()) }

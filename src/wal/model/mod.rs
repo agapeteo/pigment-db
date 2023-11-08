@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use crc32fast::Hasher;
+use crate::model::{SortedMapEntry, SortedMapKey};
 
 pub const ACT_TYPE_FIELD_LEN: u8 = 1;
 pub const CRC32_FIELD_LEN: u8 = 4;
@@ -12,6 +13,8 @@ pub const DELETE_ACT: u8 = 0;
 pub const PUT_ACT: u8 = 1;
 pub const SET_APPEND_ACT: u8 = 2;
 pub const SET_REMOVE_ACT: u8 = 3;
+pub const MAP_PUT_ACT: u8 = 4;
+pub const MAP_REMOVE_ACT: u8 = 5;
 
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -82,6 +85,26 @@ impl StoredAction {
     pub fn remove_from_set(offset: &u32, key_value: &KeyValueData) -> Self {
         let act_type = SET_REMOVE_ACT;
         let data = bincode::serialize(&key_value).expect("key_value should be serialized with bincode");
+        let crc = crc(&data);
+        let data_size = data.len() as u32;
+        let start_offset = *offset;
+
+        StoredAction { act_type, crc, data_size, data, start_offset }
+    }
+
+    pub fn put_to_sorted_map(offset: &u32, entry: &SortedMapEntry) -> Self {
+        let act_type = MAP_PUT_ACT;
+        let data = bincode::serialize(&entry).expect("sorted element should be serialized with bincode");
+        let crc = crc(&data);
+        let data_size = data.len() as u32;
+        let start_offset = *offset;
+
+        StoredAction { act_type, crc, data_size, data, start_offset }
+    }
+
+    pub fn remove_from_sorted_map(offset: &u32, search_map_key: &SortedMapKey) -> Self {
+        let act_type = MAP_REMOVE_ACT;
+        let data = bincode::serialize(search_map_key).expect("map entry should be serialized with bincode");
         let crc = crc(&data);
         let data_size = data.len() as u32;
         let start_offset = *offset;

@@ -1,5 +1,6 @@
 pub mod key_value_store;
 pub mod key_set_store;
+mod key_map_store;
 pub mod model;
 mod wal;
 
