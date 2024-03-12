@@ -1,15 +1,15 @@
 use dashmap::DashMap;
-use log::{info};
+use log::info;
 
-use std::path::{Path};
 use std::io::Write;
+use std::path::Path;
 
-use std::fs::File;
 use memmap::MmapOptions;
+use std::fs::File;
 
-use std::collections::HashSet;
-use dashmap::mapref::entry::Entry;
 use crate::wal::WalStorage;
+use dashmap::mapref::entry::Entry;
+use std::collections::HashSet;
 
 const SET_WAL_FILE_NAME: &str = "set.wal.dat";
 const TMP_SET_WAL_FILE_NAME: &str = ".set.wal.dat";
@@ -41,12 +41,18 @@ impl DurableKeySetStore<File> {
 
         if found_set_wal {
             let file = File::open(&tmp_wal_file_path).unwrap();
-            info!("found KeySet WAL file: {}, trying to restore...", &wal_file_path.to_str().unwrap());
+            info!(
+                "found KeySet WAL file: {}, trying to restore...",
+                &wal_file_path.to_str().unwrap()
+            );
 
             let content_as_slice = unsafe { MmapOptions::new().map(&file).unwrap() };
 
             let map = crate::wal::read_for_set(content_as_slice.as_ref());
-            info!("restored map with size: {}, adding new new WAL file", map.len());
+            info!(
+                "restored map with size: {}, adding new new WAL file",
+                map.len()
+            );
 
             for (each_key, set) in map {
                 let mut key = each_key;
@@ -59,9 +65,15 @@ impl DurableKeySetStore<File> {
             info!("{} entries added to store", store.len());
 
             let _ = std::fs::remove_file(tmp_wal_file_path.as_path());
-            info!("removed old wal file {}", tmp_wal_file_path.to_str().unwrap());
+            info!(
+                "removed old wal file {}",
+                tmp_wal_file_path.to_str().unwrap()
+            );
         } else {
-            info!("no previous wal log found, starting from scratch: {}", &wal_file_path.to_str().unwrap());
+            info!(
+                "no previous wal log found, starting from scratch: {}",
+                &wal_file_path.to_str().unwrap()
+            );
         }
 
         DurableKeySetStore { store, wal }
@@ -71,14 +83,17 @@ impl DurableKeySetStore<File> {
 impl DurableKeySetStore<Vec<u8>> {
     #[allow(unused)]
     pub fn new_vec_based() -> Self {
-        DurableKeySetStore { store: DashMap::new(), wal: WalStorage::new_vec_based() }
+        DurableKeySetStore {
+            store: DashMap::new(),
+            wal: WalStorage::new_vec_based(),
+        }
     }
 }
 
 impl<W: Write> DurableKeySetStore<W> {
     pub fn get_hashset(&self, key: &[u8]) -> Option<HashSet<Vec<u8>>> {
         match self.store.get(key) {
-            None => { None }
+            None => None,
             Some(inner_val) => {
                 let found_set = inner_val.value();
                 let mut result = HashSet::with_capacity(found_set.len());
@@ -92,10 +107,8 @@ impl<W: Write> DurableKeySetStore<W> {
 
     pub fn contains_in_set(&self, key: &[u8], set_key: &[u8]) -> bool {
         match self.store.get(key) {
-            None => { false }
-            Some(inner_val) => {
-                inner_val.contains(set_key)
-            }
+            None => false,
+            Some(inner_val) => inner_val.contains(set_key),
         }
     }
 
@@ -133,7 +146,50 @@ impl<W: Write> DurableKeySetStore<W> {
         }
     }
 
-    pub fn remove_from_set_callback(&self, key: Vec<u8>, set_entry: Vec<u8>, key_removed_callback: impl FnOnce(&[u8])) {
+    pub fn compute(&self, key: Vec<u8>, func: impl FnOnce(&mut HashSet<Vec<u8>>)) {
+        let entry = self.store.entry(key);
+        match entry {
+            Entry::Occupied(mut occupied_entry) => {
+                let set = occupied_entry.get_mut();
+                func(set);
+            }
+            Entry::Vacant(vacant_entry) => {
+                let mut set = HashSet::new();
+                func(&mut set);
+                vacant_entry.insert(set);
+            }
+        };
+    }
+
+    pub fn compute_if_present(&self, key: Vec<u8>, func: impl FnOnce(&mut HashSet<Vec<u8>>)) {
+        let entry = self.store.entry(key);
+        match entry {
+            Entry::Occupied(mut occupied_entry) => {
+                let set = occupied_entry.get_mut();
+                func(set);
+            }
+            Entry::Vacant(_) => {}
+        };
+    }
+
+    pub fn compute_if_absent(&self, key: Vec<u8>, func: impl FnOnce(&mut HashSet<Vec<u8>>)) {
+        let entry = self.store.entry(key);
+        match entry {
+            Entry::Occupied(_) => {}
+            Entry::Vacant(vacant_entry) => {
+                let mut set = HashSet::new();
+                func(&mut set);
+                vacant_entry.insert(set);
+            }
+        };
+    }
+
+    pub fn remove_from_set_callback(
+        &self,
+        key: Vec<u8>,
+        set_entry: Vec<u8>,
+        key_removed_callback: impl FnOnce(&[u8]),
+    ) {
         let (key, set_entry) = self.wal.store_remove_from_set_event(key, set_entry);
 
         match self.store.entry(key) {
@@ -151,7 +207,7 @@ impl<W: Write> DurableKeySetStore<W> {
     }
 
     pub fn remove_key(&self, key: &[u8]) {
-        self.wal.store_delete_event(&key);
+        self.wal.store_delete_event(key);
 
         self.store.remove(key);
     }
@@ -162,6 +218,7 @@ impl<W: Write> DurableKeySetStore<W> {
 }
 
 mod tests {
+
     #[test]
     fn simple_test() {
         use super::*;
@@ -190,7 +247,6 @@ mod tests {
         let res_a = store.get_hashset(b"a").unwrap();
         assert_eq!(res_a.contains(&b"article".to_vec()[..]), false);
 
-
         let res_b = store.get_hashset(b"b").unwrap();
         assert_eq!(res_b.len(), 1);
         assert_eq!(res_b.contains(&b"banana".to_vec()[..]), true);
@@ -204,6 +260,66 @@ mod tests {
 
         store.remove_key(b"b");
         assert_eq!(store.size(), 2);
+    }
+
+    #[test]
+    fn test_compute() {
+        let store = crate::key_set_store::DurableKeySetStore::new_vec_based();
+
+        store.compute(vec![0], |set| {
+            set.insert(vec![1]);
+        });
+        store.compute(vec![0], |set| {
+            set.insert(vec![2]);
+        });
+
+        let res_set = store.get_hashset(&[0]).unwrap();
+        assert_eq!(res_set.len(), 2);
+
+        assert_eq!(store.get_hashset(&[1]), None);
+    }
+
+    #[test]
+    fn test_compute_if_present() {
+        let store = crate::key_set_store::DurableKeySetStore::new_vec_based();
+
+        store.compute_if_present(vec![0], |set| {
+            set.insert(vec![1]);
+        });
+        let res_set = store.get_hashset(&[0]);
+        assert_eq!(res_set, None);
+
+        store.append(vec![0], vec![1]);
+
+        store.compute_if_present(vec![0], |set| {
+            set.insert(vec![2]);
+        });
+
+        let res_set = store.get_hashset(&[0]).unwrap();
+        assert_eq!(res_set.len(), 2);
+
+        assert_eq!(store.get_hashset(&[1]), None);
+    }
+
+    #[test]
+    fn test_compute_if_absent() {
+        let store = crate::key_set_store::DurableKeySetStore::new_vec_based();
+        store.append(vec![0], vec![1]);
+
+        store.compute_if_absent(vec![0], |set| {
+            set.insert(vec![1]);
+        });
+        let res_set = store.get_hashset(&[0]).unwrap();
+        assert_eq!(res_set.len(), 1);
+
+        store.compute_if_absent(vec![1], |set| {
+            set.insert(vec![3]);
+        });
+
+        let res_set = store.get_hashset(&[1]).unwrap();
+        assert_eq!(res_set.len(), 1);
+
+        assert_eq!(store.get_hashset(&[2]), None);
     }
 
     #[test]
@@ -225,9 +341,7 @@ mod tests {
         store.remove_from_set(b"a".to_vec(), b"apricote".to_vec());
         assert_eq!(store.size(), 1);
 
-
         store.remove_from_set(b"b".to_vec(), b"banana".to_vec());
         assert_eq!(store.size(), 0);
     }
 }
-

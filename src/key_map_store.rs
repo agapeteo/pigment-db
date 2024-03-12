@@ -1,17 +1,16 @@
 use dashmap::DashMap;
-use log::{info};
+use log::info;
 
-use std::path::{Path};
 use std::io::Write;
+use std::path::Path;
 
-use std::fs::File;
 use memmap::MmapOptions;
+use std::fs::File;
 
-use std::collections::BTreeMap;
-use dashmap::mapref::entry::Entry;
 use crate::model::{Key, SearchKey};
 use crate::wal::WalStorage;
-
+use dashmap::mapref::entry::Entry;
+use std::collections::BTreeMap;
 
 const MAP_WAL_FILE_NAME: &str = "map.wal.dat";
 const TMP_MAP_WAL_FILE_NAME: &str = ".map.wal.dat";
@@ -44,16 +43,23 @@ impl DurableKeyMapStore<File> {
 
         if found_set_wal {
             let file = File::open(&tmp_wal_file_path).unwrap();
-            info!("found KeySet WAL file: {}, trying to restore...", &wal_file_path.to_str().unwrap());
+            info!(
+                "found KeySet WAL file: {}, trying to restore...",
+                &wal_file_path.to_str().unwrap()
+            );
 
             let content_as_slice = unsafe { MmapOptions::new().map(&file).unwrap() };
 
             let map = crate::wal::read_for_map(content_as_slice.as_ref());
-            info!("restored map with size: {}, adding new new WAL file", map.len());
+            info!(
+                "restored map with size: {}, adding new new WAL file",
+                map.len()
+            );
 
             for (each_key, entry_map) in map {
                 for (search_key, element) in entry_map {
-                    let (key, search_key, element) = wal.store_put_to_map_event(each_key.clone(), search_key, element);
+                    let (key, search_key, element) =
+                        wal.store_put_to_map_event(each_key.clone(), search_key, element);
                     match store.entry(each_key.clone()) {
                         Entry::Occupied(mut entry) => {
                             let found_map: &mut BTreeMap<SearchKey, Vec<u8>> = entry.get_mut();
@@ -70,9 +76,15 @@ impl DurableKeyMapStore<File> {
             info!("{} entries added to store", store.len());
 
             let _ = std::fs::remove_file(tmp_wal_file_path.as_path());
-            info!("removed old wal file {}", tmp_wal_file_path.to_str().unwrap());
+            info!(
+                "removed old wal file {}",
+                tmp_wal_file_path.to_str().unwrap()
+            );
         } else {
-            info!("no previous wal log found, starting from scratch: {}", &wal_file_path.to_str().unwrap());
+            info!(
+                "no previous wal log found, starting from scratch: {}",
+                &wal_file_path.to_str().unwrap()
+            );
         }
 
         DurableKeyMapStore { store, wal }
@@ -82,7 +94,10 @@ impl DurableKeyMapStore<File> {
 impl DurableKeyMapStore<Vec<u8>> {
     #[allow(unused)]
     pub fn new_vec_based() -> Self {
-        DurableKeyMapStore { store: DashMap::new(), wal: WalStorage::new_vec_based() }
+        DurableKeyMapStore {
+            store: DashMap::new(),
+            wal: WalStorage::new_vec_based(),
+        }
     }
 }
 
@@ -90,7 +105,7 @@ impl DurableKeyMapStore<Vec<u8>> {
 impl<W: Write> DurableKeyMapStore<W> {
     pub fn get_sorted_map(&self, key: &[u8]) -> Option<BTreeMap<SearchKey, Vec<u8>>> {
         match self.store.get(key) {
-            None => { None }
+            None => None,
             Some(inner_val) => {
                 let found = inner_val.value();
                 let mut map = BTreeMap::new();
@@ -104,19 +119,15 @@ impl<W: Write> DurableKeyMapStore<W> {
 
     pub fn get_element(&self, key: &[u8], search_key: &SearchKey) -> Option<Vec<u8>> {
         match self.store.get(key) {
-            None => { None }
-            Some(inner_val) => {
-                inner_val.value().get(search_key).cloned()
-            }
+            None => None,
+            Some(inner_val) => inner_val.value().get(search_key).cloned(),
         }
     }
 
     pub fn contains_in_map(&self, key: &[u8], search_key: &SearchKey) -> bool {
         match self.store.get(key) {
-            None => { false }
-            Some(inner_val) => {
-                inner_val.value().contains_key(search_key)
-            }
+            None => false,
+            Some(inner_val) => inner_val.value().contains_key(search_key),
         }
     }
 
@@ -139,22 +150,37 @@ impl<W: Write> DurableKeyMapStore<W> {
         self.store.contains_key(key)
     }
 
-    pub fn remove_from_sorted_map(&self, key: Vec<u8>, search_key: SearchKey) {
+    pub fn contains_search_key(&self, key: &[u8], search_key: &SearchKey) -> bool {
+        if let Some(entry) = self.store.get(key) {
+            if entry.value().contains_key(search_key) {
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn remove_from_sorted_map(&self, key: Vec<u8>, search_key: SearchKey) -> Option<Vec<u8>> {
         let (key, search_key) = self.wal.store_remove_from_sorted_map_event(key, search_key);
 
         match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
-                entry.get_mut().remove(&search_key);
+                let old_value = entry.get_mut().remove(&search_key);
                 if entry.get().is_empty() {
                     self.wal.store_delete_event(entry.key());
                     entry.remove();
                 }
+                old_value
             }
-            Entry::Vacant(_) => {}
+            Entry::Vacant(_) => None,
         }
     }
 
-    pub fn remove_from_sorted_map_callback(&self, key: Vec<u8>, search_key: SearchKey, key_removed_callback: impl FnOnce(&SearchKey)) {
+    pub fn remove_from_sorted_map_callback(
+        &self,
+        key: Vec<u8>,
+        search_key: SearchKey,
+        key_removed_callback: impl FnOnce(&SearchKey),
+    ) {
         let (key, search_key) = self.wal.store_remove_from_sorted_map_event(key, search_key);
 
         match self.store.entry(key) {
@@ -185,24 +211,32 @@ impl<W: Write> DurableKeyMapStore<W> {
         self.store.get(key).map(|v| v.value().len())
     }
 
-    pub fn range(&self, key: &[u8], range: std::ops::Range<SearchKey>) -> Option<Vec<Vec<u8>>> {
+    pub fn range_entries(
+        &self,
+        key: &[u8],
+        bound_start: std::ops::Bound<SearchKey>,
+        bound_end: std::ops::Bound<SearchKey>,
+    ) -> Option<Vec<(SearchKey, Vec<u8>)>> {
         self.store.get(key).map(|v| {
-           v.value().range(range).map(|(_k, v)| v.clone()).collect()
+            v.value()
+                .range((bound_start, bound_end))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
         })
     }
 
-   pub fn first(&self, key: &[u8]) -> Option<(SearchKey, Vec<u8>)> {
-       match self.store.get(key) {
-           Some(found) => {
-               if let Some((k, v)) = found.value().first_key_value() {
-                   Some((k.clone(), v.clone()))
-               } else {
-                   None
-               }
-           }
-           None => None
-       }
-   }
+    pub fn first(&self, key: &[u8]) -> Option<(SearchKey, Vec<u8>)> {
+        match self.store.get(key) {
+            Some(found) => {
+                if let Some((k, v)) = found.value().first_key_value() {
+                    Some((k.clone(), v.clone()))
+                } else {
+                    None
+                }
+            }
+            None => None,
+        }
+    }
 
     pub fn last(&self, key: &[u8]) -> Option<(SearchKey, Vec<u8>)> {
         match self.store.get(key) {
@@ -213,7 +247,7 @@ impl<W: Write> DurableKeyMapStore<W> {
                     None
                 }
             }
-            None => None
+            None => None,
         }
     }
 
@@ -221,7 +255,8 @@ impl<W: Write> DurableKeyMapStore<W> {
         match self.store.entry(key.clone()) {
             Entry::Occupied(mut entry) => {
                 let result = if let Some((search_key, _element)) = entry.get_mut().pop_first() {
-                    let (element, search_key) = self.wal.store_remove_from_sorted_map_event(key, search_key);
+                    let (element, search_key) =
+                        self.wal.store_remove_from_sorted_map_event(key, search_key);
                     Some((search_key, element))
                 } else {
                     None
@@ -232,15 +267,16 @@ impl<W: Write> DurableKeyMapStore<W> {
                 }
                 result
             }
-            Entry::Vacant(_) => None
+            Entry::Vacant(_) => None,
         }
     }
 
-    pub fn pop_last(&self, key: Vec<u8>) -> Option<(SearchKey, Vec<u8>)>  {
+    pub fn pop_last(&self, key: Vec<u8>) -> Option<(SearchKey, Vec<u8>)> {
         match self.store.entry(key.clone()) {
             Entry::Occupied(mut entry) => {
                 let result = if let Some((search_key, _element)) = entry.get_mut().pop_last() {
-                    let (element, search_key) = self.wal.store_remove_from_sorted_map_event(key, search_key);
+                    let (element, search_key) =
+                        self.wal.store_remove_from_sorted_map_event(key, search_key);
                     Some((search_key, element))
                 } else {
                     None
@@ -251,7 +287,7 @@ impl<W: Write> DurableKeyMapStore<W> {
                 }
                 result
             }
-            Entry::Vacant(_) => None
+            Entry::Vacant(_) => None,
         }
     }
 
@@ -271,27 +307,75 @@ impl<W: Write> DurableKeyMapStore<W> {
                         0
                     }
                 };
-                let (_key, search_key, element) = self.wal.store_put_to_map_event(key, cur_num.into(), element);
+                let (_key, search_key, element) =
+                    self.wal
+                        .store_put_to_map_event(key, cur_num.into(), element);
                 map.insert(search_key, element);
             }
             Entry::Vacant(entry) => {
                 let mut map: BTreeMap<SearchKey, Vec<u8>> = BTreeMap::new();
-                let (_key, search_key, element) = self.wal.store_put_to_map_event(key, 0.into(), element);
+                let (_key, search_key, element) =
+                    self.wal.store_put_to_map_event(key, 0.into(), element);
                 map.insert(search_key, element);
                 entry.insert(map);
             }
         }
     }
 
+    pub fn compute(&self, key: Vec<u8>, func: impl FnOnce(&mut BTreeMap<SearchKey, Vec<u8>>)) {
+        let entry = self.store.entry(key);
+        match entry {
+            Entry::Occupied(mut occupied_entry) => {
+                let map = occupied_entry.get_mut();
+                func(map);
+            }
+            Entry::Vacant(vacant_entry) => {
+                let mut map = BTreeMap::new();
+                func(&mut map);
+                vacant_entry.insert(map);
+            }
+        };
+    }
+
+    pub fn compute_if_present(
+        &self,
+        key: Vec<u8>,
+        func: impl FnOnce(&mut BTreeMap<SearchKey, Vec<u8>>),
+    ) {
+        let entry = self.store.entry(key);
+        match entry {
+            Entry::Occupied(mut occupied_entry) => {
+                let map = occupied_entry.get_mut();
+                func(map);
+            }
+            Entry::Vacant(_) => {}
+        };
+    }
+
+    pub fn compute_if_absent(
+        &self,
+        key: Vec<u8>,
+        func: impl FnOnce(&mut BTreeMap<SearchKey, Vec<u8>>),
+    ) {
+        let entry = self.store.entry(key);
+        match entry {
+            Entry::Occupied(_) => {}
+            Entry::Vacant(vacant_entry) => {
+                let mut map = BTreeMap::new();
+                func(&mut map);
+                vacant_entry.insert(map);
+            }
+        };
+    }
 }
 
+#[cfg(test)]
 mod tests {
 
-    use std::collections::BTreeMap;
     use crate::model::SearchKey;
+    use std::collections::BTreeMap;
 
     use super::DurableKeyMapStore;
-
 
     #[test]
     fn simple_test() {
@@ -310,13 +394,31 @@ mod tests {
         store.put(key_2.clone(), 1.into(), "A".as_bytes().to_vec());
         store.put(key_2.clone(), 2.into(), "B".as_bytes().to_vec());
 
-        assert_eq!(store.get_element(&key_1, &2.into()), Some("b".as_bytes().to_vec()));
-        assert_eq!(store.get_element(&key_1, &3.into()), Some("c_".as_bytes().to_vec()));
-        assert_eq!(store.get_element(&key_1, &1.into()), Some("a".as_bytes().to_vec()));
+        assert_eq!(
+            store.get_element(&key_1, &2.into()),
+            Some("b".as_bytes().to_vec())
+        );
+        assert_eq!(
+            store.get_element(&key_1, &3.into()),
+            Some("c_".as_bytes().to_vec())
+        );
+        assert_eq!(
+            store.get_element(&key_1, &1.into()),
+            Some("a".as_bytes().to_vec())
+        );
 
-        assert_eq!(store.get_element(&key_2, &2.into()), Some("B".as_bytes().to_vec()));
-        assert_eq!(store.get_element(&key_2, &3.into()), Some("C".as_bytes().to_vec()));
-        assert_eq!(store.get_element(&key_2, &1.into()), Some("A".as_bytes().to_vec()));
+        assert_eq!(
+            store.get_element(&key_2, &2.into()),
+            Some("B".as_bytes().to_vec())
+        );
+        assert_eq!(
+            store.get_element(&key_2, &3.into()),
+            Some("C".as_bytes().to_vec())
+        );
+        assert_eq!(
+            store.get_element(&key_2, &1.into()),
+            Some("A".as_bytes().to_vec())
+        );
 
         store.remove_from_sorted_map(key_1.clone(), 1.into());
         assert_eq!(store.get_element(&key_1, &1.into()), None);
@@ -364,7 +466,7 @@ mod tests {
 
         let start: SearchKey = 2.into();
         let end: SearchKey = 5.into();
-            
+
         for (key, str) in map.range(start..end) {
             println!("{:?} -> {}", key, str);
         }
@@ -375,10 +477,8 @@ mod tests {
         let store = DurableKeyMapStore::new_vec_based();
         let key: Vec<u8> = vec![0];
 
-        
         (0..10).for_each(|i| {
             store.append_ordered_element(key.clone(), format!("{}", i).into_bytes());
-
         });
 
         let map = store.get_sorted_map(&key).unwrap();
@@ -386,8 +486,5 @@ mod tests {
         for (k, v) in map {
             println!("{:?} -> {}", k, String::from_utf8_lossy(v.as_slice()));
         }
-
-
     }
 }
-
