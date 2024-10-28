@@ -211,6 +211,37 @@ impl<W: Write> DurableKeyMapStore<W> {
         self.store.get(key).map(|v| v.value().len())
     }
 
+    pub fn range_search_keys_filtered<P>(
+        &self,
+        key: &[u8],
+        bound_start: std::ops::Bound<SearchKey>,
+        bound_end: std::ops::Bound<SearchKey>,
+        predicate: P,
+    ) -> Option<Vec<SearchKey>>
+        where P: FnMut(&SearchKey) -> bool {
+        self.store.get(key).map(|v| {
+            v.value()
+                .range((bound_start, bound_end))
+                .map(|(k, v)| k.clone())
+                .filter(predicate)
+                .collect()
+        })
+    }
+
+    pub fn range_search_keys (
+        &self,
+        key: &[u8],
+        bound_start: std::ops::Bound<SearchKey>,
+        bound_end: std::ops::Bound<SearchKey>,
+    ) -> Option<Vec<SearchKey>> {
+        self.store.get(key).map(|v| {
+            v.value()
+                .range((bound_start, bound_end))
+                .map(|(k, v)| k.clone())
+                .collect()
+        })
+    }
+
     pub fn range_entries(
         &self,
         key: &[u8],
@@ -221,6 +252,23 @@ impl<W: Write> DurableKeyMapStore<W> {
             v.value()
                 .range((bound_start, bound_end))
                 .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+    }
+
+    pub fn range_entries_filtered<P>(
+        &self,
+        key: &[u8],
+        bound_start: std::ops::Bound<SearchKey>,
+        bound_end: std::ops::Bound<SearchKey>,
+        predicate: P,
+    ) -> Option<Vec<(SearchKey, Vec<u8>)>>
+        where P: FnMut(&(SearchKey, Vec<u8>)) -> bool {
+        self.store.get(key).map(|v| {
+            v.value()
+                .range((bound_start, bound_end))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .filter(predicate)
                 .collect()
         })
     }
@@ -371,7 +419,6 @@ impl<W: Write> DurableKeyMapStore<W> {
 
 #[cfg(test)]
 mod tests {
-
     use crate::model::SearchKey;
     use std::collections::BTreeMap;
 

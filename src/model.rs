@@ -62,6 +62,10 @@ impl SearchKey {
     pub fn into_key_vec(self) -> Vec<Key> {
         self.0
     }
+    
+    pub fn slice(&self) -> &[Key] {
+        self.0.as_slice()
+    }
 }
 
 impl From<usize> for SearchKey {
@@ -91,6 +95,12 @@ impl From<&[u8]> for SearchKey {
 impl From<Vec<Key>> for SearchKey {
     fn from(value: Vec<Key>) -> Self {
         Self(value)
+    }
+}
+
+impl From<&[Key]> for SearchKey {
+    fn from(value: &[Key]) -> Self {
+        Self(Vec::from(value))
     }
 }
 
