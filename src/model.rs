@@ -68,6 +68,54 @@ impl SearchKey {
     }
 }
 
+pub trait BytesLen {
+    fn bytes_len(&self) -> usize;
+}
+impl BytesLen for SearchKey {
+    fn bytes_len(&self) -> usize {
+        self.0.iter().map(|k| k.bytes_len()).sum()
+    }
+}
+impl BytesLen for Vec<u8> {
+    fn bytes_len(&self) -> usize {
+        self.len()
+    }
+}
+
+impl BytesLen for String {
+    fn bytes_len(&self) -> usize {
+        self.len()
+    }
+}
+
+impl BytesLen for &'static str {
+    fn bytes_len(&self) -> usize {
+        self.len()
+    }
+}
+
+impl BytesLen for Key {
+    fn bytes_len(&self) -> usize {
+        match &self {
+            Key::Bool(_) => 1,
+            Key::I(_) => 1,
+            Key::U8(_) => 1,
+            Key::I16(_) => 2,
+            Key::U16(_) => 2,
+            Key::I32(_) => 4,
+            Key::U32(_) => 4,
+            Key::I64(_) => 8,
+            Key::U64(_) => 8,
+            Key::USIZE(_) => (usize::BITS / 8) as usize,
+            Key::I128(_) => 16,
+            Key::U128(_) => 16,
+            Key::Char(_) => 4,
+            Key::Str(str) => str.bytes_len(),
+            Key::Bytes(bytes) => bytes.len()
+        }
+    }
+}
+
 impl From<usize> for SearchKey {
     fn from(value: usize) -> Self {
         Self(vec![Key::USIZE(value)])
