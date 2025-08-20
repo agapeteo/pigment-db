@@ -161,6 +161,20 @@ impl<W: Write> DurableKeySetStore<W> {
         };
     }
 
+    pub async fn compute_async(&self, key: Vec<u8>, func: impl AsyncFnOnce(&mut HashSet<Vec<u8>>)) {
+        let entry = self.store.entry(key);
+        match entry {
+            Entry::Occupied(mut occupied_entry) => {
+                let set = occupied_entry.get_mut();
+                func(set).await;
+            }
+            Entry::Vacant(vacant_entry) => {
+                let mut set = HashSet::new();
+                func(&mut set).await;
+                vacant_entry.insert(set);
+            }
+        };
+    }
     pub fn compute_if_present(&self, key: Vec<u8>, func: impl FnOnce(&mut HashSet<Vec<u8>>)) {
         let entry = self.store.entry(key);
         match entry {
