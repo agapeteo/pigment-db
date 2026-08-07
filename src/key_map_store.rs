@@ -609,7 +609,7 @@ impl<W: Write> DurableKeyMapStore<W> {
             .unwrap_or_else(|error| panic!("WAL map pop-first rejected: {error}"))
     }
 
-    /// Persists removal of the first ordered entry before returning its result.
+    /// Persists removal of the first ordered entry, then returns its search key and value.
     pub fn try_pop_first(&self, key: Vec<u8>) -> std::io::Result<Option<(SearchKey, Vec<u8>)>> {
         self.try_pop_first_core(key)
     }
@@ -624,7 +624,6 @@ impl<W: Write> DurableKeyMapStore<W> {
                 else {
                     return Ok(None);
                 };
-                let returned_element = entry.key().clone();
                 let removes_final_entry = entry.get().len() == 1;
                 #[cfg(test)]
                 self.mutation_observer
@@ -640,20 +639,28 @@ impl<W: Write> DurableKeyMapStore<W> {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
-                if removes_final_entry {
+                let removed_value = if removes_final_entry {
                     #[cfg(test)]
                     let published_key = entry.key().clone();
-                    entry.remove();
+                    let mut removed_map = entry.remove();
+                    let removed_value = removed_map
+                        .remove(&search_key)
+                        .expect("selected first entry must remain guarded until publication");
                     #[cfg(test)]
                     self.mutation_observer
                         .notify(&published_key, MutationPhase::Published);
+                    removed_value
                 } else {
-                    entry.get_mut().remove(&search_key);
+                    let removed_value = entry
+                        .get_mut()
+                        .remove(&search_key)
+                        .expect("selected first entry must remain guarded until publication");
                     #[cfg(test)]
                     self.mutation_observer
                         .notify(entry.key(), MutationPhase::Published);
-                }
-                Ok(Some((search_key, returned_element)))
+                    removed_value
+                };
+                Ok(Some((search_key, removed_value)))
             }
             Entry::Vacant(_) => Ok(None),
         }
@@ -664,7 +671,7 @@ impl<W: Write> DurableKeyMapStore<W> {
             .unwrap_or_else(|error| panic!("WAL map pop-last rejected: {error}"))
     }
 
-    /// Persists removal of the last ordered entry before returning its result.
+    /// Persists removal of the last ordered entry, then returns its search key and value.
     pub fn try_pop_last(&self, key: Vec<u8>) -> std::io::Result<Option<(SearchKey, Vec<u8>)>> {
         self.try_pop_last_core(key)
     }
@@ -679,7 +686,6 @@ impl<W: Write> DurableKeyMapStore<W> {
                 else {
                     return Ok(None);
                 };
-                let returned_element = entry.key().clone();
                 let removes_final_entry = entry.get().len() == 1;
                 #[cfg(test)]
                 self.mutation_observer
@@ -695,20 +701,28 @@ impl<W: Write> DurableKeyMapStore<W> {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
-                if removes_final_entry {
+                let removed_value = if removes_final_entry {
                     #[cfg(test)]
                     let published_key = entry.key().clone();
-                    entry.remove();
+                    let mut removed_map = entry.remove();
+                    let removed_value = removed_map
+                        .remove(&search_key)
+                        .expect("selected last entry must remain guarded until publication");
                     #[cfg(test)]
                     self.mutation_observer
                         .notify(&published_key, MutationPhase::Published);
+                    removed_value
                 } else {
-                    entry.get_mut().remove(&search_key);
+                    let removed_value = entry
+                        .get_mut()
+                        .remove(&search_key)
+                        .expect("selected last entry must remain guarded until publication");
                     #[cfg(test)]
                     self.mutation_observer
                         .notify(entry.key(), MutationPhase::Published);
-                }
-                Ok(Some((search_key, returned_element)))
+                    removed_value
+                };
+                Ok(Some((search_key, removed_value)))
             }
             Entry::Vacant(_) => Ok(None),
         }
