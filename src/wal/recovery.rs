@@ -1,11 +1,18 @@
 //! Crash-safe WAL artifact classification and publication.
 
+use std::error::Error;
+use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Mutex;
 
+use crate::config::DurabilityPolicy;
+use crate::durability::{
+    preflight_directory, preflight_file, preflight_file_handle, synchronize_directory,
+    validate_compile_target,
+};
 use crate::wal::format::{HeaderProbeClassification, V1CodecProbe};
 use crate::wal::replay::{CheckedFrames, ReplaySnapshot, TailReplay, ValidationError};
 use crate::wal::WalStorage;
@@ -524,6 +531,7 @@ pub(crate) fn handoff_fresh_handle(
 pub(crate) fn initialize_fresh_v1(
     paths: &ArtifactPaths,
     header: &[u8; V1CodecProbe::HEADER_LEN],
+    durability_policy: DurabilityPolicy,
 ) -> Result<WalStorage<std::fs::File>, RecoveryError> {
     let mut registry = FreshCleanupRegistry::default();
     let staging = create_fresh_staging(paths, &mut registry)?;
@@ -535,12 +543,35 @@ pub(crate) fn initialize_fresh_v1(
         readback_fresh_header(staging, false, &mut registry).map_err(fresh_publication_error)?;
     let staging = validate_fresh_header(staging, &persisted, header, &mut registry)
         .map_err(fresh_publication_error)?;
-    let staging =
-        sync_fresh_header(staging, false, &mut registry).map_err(fresh_publication_error)?;
+    let staging = if durability_policy == DurabilityPolicy::Physical {
+        if let Err(mut source) = preflight_file_handle(&staging, &paths.staging) {
+            drop(staging);
+            let cleanup_failed = registry.cleanup().is_err();
+            if cleanup_failed {
+                log::warn!(
+                    "failed to remove non-authoritative staging after content preflight failure: {}",
+                    paths.staging.display()
+                );
+                source = diagnose_staging_cleanup_failure(source, &paths.staging);
+            }
+            return Err(RecoveryError::UnsupportedDurability { source });
+        }
+        staging
+    } else {
+        sync_fresh_header(staging, false, &mut registry).map_err(fresh_publication_error)?
+    };
     let staging =
         prepare_fresh_append(staging, false, &mut registry).map_err(fresh_publication_error)?;
     let published = publish_fresh_header(staging, paths, false, &mut registry)
         .map_err(fresh_publication_error)?;
+    if durability_policy == DurabilityPolicy::Physical {
+        let parent = paths
+            .active
+            .parent()
+            .expect("WAL artifact must have a parent directory");
+        synchronize_directory(parent)
+            .map_err(|source| io_failure(RecoveryOperation::Publish, parent, source))?;
+    }
     let handle = match handoff_fresh_handle(published) {
         Ok(handle) => handle,
         Err(_) => unreachable!("prepared fresh handle handoff is infallible"),
@@ -553,6 +584,56 @@ pub(crate) fn initialize_fresh_v1(
         granularity_nanos,
         base_bucket,
     ))
+}
+
+#[derive(Debug)]
+struct StagingCleanupDiagnostic {
+    preflight: io::Error,
+    staging: PathBuf,
+}
+
+impl fmt::Display for StagingCleanupDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{}; cleanup failed for non-authoritative staging {}",
+            self.preflight,
+            self.staging.display()
+        )
+    }
+}
+
+impl Error for StagingCleanupDiagnostic {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.preflight)
+    }
+}
+
+fn diagnose_staging_cleanup_failure(
+    error: crate::durability::DurabilitySupportError,
+    staging: &Path,
+) -> crate::durability::DurabilitySupportError {
+    match error {
+        crate::durability::DurabilitySupportError::RequiredBarrierUnavailable {
+            operation,
+            path,
+            source,
+        } => {
+            let kind = source.kind();
+            crate::durability::DurabilitySupportError::RequiredBarrierUnavailable {
+                operation,
+                path,
+                source: io::Error::new(
+                    kind,
+                    StagingCleanupDiagnostic {
+                        preflight: source,
+                        staging: staging.to_path_buf(),
+                    },
+                ),
+            }
+        }
+        other => other,
+    }
 }
 
 pub(crate) fn encode_key_value_repair_snapshot(
@@ -909,12 +990,33 @@ pub(crate) enum RepairAuthority<'a> {
     Recovery { obsolete_active: Option<&'a [u8]> },
 }
 
+#[cfg(test)]
 pub(crate) fn publish_validated_repair(
     paths: &ArtifactPaths,
     authority: RepairAuthority<'_>,
     replacement: &[u8],
     validate: impl Fn(&[u8]) -> bool,
 ) -> Result<CompletedRepairHandle, RecoveryError> {
+    publish_validated_repair_with_policy(
+        paths,
+        authority,
+        replacement,
+        validate,
+        DurabilityPolicy::Buffered,
+    )
+}
+
+pub(crate) fn publish_validated_repair_with_policy(
+    paths: &ArtifactPaths,
+    authority: RepairAuthority<'_>,
+    replacement: &[u8],
+    validate: impl Fn(&[u8]) -> bool,
+    durability_policy: DurabilityPolicy,
+) -> Result<CompletedRepairHandle, RecoveryError> {
+    let parent = paths
+        .active
+        .parent()
+        .expect("WAL artifact must have a parent directory");
     let staging = create_repair_staging(paths).map_err(repair_publication_error)?;
     let staging = write_repair_snapshot_prefix(staging, replacement, replacement.len(), paths)
         .map_err(repair_publication_error)?;
@@ -944,6 +1046,10 @@ pub(crate) fn publish_validated_repair(
             }
             fs::rename(&paths.active, &paths.legacy)
                 .map_err(|source| io_failure(RecoveryOperation::Publish, &paths.legacy, source))?;
+            if durability_policy == DurabilityPolicy::Physical {
+                synchronize_directory(parent)
+                    .map_err(|source| io_failure(RecoveryOperation::Publish, parent, source))?;
+            }
         }
         RepairAuthority::Recovery { obsolete_active } => {
             if paths.active.exists() {
@@ -961,9 +1067,47 @@ pub(crate) fn publish_validated_repair(
 
     let expected_len =
         publish_repair_snapshot(staging, paths, false).map_err(repair_publication_error)?;
+    if durability_policy == DurabilityPolicy::Physical {
+        synchronize_directory(parent)
+            .map_err(|source| io_failure(RecoveryOperation::Publish, parent, source))?;
+    }
     let validated =
         reopen_repair_snapshot(paths, expected_len, &validate).map_err(repair_publication_error)?;
-    cleanup_after_validated_repair(validated, paths, false).map_err(repair_publication_error)
+    if durability_policy == DurabilityPolicy::Buffered {
+        return cleanup_after_validated_repair(validated, paths, false)
+            .map_err(repair_publication_error);
+    }
+
+    let cleanup_deferred = if paths.legacy.exists() {
+        match remove_obsolete(&paths.legacy) {
+            Err(error) => {
+                log::warn!(
+                    "deferred stale WAL recovery cleanup for {}: {}",
+                    paths.legacy.display(),
+                    error
+                );
+                true
+            }
+            Ok(()) => match synchronize_directory(parent) {
+                Ok(()) => false,
+                Err(error) => {
+                    log::warn!(
+                        "WAL recovery cleanup is durable-indeterminate for {}: {}",
+                        paths.legacy.display(),
+                        error
+                    );
+                    true
+                }
+            },
+        }
+    } else {
+        false
+    };
+    Ok(CompletedRepairHandle {
+        handle: validated.handle,
+        status: RecoveryStatus::Recovered,
+        cleanup_deferred,
+    })
 }
 
 fn repair_publication_error(failure: RepairPublicationFailure) -> RecoveryError {
@@ -1031,11 +1175,16 @@ pub(crate) fn artifact_exists(path: &Path) -> Result<bool, RecoveryError> {
 }
 
 #[cfg(test)]
-static CLEANUP_FAULT: Mutex<Option<PathBuf>> = Mutex::new(None);
+static CLEANUP_FAULTS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 pub(crate) fn remove_obsolete(path: &Path) -> io::Result<()> {
     #[cfg(test)]
-    if CLEANUP_FAULT.lock().unwrap().as_deref() == Some(path) {
+    if CLEANUP_FAULTS
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|fault| fault == path)
+    {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "injected cleanup failure",
@@ -1045,19 +1194,24 @@ pub(crate) fn remove_obsolete(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(test)]
-pub(crate) struct CleanupFaultGuard;
+pub(crate) struct CleanupFaultGuard(PathBuf);
 
 #[cfg(test)]
 impl Drop for CleanupFaultGuard {
     fn drop(&mut self) {
-        *CLEANUP_FAULT.lock().unwrap() = None;
+        let mut faults = CLEANUP_FAULTS.lock().unwrap();
+        let index = faults
+            .iter()
+            .position(|fault| fault == &self.0)
+            .expect("registered cleanup fault must remain until its guard drops");
+        faults.swap_remove(index);
     }
 }
 
 #[cfg(test)]
 pub(crate) fn fail_cleanup_for(path: PathBuf) -> CleanupFaultGuard {
-    *CLEANUP_FAULT.lock().unwrap() = Some(path);
-    CleanupFaultGuard
+    CLEANUP_FAULTS.lock().unwrap().push(path.clone());
+    CleanupFaultGuard(path)
 }
 
 pub(crate) fn publish_replacement(
@@ -1160,6 +1314,7 @@ pub(crate) struct InitializedWal<S> {
     pub(crate) status: RecoveryStatus,
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn initialize_snapshot<S: Clone + Eq + Default>(
     paths: &ArtifactPaths,
@@ -1172,6 +1327,37 @@ pub(crate) fn initialize_snapshot<S: Clone + Eq + Default>(
     fresh_header: Option<[u8; V1CodecProbe::HEADER_LEN]>,
     requested_granularity_nanos: Option<u64>,
 ) -> Result<InitializedWal<S>, RecoveryError> {
+    initialize_snapshot_with_policy(
+        paths,
+        replay,
+        replay_tail,
+        replay_against,
+        encode,
+        encode_repair,
+        is_proper_snapshot_prefix,
+        fresh_header,
+        requested_granularity_nanos,
+        DurabilityPolicy::Buffered,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn initialize_snapshot_with_policy<S: Clone + Eq + Default>(
+    paths: &ArtifactPaths,
+    replay: fn(&[u8]) -> Result<ReplaySnapshot<S>, ValidationError>,
+    replay_tail: fn(&[u8]) -> TailReplay<S>,
+    replay_against: fn(&[u8], &S) -> Result<ReplaySnapshot<S>, ValidationError>,
+    encode: fn(&S) -> Vec<u8>,
+    encode_repair: fn(&S, &[u8; V1CodecProbe::HEADER_LEN]) -> Vec<u8>,
+    is_proper_snapshot_prefix: fn(&S, &S) -> bool,
+    fresh_header: Option<[u8; V1CodecProbe::HEADER_LEN]>,
+    requested_granularity_nanos: Option<u64>,
+    durability_policy: DurabilityPolicy,
+) -> Result<InitializedWal<S>, RecoveryError> {
+    if durability_policy == DurabilityPolicy::Physical {
+        validate_compile_target()
+            .map_err(|source| RecoveryError::UnsupportedDurability { source })?;
+    }
     let active_exists = artifact_exists(&paths.active)?;
     let legacy_exists = artifact_exists(&paths.legacy)?;
     let had_staging = artifact_exists(&paths.staging)?;
@@ -1315,6 +1501,24 @@ pub(crate) fn initialize_snapshot<S: Clone + Eq + Default>(
         }
     };
 
+    if durability_policy == DurabilityPolicy::Physical {
+        let parent = paths
+            .active
+            .parent()
+            .expect("WAL artifact must have a parent directory");
+        preflight_directory(parent)
+            .map_err(|source| RecoveryError::UnsupportedDurability { source })?;
+        let selected_path = match &selected {
+            Selected::Empty(_) => None,
+            Selected::Active(_) | Selected::ActiveTail { .. } => Some(&paths.active),
+            Selected::Legacy(_) => Some(&paths.legacy),
+        };
+        if let Some(path) = selected_path {
+            preflight_file(path)
+                .map_err(|source| RecoveryError::UnsupportedDurability { source })?;
+        }
+    }
+
     let status = if legacy_exists || had_staging {
         RecoveryStatus::Recovered
     } else {
@@ -1336,14 +1540,14 @@ pub(crate) fn initialize_snapshot<S: Clone + Eq + Default>(
         true
     };
 
-    match selected {
+    let initialized = match selected {
         Selected::Empty(snapshot) => {
             let wal = match fresh_header {
                 Some(header) => {
                     let granularity = requested_granularity_nanos
                         .unwrap_or_else(|| V1CodecProbe::granularity(&header).unwrap());
                     let header = header_with_granularity_and_base_bucket(header, granularity, 0);
-                    initialize_fresh_v1(paths, &header)?
+                    initialize_fresh_v1(paths, &header, durability_policy)?
                 }
                 None => WalStorage::try_new_file_based(&paths.active).map_err(|source| {
                     io_failure(RecoveryOperation::CreateStaging, &paths.active, source)
@@ -1375,13 +1579,14 @@ pub(crate) fn initialize_snapshot<S: Clone + Eq + Default>(
                 .to_vec();
             replacement[..V1CodecProbe::HEADER_LEN].copy_from_slice(&repair_header);
             let expected_bytes = replacement.clone();
-            let completed = publish_validated_repair(
+            let completed = publish_validated_repair_with_policy(
                 paths,
                 RepairAuthority::Active {
                     obsolete_recovery: legacy_bytes.as_deref(),
                 },
                 &replacement,
                 |persisted| persisted == expected_bytes,
+                durability_policy,
             )?;
             let offset =
                 u32::try_from(replacement.len()).map_err(|_| RecoveryError::InvalidArtifact {
@@ -1415,7 +1620,7 @@ pub(crate) fn initialize_snapshot<S: Clone + Eq + Default>(
                 let replacement = encode_repair(&active.snapshot, &replacement_header);
                 let expected = active.snapshot.clone();
                 let expected_last_bucket = active.last_bucket;
-                let completed = publish_validated_repair(
+                let completed = publish_validated_repair_with_policy(
                     paths,
                     RepairAuthority::Active {
                         obsolete_recovery: legacy_bytes.as_deref(),
@@ -1428,13 +1633,14 @@ pub(crate) fn initialize_snapshot<S: Clone + Eq + Default>(
                                 && validated.last_bucket == expected_last_bucket
                         })
                     },
+                    durability_policy,
                 )?;
                 let offset = u32::try_from(replacement.len()).map_err(|_| {
                     RecoveryError::InvalidArtifact {
                         path: paths.active.clone(),
                     }
                 })?;
-                return Ok(InitializedWal {
+                let initialized = InitializedWal {
                     snapshot: active.snapshot,
                     wal: WalStorage::from_prepared_file_with_timestamp_state(
                         completed.handle,
@@ -1443,7 +1649,9 @@ pub(crate) fn initialize_snapshot<S: Clone + Eq + Default>(
                         active.last_bucket,
                     ),
                     status: completed.status,
-                });
+                };
+                initialized.wal.set_runtime_policy(durability_policy);
+                return Ok(initialized);
             }
             let legacy_clean = if legacy_exists {
                 match remove_obsolete(&paths.legacy) {
@@ -1521,33 +1729,34 @@ pub(crate) fn initialize_snapshot<S: Clone + Eq + Default>(
                 .expect("selected recovery bytes must exist")
                 .clone();
             let expected = legacy.snapshot.clone();
-            let validated_len = publish_replacement(
+            let completed = publish_validated_repair_with_policy(
                 paths,
+                RepairAuthority::Recovery {
+                    obsolete_active: active_bytes.as_deref(),
+                },
                 &replacement,
                 |bytes| replay(bytes).is_ok_and(|result| result.snapshot == expected),
-                &mut |_| Ok(()),
+                durability_policy,
             )?;
-            if let Err(error) = remove_obsolete(&paths.legacy) {
-                log::warn!(
-                    "deferred stale WAL recovery cleanup for {}: {}",
-                    paths.legacy.display(),
-                    error
-                );
-            }
-            let wal = WalStorage::try_open_file_based_v1_with_timestamp_state(
-                &paths.active,
-                validated_len,
+            let offset =
+                u32::try_from(replacement.len()).map_err(|_| RecoveryError::InvalidArtifact {
+                    path: paths.active.clone(),
+                })?;
+            let wal = WalStorage::from_prepared_file_with_timestamp_state(
+                completed.handle,
+                offset,
                 legacy.granularity_nanos,
                 legacy.last_bucket,
-            )
-            .map_err(|source| io_failure(RecoveryOperation::Open, &paths.active, source))?;
+            );
             Ok(InitializedWal {
                 snapshot: legacy.snapshot,
                 wal,
-                status,
+                status: completed.status,
             })
         }
-    }
+    }?;
+    initialized.wal.set_runtime_policy(durability_policy);
+    Ok(initialized)
 }
 
 #[cfg(test)]

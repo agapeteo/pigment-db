@@ -12,3 +12,7 @@ the recovery implementation.
 
 The histories intentionally include overwrites, deletes, duplicate set appends,
 member removals, multiple outer keys, and an empty value.
+
+Issue #5 pre-production durability baseline verification on 2026-08-07 confirmed
+the three SHA-256 values above before any durability production edit. These files
+remain immutable comparator inputs and were not regenerated.

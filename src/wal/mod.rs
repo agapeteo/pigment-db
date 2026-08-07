@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::sync::RwLock;
@@ -34,6 +35,9 @@ mod truncation_tests;
 #[path = "ordering_tests.rs"]
 mod ordering_tests;
 
+#[cfg(test)]
+mod durability_tests;
+
 struct WalState<W: Write> {
     offset: u32,
     writer: W,
@@ -43,6 +47,9 @@ struct WalState<W: Write> {
     granularity_nanos: u64,
     last_bucket: u64,
     clock: fn() -> u64,
+    durability_policy: crate::config::DurabilityPolicy,
+    data_barrier: Option<crate::durability::DataBarrier<W>>,
+    rollback_barrier: Option<crate::durability::DataBarrier<W>>,
 }
 
 #[derive(Clone, Copy)]
@@ -54,6 +61,100 @@ enum WalFormat {
 enum WalHealth {
     Ready,
     FailedRollback { original: String, rollback: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+/// Identifies a persistence step that rejected or left a mutation indeterminate.
+pub enum PersistenceOperation {
+    /// Appending the complete encoded logical mutation.
+    Write,
+    /// Flushing language/runtime buffers to the operating system.
+    Flush,
+    /// Synchronizing accepted mutation data to physical storage.
+    SynchronizeData,
+    /// Truncating an unaccepted mutation back to its checkpoint.
+    Rollback,
+    /// Fully synchronizing the rollback checkpoint.
+    SynchronizeRollback,
+}
+
+#[derive(Debug)]
+#[non_exhaustive]
+/// Structured cause carried by fallible mutation [`std::io::Error`] values.
+pub enum MutationFailure {
+    /// The attempted bytes were durably rolled back; the instance remains usable.
+    Rejected {
+        /// Persistence step that failed.
+        operation: PersistenceOperation,
+        /// Original persistence failure.
+        source: std::io::Error,
+    },
+    /// The attempted bytes could not be conclusively rolled back; the instance
+    /// has failed closed.
+    Indeterminate {
+        /// Persistence step that failed first.
+        operation: PersistenceOperation,
+        /// Original persistence failure.
+        source: std::io::Error,
+        /// Rollback step that could not be confirmed.
+        rollback_operation: PersistenceOperation,
+        /// Rollback failure.
+        rollback: std::io::Error,
+    },
+    /// A later mutation was refused before I/O because an earlier rollback was
+    /// indeterminate.
+    FailedClosed {
+        /// Diagnostic for the original persistence failure.
+        original: String,
+        /// Diagnostic for the rollback failure.
+        rollback: String,
+    },
+}
+
+#[cfg(test)]
+pub(crate) use MutationFailure as PrivateMutationFailure;
+
+impl MutationFailure {
+    /// Recovers a structured persistence failure from a fallible mutator's
+    /// [`std::io::Error`] value.
+    pub fn from_io_error(error: &std::io::Error) -> Option<&Self> {
+        error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<Self>())
+    }
+}
+
+impl fmt::Display for MutationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rejected { operation, source } => {
+                write!(formatter, "persistence {operation:?} rejected: {source}")
+            }
+            Self::Indeterminate {
+                operation,
+                source,
+                rollback_operation,
+                rollback,
+            } => write!(
+                formatter,
+                "persistence {operation:?} failed ({source}); {rollback_operation:?} failed ({rollback})"
+            ),
+            Self::FailedClosed { original, rollback } => write!(
+                formatter,
+                "WAL is failed closed after persistence failure ({original}) and rollback failure ({rollback})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MutationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Rejected { source, .. } | Self::Indeterminate { source, .. } => Some(source),
+            Self::FailedClosed { .. } => None,
+        }
+    }
 }
 
 pub struct WalStorage<W: Write> {
@@ -81,6 +182,9 @@ impl WalStorage<File> {
             granularity_nanos: DEFAULT_GRANULARITY_NANOS,
             last_bucket: 0,
             clock: system_unix_nanos,
+            durability_policy: crate::config::DurabilityPolicy::Buffered,
+            data_barrier: Some(crate::durability::synchronize_file_data),
+            rollback_barrier: Some(crate::durability::synchronize_file_all),
         };
         let wal_state = RwLock::new(wal_state);
 
@@ -146,6 +250,9 @@ impl WalStorage<File> {
                 granularity_nanos,
                 last_bucket,
                 clock: system_unix_nanos,
+                durability_policy: crate::config::DurabilityPolicy::Buffered,
+                data_barrier: Some(crate::durability::synchronize_file_data),
+                rollback_barrier: Some(crate::durability::synchronize_file_all),
             }),
         })
     }
@@ -171,6 +278,9 @@ impl WalStorage<File> {
                 granularity_nanos,
                 last_bucket,
                 clock: system_unix_nanos,
+                durability_policy: crate::config::DurabilityPolicy::Buffered,
+                data_barrier: Some(crate::durability::synchronize_file_data),
+                rollback_barrier: Some(crate::durability::synchronize_file_all),
             }),
         }
     }
@@ -194,6 +304,9 @@ impl WalStorage<Vec<u8>> {
             granularity_nanos: DEFAULT_GRANULARITY_NANOS,
             last_bucket: 0,
             clock: system_unix_nanos,
+            durability_policy: crate::config::DurabilityPolicy::Buffered,
+            data_barrier: None,
+            rollback_barrier: None,
         };
         let wal_state = RwLock::new(wal_state);
 
@@ -226,12 +339,51 @@ impl WalStorage<Vec<u8>> {
                 granularity_nanos: format::V1CodecProbe::granularity(header).unwrap(),
                 last_bucket: format::V1CodecProbe::base_bucket(header).unwrap_or(0),
                 clock,
+                durability_policy: crate::config::DurabilityPolicy::Buffered,
+                data_barrier: None,
+                rollback_barrier: None,
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_vec_based_v1_with_probe_options(
+        header: &[u8; 40],
+        options: crate::config::DurableStoreOptions,
+    ) -> Self {
+        let storage = Self::new_vec_based_v1(header);
+        storage.wal_state.write().unwrap().durability_policy = options.durability_policy();
+        storage
     }
 }
 
 impl<W: Write> WalStorage<W> {
+    pub(crate) fn set_runtime_policy(&self, policy: crate::config::DurabilityPolicy) {
+        self.wal_state.write().unwrap().durability_policy = policy;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runtime_policy_probe(&self) -> crate::config::DurabilityPolicy {
+        self.wal_state.read().unwrap().durability_policy
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dispatch_data_barrier_probe(
+        &self,
+        barrier: crate::durability::DataBarrier<W>,
+    ) -> std::io::Result<()> {
+        let mut state = self.wal_state.write().unwrap();
+        crate::durability::synchronize_data(&mut state.writer, barrier)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_rollback_barrier_probe(
+        &self,
+        barrier: crate::durability::DataBarrier<W>,
+    ) {
+        self.wal_state.write().unwrap().rollback_barrier = Some(barrier);
+    }
+
     #[cfg(test)]
     pub(crate) fn new_with_rollback(
         writer: W,
@@ -247,6 +399,9 @@ impl<W: Write> WalStorage<W> {
                 granularity_nanos: DEFAULT_GRANULARITY_NANOS,
                 last_bucket: 0,
                 clock: || 0,
+                durability_policy: crate::config::DurabilityPolicy::Buffered,
+                data_barrier: None,
+                rollback_barrier: None,
             }),
         }
     }
@@ -266,8 +421,24 @@ impl<W: Write> WalStorage<W> {
                 granularity_nanos: DEFAULT_GRANULARITY_NANOS,
                 last_bucket: 0,
                 clock: || 0,
+                durability_policy: crate::config::DurabilityPolicy::Buffered,
+                data_barrier: None,
+                rollback_barrier: None,
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_v1_with_physical_probe(
+        writer: W,
+        rollback: fn(&mut W, usize) -> std::io::Result<()>,
+        data_barrier: crate::durability::DataBarrier<W>,
+    ) -> Self {
+        let storage = Self::new_v1_with_rollback(writer, rollback);
+        storage.wal_state.write().unwrap().durability_policy =
+            crate::config::DurabilityPolicy::Physical;
+        storage.wal_state.write().unwrap().data_barrier = Some(data_barrier);
+        storage
     }
 
     #[cfg(test)]
@@ -338,12 +509,29 @@ impl<W: Write> WalStorage<W> {
                     })?;
                 bytes.extend_from_slice(&frame);
             }
-            if let Err(write_error) = state
-                .writer
-                .write_all(&bytes)
-                .and_then(|()| state.writer.flush())
-            {
-                return Err(rollback_or_fail(&mut state, checkpoint, write_error));
+            if let Err(write_error) = state.writer.write_all(&bytes) {
+                return Err(rollback_or_fail(
+                    &mut state,
+                    checkpoint,
+                    PersistenceOperation::Write,
+                    write_error,
+                ));
+            }
+            if let Err(flush_error) = state.writer.flush() {
+                return Err(rollback_or_fail(
+                    &mut state,
+                    checkpoint,
+                    PersistenceOperation::Flush,
+                    flush_error,
+                ));
+            }
+            if let Err(barrier_error) = synchronize_if_physical(&mut state) {
+                return Err(rollback_or_fail(
+                    &mut state,
+                    checkpoint,
+                    PersistenceOperation::SynchronizeData,
+                    barrier_error,
+                ));
             }
             state.last_bucket = timestamp_bucket;
             state.offset = offset;
@@ -351,10 +539,20 @@ impl<W: Write> WalStorage<W> {
         }
         let (bytes, accepted_offset) = encode_compute_batch(checkpoint, actions);
         if let Err(write_error) = state.writer.write_all(&bytes) {
-            return Err(rollback_or_fail(&mut state, checkpoint, write_error));
+            return Err(rollback_or_fail(
+                &mut state,
+                checkpoint,
+                PersistenceOperation::Write,
+                write_error,
+            ));
         }
         if let Err(flush_error) = state.writer.flush() {
-            return Err(rollback_or_fail(&mut state, checkpoint, flush_error));
+            return Err(rollback_or_fail(
+                &mut state,
+                checkpoint,
+                PersistenceOperation::Flush,
+                flush_error,
+            ));
         }
         state.offset = accepted_offset;
         Ok(())
@@ -512,19 +710,41 @@ impl<W: Write> WalStorage<W> {
                 .ok_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, "V1 WAL offset overflow")
                 })?;
-            if let Err(write_error) = state
-                .writer
-                .write_all(&frame)
-                .and_then(|()| state.writer.flush())
-            {
-                return Err(rollback_or_fail(&mut state, checkpoint, write_error));
+            if let Err(write_error) = state.writer.write_all(&frame) {
+                return Err(rollback_or_fail(
+                    &mut state,
+                    checkpoint,
+                    PersistenceOperation::Write,
+                    write_error,
+                ));
+            }
+            if let Err(flush_error) = state.writer.flush() {
+                return Err(rollback_or_fail(
+                    &mut state,
+                    checkpoint,
+                    PersistenceOperation::Flush,
+                    flush_error,
+                ));
+            }
+            if let Err(barrier_error) = synchronize_if_physical(&mut state) {
+                return Err(rollback_or_fail(
+                    &mut state,
+                    checkpoint,
+                    PersistenceOperation::SynchronizeData,
+                    barrier_error,
+                ));
             }
             state.last_bucket = timestamp_bucket;
             state.offset = accepted_offset;
             return Ok(());
         }
         if let Err(write_error) = write_fallible(&mut state.writer, &action) {
-            return Err(rollback_or_fail(&mut state, checkpoint, write_error));
+            return Err(rollback_or_fail(
+                &mut state,
+                checkpoint,
+                PersistenceOperation::Write,
+                write_error,
+            ));
         }
         increment_offset(&mut state.offset, &action);
         Ok(())
@@ -536,38 +756,93 @@ fn requested_timestamp_bucket<W: Write>(state: &WalState<W>) -> u64 {
     (now - now % state.granularity_nanos).max(state.last_bucket)
 }
 
+fn synchronize_if_physical<W: Write>(state: &mut WalState<W>) -> std::io::Result<()> {
+    if state.durability_policy == crate::config::DurabilityPolicy::Buffered {
+        return Ok(());
+    }
+    let barrier = state
+        .data_barrier
+        .ok_or_else(|| std::io::Error::other("physical data barrier is unavailable"))?;
+    crate::durability::synchronize_data(&mut state.writer, barrier)
+}
+
 fn ensure_ready(health: &WalHealth) -> std::io::Result<()> {
     match health {
         WalHealth::Ready => Ok(()),
-        WalHealth::FailedRollback { original, rollback } => Err(std::io::Error::other(format!(
-            "WAL is failed closed after rejection ({original}) and rollback failure ({rollback})"
-        ))),
+        WalHealth::FailedRollback { original, rollback } => {
+            Err(std::io::Error::other(MutationFailure::FailedClosed {
+                original: original.clone(),
+                rollback: rollback.clone(),
+            }))
+        }
     }
 }
 
 fn rollback_or_fail<W: Write>(
     state: &mut WalState<W>,
     checkpoint: u32,
+    operation: PersistenceOperation,
     original: std::io::Error,
 ) -> std::io::Error {
-    let rollback_result = match state.rollback {
+    let truncate_result = match state.rollback {
         Some(rollback) => rollback(&mut state.writer, checkpoint as usize),
         None => Err(std::io::Error::other("rollback unavailable")),
     };
-    match rollback_result {
-        Ok(()) => original,
-        Err(rollback_error) => {
-            let original_message = original.to_string();
-            let rollback_message = rollback_error.to_string();
-            state.health = WalHealth::FailedRollback {
-                original: original_message.clone(),
-                rollback: rollback_message.clone(),
-            };
-            std::io::Error::other(format!(
-                "WAL rejection ({original_message}); rollback failed ({rollback_message})"
-            ))
+    if let Err(rollback_error) = truncate_result {
+        return indeterminate_failure(
+            state,
+            operation,
+            original,
+            PersistenceOperation::Rollback,
+            rollback_error,
+        );
+    }
+    if state.durability_policy == crate::config::DurabilityPolicy::Physical {
+        let sync_result = match state.rollback_barrier {
+            Some(barrier) => crate::durability::synchronize_data(&mut state.writer, barrier),
+            None => Err(std::io::Error::other(
+                "rollback synchronization unavailable",
+            )),
+        };
+        if let Err(rollback_error) = sync_result {
+            return indeterminate_failure(
+                state,
+                operation,
+                original,
+                PersistenceOperation::SynchronizeRollback,
+                rollback_error,
+            );
         }
     }
+    let kind = original.kind();
+    std::io::Error::new(
+        kind,
+        MutationFailure::Rejected {
+            operation,
+            source: original,
+        },
+    )
+}
+
+fn indeterminate_failure<W: Write>(
+    state: &mut WalState<W>,
+    operation: PersistenceOperation,
+    original: std::io::Error,
+    rollback_operation: PersistenceOperation,
+    rollback_error: std::io::Error,
+) -> std::io::Error {
+    let original_message = original.to_string();
+    let rollback_message = rollback_error.to_string();
+    state.health = WalHealth::FailedRollback {
+        original: original_message,
+        rollback: rollback_message,
+    };
+    std::io::Error::other(MutationFailure::Indeterminate {
+        operation,
+        source: original,
+        rollback_operation,
+        rollback: rollback_error,
+    })
 }
 
 fn rollback_file(file: &mut File, checkpoint: usize) -> std::io::Result<()> {

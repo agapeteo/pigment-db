@@ -15,7 +15,7 @@ Thumbs.db
 *.iml
 .gradle
 out/
-bin/
+/bin/
 build/
 gen/
 deps/

@@ -8,7 +8,7 @@ use std::fs::File;
 
 use crate::wal::format::V1CodecProbe;
 use crate::wal::recovery::{
-    encode_key_set_repair_snapshot, initialize_snapshot, ArtifactPaths, StoreKind,
+    encode_key_set_repair_snapshot, initialize_snapshot_with_policy, ArtifactPaths, StoreKind,
 };
 use crate::wal::replay::{
     encode_key_set_snapshot, key_set_is_proper_snapshot_prefix, replay_key_set,
@@ -47,11 +47,12 @@ impl DurableKeySetStore<File> {
         Self::try_init_new_configured(store_dir, None)
     }
 
-    /// Opens a file-backed key/set store with an explicit timestamp configuration.
+    /// Opens a file-backed key/set store with explicit timestamp and durability options.
     ///
     /// A missing store is published as a complete V1 header. An existing V1
     /// store changes configuration only through validated staged compaction;
     /// complete legacy input remains an explicit CLI-only migration boundary.
+    /// Physical mode preflights and durably publishes filesystem authority.
     pub fn try_init_new_with_options(
         store_dir: impl AsRef<Path>,
         options: DurableStoreOptions,
@@ -64,7 +65,10 @@ impl DurableKeySetStore<File> {
         options: Option<DurableStoreOptions>,
     ) -> Result<RecoveryOutcome<Self>, RecoveryError> {
         let paths = ArtifactPaths::new(store_dir.as_ref(), StoreKind::Set);
-        let initialized = initialize_snapshot(
+        let durability_policy = options
+            .map(DurableStoreOptions::durability_policy)
+            .unwrap_or_default();
+        let initialized = initialize_snapshot_with_policy(
             &paths,
             replay_key_set,
             replay_key_set_tail,
@@ -74,6 +78,7 @@ impl DurableKeySetStore<File> {
             key_set_is_proper_snapshot_prefix,
             Some(V1CodecProbe::encode_header_with_kind(2)),
             options.map(DurableStoreOptions::granularity_nanos),
+            durability_policy,
         )?;
         let store = DashMap::new();
         for (key, values) in initialized.snapshot {
@@ -116,19 +121,66 @@ impl DurableKeySetStore<Vec<u8>> {
     }
 
     /// Creates a vector-backed key/set store using V1 timestamp configuration.
+    ///
+    /// This compatibility wrapper panics if physical durability is requested.
     pub fn new_vec_based_with_options(options: DurableStoreOptions) -> Self {
+        Self::try_new_vec_based_with_options(options)
+            .unwrap_or_else(|error| panic!("vector-backed key/set construction failed: {error}"))
+    }
+
+    /// Tries to create a vector-backed key/set store with explicit options.
+    /// Physical durability returns [`crate::DurabilitySupportError::NoPhysicalBacking`].
+    pub fn try_new_vec_based_with_options(
+        options: DurableStoreOptions,
+    ) -> Result<Self, crate::DurabilitySupportError> {
+        crate::durability::validate_memory_backing(options.durability_policy())?;
         let header =
             V1CodecProbe::encode_header_with_kind_and_granularity(2, options.granularity_nanos());
-        DurableKeySetStore {
+        Ok(DurableKeySetStore {
             store: DashMap::new(),
             wal: WalStorage::new_vec_based_v1(&header),
             #[cfg(test)]
             mutation_observer: MutationObserver::default(),
-        }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_new_vec_based_with_probe_options(
+        options: DurableStoreOptions,
+    ) -> Result<Self, crate::durability::DurabilitySupportError> {
+        Self::try_new_vec_based_with_options(options)
     }
 }
 
 impl<W: Write> DurableKeySetStore<W> {
+    #[cfg(test)]
+    pub(crate) fn from_probe_parts(
+        initial: impl IntoIterator<Item = (Vec<u8>, HashSet<Vec<u8>>)>,
+        wal: WalStorage<W>,
+        mutation_observer: MutationObserver,
+    ) -> Self {
+        Self {
+            store: initial.into_iter().collect(),
+            wal,
+            mutation_observer,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_append_probe(&self, key: Vec<u8>, value: Vec<u8>) -> std::io::Result<()> {
+        self.try_append_core(key, value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_remove_from_set_callback_probe(
+        &self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        callback: impl FnOnce(&[u8]),
+    ) -> std::io::Result<()> {
+        self.try_remove_from_set_callback_core(key, value, callback)
+    }
+
     pub fn get_hashset(&self, key: &[u8]) -> Option<HashSet<Vec<u8>>> {
         match self.store.get(key) {
             None => None,
@@ -151,21 +203,24 @@ impl<W: Write> DurableKeySetStore<W> {
     }
 
     pub fn append(&self, key: Vec<u8>, val: Vec<u8>) {
+        self.try_append(key, val)
+            .unwrap_or_else(|error| panic!("WAL set append rejected: {error}"));
+    }
+
+    /// Persists and then publishes one set member.
+    pub fn try_append(&self, key: Vec<u8>, val: Vec<u8>) -> std::io::Result<()> {
+        self.try_append_core(key, val)
+    }
+
+    pub(crate) fn try_append_core(&self, key: Vec<u8>, val: Vec<u8>) -> std::io::Result<()> {
         match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptanceEntered);
-                let val = match self
+                let val = self
                     .wal
-                    .try_store_append_to_set_event_borrowed(entry.key(), val)
-                {
-                    Ok(val) => val,
-                    Err(error) => {
-                        drop(entry);
-                        panic!("WAL set append rejected: {error}");
-                    }
-                };
+                    .try_store_append_to_set_event_borrowed(entry.key(), val)?;
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
@@ -178,16 +233,9 @@ impl<W: Write> DurableKeySetStore<W> {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptanceEntered);
-                let val = match self
+                let val = self
                     .wal
-                    .try_store_append_to_set_event_borrowed(entry.key(), val)
-                {
-                    Ok(val) => val,
-                    Err(error) => {
-                        drop(entry);
-                        panic!("WAL set append rejected: {error}");
-                    }
-                };
+                    .try_store_append_to_set_event_borrowed(entry.key(), val)?;
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
@@ -201,6 +249,7 @@ impl<W: Write> DurableKeySetStore<W> {
                     .notify(&published_key, MutationPhase::Published);
             }
         }
+        Ok(())
     }
 
     pub fn contains_key(&self, key: &[u8]) -> bool {
@@ -208,6 +257,20 @@ impl<W: Write> DurableKeySetStore<W> {
     }
 
     pub fn remove_from_set(&self, key: Vec<u8>, set_entry: Vec<u8>) {
+        self.try_remove_from_set(key, set_entry)
+            .unwrap_or_else(|error| panic!("WAL set removal rejected: {error}"));
+    }
+
+    /// Persists and then publishes one member removal.
+    pub fn try_remove_from_set(&self, key: Vec<u8>, set_entry: Vec<u8>) -> std::io::Result<()> {
+        self.try_remove_from_set_core(key, set_entry)
+    }
+
+    pub(crate) fn try_remove_from_set_core(
+        &self,
+        key: Vec<u8>,
+        set_entry: Vec<u8>,
+    ) -> std::io::Result<()> {
         #[cfg(test)]
         let observed_key = key.clone();
         if let Some(mut entry) = self.store.get_mut(&key) {
@@ -216,13 +279,7 @@ impl<W: Write> DurableKeySetStore<W> {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptanceEntered);
-                let set_entry = match self.wal.try_store_remove_from_set_event(key, set_entry) {
-                    Ok((_key, set_entry)) => set_entry,
-                    Err(error) => {
-                        drop(entry);
-                        panic!("WAL set removal rejected: {error}");
-                    }
-                };
+                let (_key, set_entry) = self.wal.try_store_remove_from_set_event(key, set_entry)?;
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
@@ -230,7 +287,7 @@ impl<W: Write> DurableKeySetStore<W> {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::Published);
-                return;
+                return Ok(());
             }
         }
         match self.store.entry(key) {
@@ -241,25 +298,15 @@ impl<W: Write> DurableKeySetStore<W> {
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptanceEntered);
                 if removes_final_member {
-                    if let Err(error) = self.wal.try_store_delete_event(entry.key()) {
-                        drop(entry);
-                        panic!("WAL delete rejected: {error}");
-                    }
+                    self.wal.try_store_delete_event(entry.key())?;
                     #[cfg(test)]
                     self.mutation_observer
                         .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
                     entry.remove();
                 } else {
-                    let set_entry = match self
+                    let (_key, set_entry) = self
                         .wal
-                        .try_store_remove_from_set_event(entry.key().clone(), set_entry)
-                    {
-                        Ok((_key, set_entry)) => set_entry,
-                        Err(error) => {
-                            drop(entry);
-                            panic!("WAL set removal rejected: {error}");
-                        }
-                    };
+                        .try_store_remove_from_set_event(entry.key().clone(), set_entry)?;
                     #[cfg(test)]
                     self.mutation_observer
                         .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
@@ -270,13 +317,8 @@ impl<W: Write> DurableKeySetStore<W> {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptanceEntered);
-                if let Err(error) = self
-                    .wal
-                    .try_store_remove_from_set_event(entry.key().clone(), set_entry)
-                {
-                    drop(entry);
-                    panic!("WAL set removal rejected: {error}");
-                }
+                self.wal
+                    .try_store_remove_from_set_event(entry.key().clone(), set_entry)?;
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
@@ -286,6 +328,7 @@ impl<W: Write> DurableKeySetStore<W> {
         #[cfg(test)]
         self.mutation_observer
             .notify(&observed_key, MutationPhase::Published);
+        Ok(())
     }
 
     /// Computes a replacement set on an owned working copy and invokes `func` exactly once.
@@ -562,6 +605,27 @@ impl<W: Write> DurableKeySetStore<W> {
         set_entry: Vec<u8>,
         key_removed_callback: impl FnOnce(&[u8]),
     ) {
+        self.try_remove_from_set_callback(key, set_entry, key_removed_callback)
+            .unwrap_or_else(|error| panic!("WAL set callback removal rejected: {error}"));
+    }
+
+    /// Removes a member and calls `key_removed_callback` only after an accepted
+    /// final-member deletion is published.
+    pub fn try_remove_from_set_callback(
+        &self,
+        key: Vec<u8>,
+        set_entry: Vec<u8>,
+        key_removed_callback: impl FnOnce(&[u8]),
+    ) -> std::io::Result<()> {
+        self.try_remove_from_set_callback_core(key, set_entry, key_removed_callback)
+    }
+
+    pub(crate) fn try_remove_from_set_callback_core(
+        &self,
+        key: Vec<u8>,
+        set_entry: Vec<u8>,
+        key_removed_callback: impl FnOnce(&[u8]),
+    ) -> std::io::Result<()> {
         #[cfg(test)]
         let observed_key = key.clone();
         let mut callback_entry = Some(set_entry);
@@ -575,10 +639,7 @@ impl<W: Write> DurableKeySetStore<W> {
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptanceEntered);
                 if removes_final_member {
-                    if let Err(error) = self.wal.try_store_delete_event(entry.key()) {
-                        drop(entry);
-                        panic!("WAL delete rejected: {error}");
-                    }
+                    self.wal.try_store_delete_event(entry.key())?;
                     #[cfg(test)]
                     self.mutation_observer
                         .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
@@ -586,16 +647,9 @@ impl<W: Write> DurableKeySetStore<W> {
                     true
                 } else {
                     let set_entry = callback_entry.take().expect("removal entry");
-                    let set_entry = match self
+                    let (_key, set_entry) = self
                         .wal
-                        .try_store_remove_from_set_event(entry.key().clone(), set_entry)
-                    {
-                        Ok((_key, set_entry)) => set_entry,
-                        Err(error) => {
-                            drop(entry);
-                            panic!("WAL set removal rejected: {error}");
-                        }
-                    };
+                        .try_store_remove_from_set_event(entry.key().clone(), set_entry)?;
                     #[cfg(test)]
                     self.mutation_observer
                         .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
@@ -607,13 +661,10 @@ impl<W: Write> DurableKeySetStore<W> {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptanceEntered);
-                if let Err(error) = self.wal.try_store_remove_from_set_event(
+                self.wal.try_store_remove_from_set_event(
                     entry.key().clone(),
                     callback_entry.take().expect("removal entry"),
-                ) {
-                    drop(entry);
-                    panic!("WAL set removal rejected: {error}");
-                }
+                )?;
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
@@ -631,18 +682,26 @@ impl<W: Write> DurableKeySetStore<W> {
                     .expect("final removal callback entry"),
             );
         }
+        Ok(())
     }
 
     pub fn remove_key(&self, key: &[u8]) {
+        self.try_remove_key(key)
+            .unwrap_or_else(|error| panic!("WAL delete rejected: {error}"));
+    }
+
+    /// Persists an outer-key deletion before removing live state.
+    pub fn try_remove_key(&self, key: &[u8]) -> std::io::Result<()> {
+        self.try_remove_key_core(key)
+    }
+
+    pub(crate) fn try_remove_key_core(&self, key: &[u8]) -> std::io::Result<()> {
         match self.store.entry(key.to_vec()) {
             Entry::Occupied(entry) => {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptanceEntered);
-                if let Err(error) = self.wal.try_store_delete_event(entry.key()) {
-                    drop(entry);
-                    panic!("WAL delete rejected: {error}");
-                }
+                self.wal.try_store_delete_event(entry.key())?;
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
@@ -652,10 +711,7 @@ impl<W: Write> DurableKeySetStore<W> {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptanceEntered);
-                if let Err(error) = self.wal.try_store_delete_event(entry.key()) {
-                    drop(entry);
-                    panic!("WAL delete rejected: {error}");
-                }
+                self.wal.try_store_delete_event(entry.key())?;
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
@@ -664,6 +720,7 @@ impl<W: Write> DurableKeySetStore<W> {
         }
         #[cfg(test)]
         self.mutation_observer.notify(key, MutationPhase::Published);
+        Ok(())
     }
 
     pub fn size(&self) -> usize {

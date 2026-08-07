@@ -11,6 +11,8 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
+use crate::durability::DurabilitySupportError;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Describes whether initialization resolved interrupted-maintenance artifacts.
 pub enum RecoveryStatus {
@@ -78,6 +80,11 @@ pub enum RecoveryOperation {
 /// When authority cannot be established, recovery returns an error without
 /// deleting or overwriting any potentially authoritative candidate.
 pub enum RecoveryError {
+    /// The requested durability policy cannot be honored by this platform or backing store.
+    ///
+    /// Capability failures occur before authority-changing startup work. Once
+    /// all required preflights succeed, later failures use [`Self::Io`].
+    UnsupportedDurability { source: DurabilitySupportError },
     /// A complete legacy WAL must be converted with the standalone migration tool.
     MigrationRequired { path: PathBuf },
     /// Replay provenance could not prove which candidate is authoritative.
@@ -98,6 +105,7 @@ pub enum RecoveryError {
 impl fmt::Display for RecoveryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnsupportedDurability { source } => write!(formatter, "{source}"),
             Self::MigrationRequired { path } => write!(
                 formatter,
                 "legacy WAL requires explicit migration with pigment-db-migrate: {}",
@@ -129,6 +137,7 @@ impl fmt::Display for RecoveryError {
 impl Error for RecoveryError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::UnsupportedDurability { source } => Some(source),
             Self::Io { source, .. } => Some(source),
             _ => None,
         }

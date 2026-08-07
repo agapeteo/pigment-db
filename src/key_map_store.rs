@@ -9,7 +9,7 @@ use std::fs::File;
 use crate::model::{Key, SearchKey};
 use crate::wal::format::V1CodecProbe;
 use crate::wal::recovery::{
-    encode_key_map_repair_snapshot, initialize_snapshot, ArtifactPaths, StoreKind,
+    encode_key_map_repair_snapshot, initialize_snapshot_with_policy, ArtifactPaths, StoreKind,
 };
 use crate::wal::replay::{
     encode_key_map_snapshot, key_map_is_proper_snapshot_prefix, replay_key_map,
@@ -49,11 +49,12 @@ impl DurableKeyMapStore<File> {
         Self::try_init_new_configured(store_dir, None)
     }
 
-    /// Opens a file-backed key/sorted-map store with an explicit timestamp configuration.
+    /// Opens a file-backed key/sorted-map store with explicit timestamp and durability options.
     ///
     /// A missing store is published as a complete V1 header. An existing V1
     /// store changes configuration only through validated staged compaction;
     /// complete legacy input remains an explicit CLI-only migration boundary.
+    /// Physical mode preflights and durably publishes filesystem authority.
     pub fn try_init_new_with_options(
         store_dir: impl AsRef<Path>,
         options: DurableStoreOptions,
@@ -66,7 +67,10 @@ impl DurableKeyMapStore<File> {
         options: Option<DurableStoreOptions>,
     ) -> Result<RecoveryOutcome<Self>, RecoveryError> {
         let paths = ArtifactPaths::new(store_dir.as_ref(), StoreKind::Map);
-        let initialized = initialize_snapshot(
+        let durability_policy = options
+            .map(DurableStoreOptions::durability_policy)
+            .unwrap_or_default();
+        let initialized = initialize_snapshot_with_policy(
             &paths,
             replay_key_map,
             replay_key_map_tail,
@@ -76,6 +80,7 @@ impl DurableKeyMapStore<File> {
             key_map_is_proper_snapshot_prefix,
             Some(V1CodecProbe::encode_header_with_kind(3)),
             options.map(DurableStoreOptions::granularity_nanos),
+            durability_policy,
         )?;
         let store = DashMap::new();
         for (key, values) in initialized.snapshot {
@@ -118,20 +123,70 @@ impl DurableKeyMapStore<Vec<u8>> {
     }
 
     /// Creates a vector-backed key/sorted-map store using V1 timestamp configuration.
+    ///
+    /// This compatibility wrapper panics if physical durability is requested.
     pub fn new_vec_based_with_options(options: DurableStoreOptions) -> Self {
+        Self::try_new_vec_based_with_options(options)
+            .unwrap_or_else(|error| panic!("vector-backed key/map construction failed: {error}"))
+    }
+
+    /// Tries to create a vector-backed key/sorted-map store with explicit options.
+    /// Physical durability returns [`crate::DurabilitySupportError::NoPhysicalBacking`].
+    pub fn try_new_vec_based_with_options(
+        options: DurableStoreOptions,
+    ) -> Result<Self, crate::DurabilitySupportError> {
+        crate::durability::validate_memory_backing(options.durability_policy())?;
         let header =
             V1CodecProbe::encode_header_with_kind_and_granularity(3, options.granularity_nanos());
-        DurableKeyMapStore {
+        Ok(DurableKeyMapStore {
             store: DashMap::new(),
             wal: WalStorage::new_vec_based_v1(&header),
             #[cfg(test)]
             mutation_observer: MutationObserver::default(),
-        }
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_new_vec_based_with_probe_options(
+        options: DurableStoreOptions,
+    ) -> Result<Self, crate::durability::DurabilitySupportError> {
+        Self::try_new_vec_based_with_options(options)
     }
 }
 
 #[allow(unused)]
 impl<W: Write> DurableKeyMapStore<W> {
+    #[cfg(test)]
+    pub(crate) fn from_probe_parts(
+        initial: impl IntoIterator<Item = (Vec<u8>, BTreeMap<SearchKey, Vec<u8>>)>,
+        wal: WalStorage<W>,
+        mutation_observer: MutationObserver,
+    ) -> Self {
+        Self {
+            store: initial.into_iter().collect(),
+            wal,
+            mutation_observer,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_put_probe(
+        &self,
+        key: Vec<u8>,
+        search_key: SearchKey,
+        value: Vec<u8>,
+    ) -> std::io::Result<()> {
+        self.try_put_core(key, search_key, value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_pop_first_probe(
+        &self,
+        key: Vec<u8>,
+    ) -> std::io::Result<Option<(SearchKey, Vec<u8>)>> {
+        self.try_pop_first_core(key)
+    }
+
     pub fn get_sorted_map(&self, key: &[u8]) -> Option<BTreeMap<SearchKey, Vec<u8>>> {
         match self.store.get(key) {
             None => None,
@@ -161,18 +216,32 @@ impl<W: Write> DurableKeyMapStore<W> {
     }
 
     pub fn put(&self, key: Vec<u8>, search_key: SearchKey, val: Vec<u8>) {
+        self.try_put(key, search_key, val)
+            .unwrap_or_else(|error| panic!("WAL map put rejected: {error}"));
+    }
+
+    /// Persists and then publishes one sorted-map entry.
+    pub fn try_put(
+        &self,
+        key: Vec<u8>,
+        search_key: SearchKey,
+        val: Vec<u8>,
+    ) -> std::io::Result<()> {
+        self.try_put_core(key, search_key, val)
+    }
+
+    pub(crate) fn try_put_core(
+        &self,
+        key: Vec<u8>,
+        search_key: SearchKey,
+        val: Vec<u8>,
+    ) -> std::io::Result<()> {
         if let Some(mut entry) = self.store.get_mut(&key) {
             #[cfg(test)]
             self.mutation_observer
                 .notify(entry.key(), MutationPhase::AcceptanceEntered);
-            let (search_key, val) = match self.wal.try_store_put_to_map_event(key, search_key, val)
-            {
-                Ok((_key, search_key, val)) => (search_key, val),
-                Err(error) => {
-                    drop(entry);
-                    panic!("WAL map put rejected: {error}");
-                }
-            };
+            let (_key, search_key, val) =
+                self.wal.try_store_put_to_map_event(key, search_key, val)?;
             #[cfg(test)]
             self.mutation_observer
                 .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
@@ -180,24 +249,16 @@ impl<W: Write> DurableKeyMapStore<W> {
             #[cfg(test)]
             self.mutation_observer
                 .notify(entry.key(), MutationPhase::Published);
-            return;
+            return Ok(());
         }
         match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptanceEntered);
-                let (search_key, val) =
-                    match self
-                        .wal
-                        .try_store_put_to_map_event(entry.key().clone(), search_key, val)
-                    {
-                        Ok((_key, search_key, val)) => (search_key, val),
-                        Err(error) => {
-                            drop(entry);
-                            panic!("WAL map put rejected: {error}");
-                        }
-                    };
+                let (_key, search_key, val) =
+                    self.wal
+                        .try_store_put_to_map_event(entry.key().clone(), search_key, val)?;
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
@@ -210,17 +271,9 @@ impl<W: Write> DurableKeyMapStore<W> {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptanceEntered);
-                let (search_key, val) =
-                    match self
-                        .wal
-                        .try_store_put_to_map_event(entry.key().clone(), search_key, val)
-                    {
-                        Ok((_key, search_key, val)) => (search_key, val),
-                        Err(error) => {
-                            drop(entry);
-                            panic!("WAL map put rejected: {error}");
-                        }
-                    };
+                let (_key, search_key, val) =
+                    self.wal
+                        .try_store_put_to_map_event(entry.key().clone(), search_key, val)?;
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
@@ -234,6 +287,7 @@ impl<W: Write> DurableKeyMapStore<W> {
                     .notify(&published_key, MutationPhase::Published);
             }
         }
+        Ok(())
     }
 
     pub fn contains_key(&self, key: &[u8]) -> bool {
@@ -250,19 +304,32 @@ impl<W: Write> DurableKeyMapStore<W> {
     }
 
     pub fn remove_from_sorted_map(&self, key: Vec<u8>, search_key: SearchKey) -> Option<Vec<u8>> {
+        self.try_remove_from_sorted_map(key, search_key)
+            .unwrap_or_else(|error| panic!("WAL map removal rejected: {error}"))
+    }
+
+    /// Persists one entry removal and returns the value only after publication.
+    pub fn try_remove_from_sorted_map(
+        &self,
+        key: Vec<u8>,
+        search_key: SearchKey,
+    ) -> std::io::Result<Option<Vec<u8>>> {
+        self.try_remove_from_sorted_map_core(key, search_key)
+    }
+
+    pub(crate) fn try_remove_from_sorted_map_core(
+        &self,
+        key: Vec<u8>,
+        search_key: SearchKey,
+    ) -> std::io::Result<Option<Vec<u8>>> {
         if let Some(mut entry) = self.store.get_mut(&key) {
             let removes_final_entry = entry.len() == 1 && entry.contains_key(&search_key);
             if !removes_final_entry {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptanceEntered);
-                if let Err(error) = self
-                    .wal
-                    .try_store_remove_from_sorted_map_event(key, search_key.clone())
-                {
-                    drop(entry);
-                    panic!("WAL map removal rejected: {error}");
-                }
+                self.wal
+                    .try_store_remove_from_sorted_map_event(key, search_key.clone())?;
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
@@ -270,7 +337,7 @@ impl<W: Write> DurableKeyMapStore<W> {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::Published);
-                return old_value;
+                return Ok(old_value);
             }
         }
         match self.store.entry(key) {
@@ -281,18 +348,12 @@ impl<W: Write> DurableKeyMapStore<W> {
                 let old_value = entry.get().get(&search_key).cloned();
                 let removes_final_entry = old_value.is_some() && entry.get().len() == 1;
                 if removes_final_entry {
-                    if let Err(error) = self.wal.try_store_delete_event(entry.key()) {
-                        drop(entry);
-                        panic!("WAL delete rejected: {error}");
-                    }
+                    self.wal.try_store_delete_event(entry.key())?;
                 } else {
-                    if let Err(error) = self.wal.try_store_remove_from_sorted_map_event(
+                    self.wal.try_store_remove_from_sorted_map_event(
                         entry.key().clone(),
                         search_key.clone(),
-                    ) {
-                        drop(entry);
-                        panic!("WAL map removal rejected: {error}");
-                    }
+                    )?;
                 }
                 #[cfg(test)]
                 self.mutation_observer
@@ -310,26 +371,21 @@ impl<W: Write> DurableKeyMapStore<W> {
                     self.mutation_observer
                         .notify(entry.key(), MutationPhase::Published);
                 }
-                old_value
+                Ok(old_value)
             }
             Entry::Vacant(entry) => {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptanceEntered);
-                if let Err(error) = self
-                    .wal
-                    .try_store_remove_from_sorted_map_event(entry.key().clone(), search_key)
-                {
-                    drop(entry);
-                    panic!("WAL map removal rejected: {error}");
-                }
+                self.wal
+                    .try_store_remove_from_sorted_map_event(entry.key().clone(), search_key)?;
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::Published);
-                None
+                Ok(None)
             }
         }
     }
@@ -340,6 +396,27 @@ impl<W: Write> DurableKeyMapStore<W> {
         search_key: SearchKey,
         key_removed_callback: impl FnOnce(&SearchKey),
     ) {
+        self.try_remove_from_sorted_map_callback(key, search_key, key_removed_callback)
+            .unwrap_or_else(|error| panic!("WAL map callback removal rejected: {error}"));
+    }
+
+    /// Removes an entry and calls `key_removed_callback` only after an accepted
+    /// final-entry deletion is published.
+    pub fn try_remove_from_sorted_map_callback(
+        &self,
+        key: Vec<u8>,
+        search_key: SearchKey,
+        key_removed_callback: impl FnOnce(&SearchKey),
+    ) -> std::io::Result<()> {
+        self.try_remove_from_sorted_map_callback_core(key, search_key, key_removed_callback)
+    }
+
+    pub(crate) fn try_remove_from_sorted_map_callback_core(
+        &self,
+        key: Vec<u8>,
+        search_key: SearchKey,
+        key_removed_callback: impl FnOnce(&SearchKey),
+    ) -> std::io::Result<()> {
         #[cfg(test)]
         let observed_key = key.clone();
         let removed_outer_key = match self.store.entry(key) {
@@ -350,18 +427,12 @@ impl<W: Write> DurableKeyMapStore<W> {
                 let removes_final_entry =
                     entry.get().len() == 1 && entry.get().contains_key(&search_key);
                 if removes_final_entry {
-                    if let Err(error) = self.wal.try_store_delete_event(entry.key()) {
-                        drop(entry);
-                        panic!("WAL delete rejected: {error}");
-                    }
+                    self.wal.try_store_delete_event(entry.key())?;
                 } else {
-                    if let Err(error) = self.wal.try_store_remove_from_sorted_map_event(
+                    self.wal.try_store_remove_from_sorted_map_event(
                         entry.key().clone(),
                         search_key.clone(),
-                    ) {
-                        drop(entry);
-                        panic!("WAL map removal rejected: {error}");
-                    }
+                    )?;
                 }
                 #[cfg(test)]
                 self.mutation_observer
@@ -377,13 +448,10 @@ impl<W: Write> DurableKeyMapStore<W> {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptanceEntered);
-                if let Err(error) = self
-                    .wal
-                    .try_store_remove_from_sorted_map_event(entry.key().clone(), search_key.clone())
-                {
-                    drop(entry);
-                    panic!("WAL map removal rejected: {error}");
-                }
+                self.wal.try_store_remove_from_sorted_map_event(
+                    entry.key().clone(),
+                    search_key.clone(),
+                )?;
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
@@ -396,18 +464,26 @@ impl<W: Write> DurableKeyMapStore<W> {
         if removed_outer_key {
             key_removed_callback(&search_key);
         }
+        Ok(())
     }
 
     pub fn remove_key(&self, key: &[u8]) {
+        self.try_remove_key(key)
+            .unwrap_or_else(|error| panic!("WAL delete rejected: {error}"));
+    }
+
+    /// Persists an outer-key deletion before removing live state.
+    pub fn try_remove_key(&self, key: &[u8]) -> std::io::Result<()> {
+        self.try_remove_key_core(key)
+    }
+
+    pub(crate) fn try_remove_key_core(&self, key: &[u8]) -> std::io::Result<()> {
         match self.store.entry(key.to_vec()) {
             Entry::Occupied(entry) => {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptanceEntered);
-                if let Err(error) = self.wal.try_store_delete_event(entry.key()) {
-                    drop(entry);
-                    panic!("WAL delete rejected: {error}");
-                }
+                self.wal.try_store_delete_event(entry.key())?;
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
@@ -417,10 +493,7 @@ impl<W: Write> DurableKeyMapStore<W> {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptanceEntered);
-                if let Err(error) = self.wal.try_store_delete_event(entry.key()) {
-                    drop(entry);
-                    panic!("WAL delete rejected: {error}");
-                }
+                self.wal.try_store_delete_event(entry.key())?;
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
@@ -428,6 +501,7 @@ impl<W: Write> DurableKeyMapStore<W> {
         }
         #[cfg(test)]
         self.mutation_observer.notify(key, MutationPhase::Published);
+        Ok(())
     }
 
     pub fn size(&self) -> usize {
@@ -531,27 +605,37 @@ impl<W: Write> DurableKeyMapStore<W> {
     }
 
     pub fn pop_first(&self, key: Vec<u8>) -> Option<(SearchKey, Vec<u8>)> {
+        self.try_pop_first(key)
+            .unwrap_or_else(|error| panic!("WAL map pop-first rejected: {error}"))
+    }
+
+    /// Persists removal of the first ordered entry before returning its result.
+    pub fn try_pop_first(&self, key: Vec<u8>) -> std::io::Result<Option<(SearchKey, Vec<u8>)>> {
+        self.try_pop_first_core(key)
+    }
+
+    pub(crate) fn try_pop_first_core(
+        &self,
+        key: Vec<u8>,
+    ) -> std::io::Result<Option<(SearchKey, Vec<u8>)>> {
         match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
-                let search_key = entry.get().first_key_value().map(|(key, _)| key.clone())?;
+                let Some(search_key) = entry.get().first_key_value().map(|(key, _)| key.clone())
+                else {
+                    return Ok(None);
+                };
                 let returned_element = entry.key().clone();
                 let removes_final_entry = entry.get().len() == 1;
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptanceEntered);
                 if removes_final_entry {
-                    if let Err(error) = self.wal.try_store_delete_event(entry.key()) {
-                        drop(entry);
-                        panic!("WAL delete rejected: {error}");
-                    }
+                    self.wal.try_store_delete_event(entry.key())?;
                 } else {
-                    if let Err(error) = self.wal.try_store_remove_from_sorted_map_event(
+                    self.wal.try_store_remove_from_sorted_map_event(
                         entry.key().clone(),
                         search_key.clone(),
-                    ) {
-                        drop(entry);
-                        panic!("WAL map removal rejected: {error}");
-                    }
+                    )?;
                 }
                 #[cfg(test)]
                 self.mutation_observer
@@ -569,34 +653,44 @@ impl<W: Write> DurableKeyMapStore<W> {
                     self.mutation_observer
                         .notify(entry.key(), MutationPhase::Published);
                 }
-                Some((search_key, returned_element))
+                Ok(Some((search_key, returned_element)))
             }
-            Entry::Vacant(_) => None,
+            Entry::Vacant(_) => Ok(None),
         }
     }
 
     pub fn pop_last(&self, key: Vec<u8>) -> Option<(SearchKey, Vec<u8>)> {
+        self.try_pop_last(key)
+            .unwrap_or_else(|error| panic!("WAL map pop-last rejected: {error}"))
+    }
+
+    /// Persists removal of the last ordered entry before returning its result.
+    pub fn try_pop_last(&self, key: Vec<u8>) -> std::io::Result<Option<(SearchKey, Vec<u8>)>> {
+        self.try_pop_last_core(key)
+    }
+
+    pub(crate) fn try_pop_last_core(
+        &self,
+        key: Vec<u8>,
+    ) -> std::io::Result<Option<(SearchKey, Vec<u8>)>> {
         match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
-                let search_key = entry.get().last_key_value().map(|(key, _)| key.clone())?;
+                let Some(search_key) = entry.get().last_key_value().map(|(key, _)| key.clone())
+                else {
+                    return Ok(None);
+                };
                 let returned_element = entry.key().clone();
                 let removes_final_entry = entry.get().len() == 1;
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptanceEntered);
                 if removes_final_entry {
-                    if let Err(error) = self.wal.try_store_delete_event(entry.key()) {
-                        drop(entry);
-                        panic!("WAL delete rejected: {error}");
-                    }
+                    self.wal.try_store_delete_event(entry.key())?;
                 } else {
-                    if let Err(error) = self.wal.try_store_remove_from_sorted_map_event(
+                    self.wal.try_store_remove_from_sorted_map_event(
                         entry.key().clone(),
                         search_key.clone(),
-                    ) {
-                        drop(entry);
-                        panic!("WAL map removal rejected: {error}");
-                    }
+                    )?;
                 }
                 #[cfg(test)]
                 self.mutation_observer
@@ -614,13 +708,31 @@ impl<W: Write> DurableKeyMapStore<W> {
                     self.mutation_observer
                         .notify(entry.key(), MutationPhase::Published);
                 }
-                Some((search_key, returned_element))
+                Ok(Some((search_key, returned_element)))
             }
-            Entry::Vacant(_) => None,
+            Entry::Vacant(_) => Ok(None),
         }
     }
 
     pub fn append_ordered_element(&self, key: Vec<u8>, element: Vec<u8>) {
+        self.try_append_ordered_element(key, element)
+            .unwrap_or_else(|error| panic!("WAL map append rejected: {error}"));
+    }
+
+    /// Persists and publishes an entry under the next numeric search key.
+    pub fn try_append_ordered_element(
+        &self,
+        key: Vec<u8>,
+        element: Vec<u8>,
+    ) -> std::io::Result<()> {
+        self.try_append_ordered_element_core(key, element)
+    }
+
+    pub(crate) fn try_append_ordered_element_core(
+        &self,
+        key: Vec<u8>,
+        element: Vec<u8>,
+    ) -> std::io::Result<()> {
         match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
                 let cur_num = {
@@ -638,17 +750,11 @@ impl<W: Write> DurableKeyMapStore<W> {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptanceEntered);
-                let (search_key, element) = match self.wal.try_store_put_to_map_event(
+                let (_key, search_key, element) = self.wal.try_store_put_to_map_event(
                     entry.key().clone(),
                     cur_num.into(),
                     element,
-                ) {
-                    Ok((_key, search_key, element)) => (search_key, element),
-                    Err(error) => {
-                        drop(entry);
-                        panic!("WAL map append rejected: {error}");
-                    }
-                };
+                )?;
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
@@ -662,17 +768,9 @@ impl<W: Write> DurableKeyMapStore<W> {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptanceEntered);
-                let (search_key, element) = match self.wal.try_store_put_to_map_event(
-                    entry.key().clone(),
-                    0.into(),
-                    element,
-                ) {
-                    Ok((_key, search_key, element)) => (search_key, element),
-                    Err(error) => {
-                        drop(entry);
-                        panic!("WAL map append rejected: {error}");
-                    }
-                };
+                let (_key, search_key, element) =
+                    self.wal
+                        .try_store_put_to_map_event(entry.key().clone(), 0.into(), element)?;
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
@@ -685,6 +783,7 @@ impl<W: Write> DurableKeyMapStore<W> {
                     .notify(&published_key, MutationPhase::Published);
             }
         }
+        Ok(())
     }
 
     /// Computes a replacement ordered map on an owned working copy and invokes `func` once.

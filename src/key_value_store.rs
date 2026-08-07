@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::wal::format::V1CodecProbe;
 use crate::wal::recovery::{
-    encode_key_value_repair_snapshot, initialize_snapshot, ArtifactPaths, StoreKind,
+    encode_key_value_repair_snapshot, initialize_snapshot_with_policy, ArtifactPaths, StoreKind,
 };
 use crate::wal::replay::{
     encode_key_value_snapshot, key_value_is_proper_snapshot_prefix, replay_key_value,
@@ -47,12 +47,13 @@ impl DurableKeyValueStore<File> {
         Self::try_init_new_configured(store_dir, None)
     }
 
-    /// Opens a file-backed key/value store with an explicit timestamp configuration.
+    /// Opens a file-backed key/value store with explicit timestamp and durability options.
     ///
     /// A missing store is published as a complete V1 header. An existing V1
     /// store honors this explicit granularity through validated staged
     /// compaction when needed. Complete legacy input still requires the
-    /// standalone migration command.
+    /// standalone migration command. Physical mode performs filesystem capability
+    /// preflights and crash-safe namespace publication before returning a store.
     pub fn try_init_new_with_options(
         store_dir: impl AsRef<Path>,
         options: DurableStoreOptions,
@@ -65,7 +66,10 @@ impl DurableKeyValueStore<File> {
         options: Option<DurableStoreOptions>,
     ) -> Result<RecoveryOutcome<Self>, RecoveryError> {
         let paths = ArtifactPaths::new(store_dir.as_ref(), StoreKind::Value);
-        let initialized = initialize_snapshot(
+        let durability_policy = options
+            .map(DurableStoreOptions::durability_policy)
+            .unwrap_or_default();
+        let initialized = initialize_snapshot_with_policy(
             &paths,
             replay_key_value,
             replay_key_value_tail,
@@ -75,6 +79,7 @@ impl DurableKeyValueStore<File> {
             key_value_is_proper_snapshot_prefix,
             Some(V1CodecProbe::encode_header()),
             options.map(DurableStoreOptions::granularity_nanos),
+            durability_policy,
         )?;
         let store = DashMap::new();
         for (key, value) in initialized.snapshot {
@@ -89,6 +94,14 @@ impl DurableKeyValueStore<File> {
             },
             initialized.status,
         ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_init_new_with_probe_options(
+        store_dir: impl AsRef<Path>,
+        options: DurableStoreOptions,
+    ) -> Result<RecoveryOutcome<Self>, RecoveryError> {
+        Self::try_init_new_configured(store_dir, Some(options))
     }
 
     /// Opens a file-backed key/value store using the historical panic-on-error API.
@@ -117,18 +130,64 @@ impl DurableKeyValueStore<Vec<u8>> {
     }
 
     /// Creates a vector-backed key/value store using V1 timestamp configuration.
+    ///
+    /// This compatibility wrapper panics if physical durability is requested.
     pub fn new_vec_based_with_options(options: DurableStoreOptions) -> Self {
+        Self::try_new_vec_based_with_options(options)
+            .unwrap_or_else(|error| panic!("vector-backed key/value construction failed: {error}"))
+    }
+
+    /// Tries to create a vector-backed key/value store with explicit options.
+    /// Physical durability returns [`crate::DurabilitySupportError::NoPhysicalBacking`].
+    pub fn try_new_vec_based_with_options(
+        options: DurableStoreOptions,
+    ) -> Result<Self, crate::DurabilitySupportError> {
+        crate::durability::validate_memory_backing(options.durability_policy())?;
         let header = V1CodecProbe::encode_header_with_granularity(options.granularity_nanos());
-        DurableKeyValueStore {
+        Ok(DurableKeyValueStore {
             store: DashMap::new(),
             wal: WalStorage::new_vec_based_v1(&header),
             #[cfg(test)]
             mutation_observer: MutationObserver::default(),
-        }
+        })
+    }
+}
+
+#[cfg(test)]
+impl<W: Write> DurableKeyValueStore<W> {
+    pub(crate) fn runtime_policy_probe(&self) -> crate::config::DurabilityPolicy {
+        self.wal.runtime_policy_probe()
     }
 }
 
 impl<W: Write> DurableKeyValueStore<W> {
+    #[cfg(test)]
+    pub(crate) fn from_probe_parts(
+        initial: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
+        wal: WalStorage<W>,
+        mutation_observer: MutationObserver,
+    ) -> Self {
+        Self {
+            store: initial.into_iter().collect(),
+            wal,
+            mutation_observer,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_put_probe(&self, key: Vec<u8>, value: Vec<u8>) -> std::io::Result<()> {
+        self.try_put_core(key, value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_compute_probe(
+        &self,
+        key: Vec<u8>,
+        function: impl FnOnce(Option<&[u8]>) -> Vec<u8>,
+    ) -> std::io::Result<()> {
+        self.try_compute_core(key, function)
+    }
+
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         match self.store.get(key) {
             None => None,
@@ -140,17 +199,21 @@ impl<W: Write> DurableKeyValueStore<W> {
     }
 
     pub fn put(&self, key: Vec<u8>, val: Vec<u8>) {
+        self.try_put(key, val)
+            .unwrap_or_else(|error| panic!("WAL put rejected: {error}"));
+    }
+
+    /// Persists and then publishes a value replacement.
+    pub fn try_put(&self, key: Vec<u8>, val: Vec<u8>) -> std::io::Result<()> {
+        self.try_put_core(key, val)
+    }
+
+    pub(crate) fn try_put_core(&self, key: Vec<u8>, val: Vec<u8>) -> std::io::Result<()> {
         if let Some(mut entry) = self.store.get_mut(&key) {
             #[cfg(test)]
             self.mutation_observer
                 .notify(entry.key(), MutationPhase::AcceptanceEntered);
-            let val = match self.wal.try_store_put_event(key, val) {
-                Ok((_key, val)) => val,
-                Err(error) => {
-                    drop(entry);
-                    panic!("WAL put rejected: {error}");
-                }
-            };
+            let (_key, val) = self.wal.try_store_put_event(key, val)?;
             #[cfg(test)]
             self.mutation_observer
                 .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
@@ -158,20 +221,14 @@ impl<W: Write> DurableKeyValueStore<W> {
             #[cfg(test)]
             self.mutation_observer
                 .notify(entry.key(), MutationPhase::Published);
-            return;
+            return Ok(());
         }
         match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptanceEntered);
-                let val = match self.wal.try_store_put_event(entry.key().clone(), val) {
-                    Ok((_key, val)) => val,
-                    Err(error) => {
-                        drop(entry);
-                        panic!("WAL put rejected: {error}");
-                    }
-                };
+                let (_key, val) = self.wal.try_store_put_event(entry.key().clone(), val)?;
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
@@ -184,13 +241,7 @@ impl<W: Write> DurableKeyValueStore<W> {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptanceEntered);
-                let val = match self.wal.try_store_put_event(entry.key().clone(), val) {
-                    Ok((_key, val)) => val,
-                    Err(error) => {
-                        drop(entry);
-                        panic!("WAL put rejected: {error}");
-                    }
-                };
+                let (_key, val) = self.wal.try_store_put_event(entry.key().clone(), val)?;
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
@@ -202,37 +253,65 @@ impl<W: Write> DurableKeyValueStore<W> {
                     .notify(&published_key, MutationPhase::Published);
             }
         }
+        Ok(())
     }
 
     pub fn compute(&self, key: Vec<u8>, func: impl FnOnce(Option<&[u8]>) -> Vec<u8>) {
+        self.try_compute(key, func)
+            .unwrap_or_else(|error| panic!("WAL compute put rejected: {error}"));
+    }
+
+    /// Runs the callback once, persists its candidate, and publishes only on success.
+    pub fn try_compute(
+        &self,
+        key: Vec<u8>,
+        func: impl FnOnce(Option<&[u8]>) -> Vec<u8>,
+    ) -> std::io::Result<()> {
+        self.try_compute_core(key, func)
+    }
+
+    pub(crate) fn try_compute_core(
+        &self,
+        key: Vec<u8>,
+        func: impl FnOnce(Option<&[u8]>) -> Vec<u8>,
+    ) -> std::io::Result<()> {
         match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
                 let new_val = func(Some(entry.get().as_slice()));
-                let new_val = match self.wal.try_store_put_event(entry.key().clone(), new_val) {
-                    Ok((_key, value)) => value,
-                    Err(error) => {
-                        drop(entry);
-                        panic!("WAL compute put rejected: {error}");
-                    }
-                };
+                let (_key, new_val) = self.wal.try_store_put_event(entry.key().clone(), new_val)?;
                 *entry.get_mut() = new_val;
             }
             Entry::Vacant(entry) => {
                 let new_val = func(None);
-                let new_val = match self.wal.try_store_put_event(entry.key().clone(), new_val) {
-                    Ok((_key, value)) => value,
-                    Err(error) => {
-                        drop(entry);
-                        panic!("WAL compute put rejected: {error}");
-                    }
-                };
+                let (_key, new_val) = self.wal.try_store_put_event(entry.key().clone(), new_val)?;
                 entry.insert(new_val);
             }
         };
+        Ok(())
     }
 
     #[allow(clippy::result_unit_err)] // Public compatibility signature.
     pub fn increment_or_init(&self, key: Vec<u8>, increment_by: u64) -> Result<u64, ()> {
+        self.try_increment_or_init(key, increment_by)
+            .unwrap_or_else(|error| panic!("WAL increment rejected: {error}"))
+    }
+
+    #[allow(clippy::result_unit_err)]
+    /// Persists a numeric increment while preserving the nested invalid-value result.
+    pub fn try_increment_or_init(
+        &self,
+        key: Vec<u8>,
+        increment_by: u64,
+    ) -> std::io::Result<Result<u64, ()>> {
+        self.try_increment_or_init_core(key, increment_by)
+    }
+
+    #[allow(clippy::result_unit_err)]
+    pub(crate) fn try_increment_or_init_core(
+        &self,
+        key: Vec<u8>,
+        increment_by: u64,
+    ) -> std::io::Result<Result<u64, ()>> {
         match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
                 let entry_bytes = entry.get().as_slice();
@@ -240,43 +319,49 @@ impl<W: Write> DurableKeyValueStore<W> {
                     match <&[u8] as std::convert::TryInto<[u8; 8]>>::try_into(entry_bytes) {
                         Ok(arr) => arr,
                         Err(_) => {
-                            return Err(());
+                            return Ok(Err(()));
                         }
                     };
                 let cur_num = u64::from_ne_bytes(bytes_arr);
                 let new_num = cur_num + increment_by;
-                let new_num_bytes = match self
+                let (_key, new_num_bytes) = self
                     .wal
-                    .try_store_put_event(entry.key().clone(), u64::to_ne_bytes(new_num).to_vec())
-                {
-                    Ok((_key, value)) => value,
-                    Err(error) => {
-                        drop(entry);
-                        panic!("WAL increment rejected: {error}");
-                    }
-                };
+                    .try_store_put_event(entry.key().clone(), u64::to_ne_bytes(new_num).to_vec())?;
                 *entry.get_mut() = new_num_bytes;
-                Ok(new_num)
+                Ok(Ok(new_num))
             }
             Entry::Vacant(entry) => {
                 let new_num = increment_by;
-                let new_num_bytes = match self
+                let (_key, new_num_bytes) = self
                     .wal
-                    .try_store_put_event(entry.key().clone(), u64::to_ne_bytes(new_num).to_vec())
-                {
-                    Ok((_key, value)) => value,
-                    Err(error) => {
-                        drop(entry);
-                        panic!("WAL increment rejected: {error}");
-                    }
-                };
+                    .try_store_put_event(entry.key().clone(), u64::to_ne_bytes(new_num).to_vec())?;
                 entry.insert(new_num_bytes);
-                Ok(new_num)
+                Ok(Ok(new_num))
             }
         }
     }
 
     pub fn decrement(&self, key: Vec<u8>, decrement_by: u64) -> Option<Result<u64, ()>> {
+        self.try_decrement(key, decrement_by)
+            .unwrap_or_else(|error| panic!("WAL decrement rejected: {error}"))
+    }
+
+    #[allow(clippy::result_unit_err)]
+    /// Persists a saturating decrement while preserving absence and invalid-value results.
+    pub fn try_decrement(
+        &self,
+        key: Vec<u8>,
+        decrement_by: u64,
+    ) -> std::io::Result<Option<Result<u64, ()>>> {
+        self.try_decrement_core(key, decrement_by)
+    }
+
+    #[allow(clippy::result_unit_err)]
+    pub(crate) fn try_decrement_core(
+        &self,
+        key: Vec<u8>,
+        decrement_by: u64,
+    ) -> std::io::Result<Option<Result<u64, ()>>> {
         match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
                 let entry_bytes = entry.get().as_slice();
@@ -284,25 +369,18 @@ impl<W: Write> DurableKeyValueStore<W> {
                     match <&[u8] as std::convert::TryInto<[u8; 8]>>::try_into(entry_bytes) {
                         Ok(arr) => arr,
                         Err(_) => {
-                            return Some(Err(()));
+                            return Ok(Some(Err(())));
                         }
                     };
                 let cur_num = u64::from_ne_bytes(bytes_arr);
                 let new_num = cur_num.saturating_sub(decrement_by);
-                let new_num_bytes = match self
+                let (_key, new_num_bytes) = self
                     .wal
-                    .try_store_put_event(entry.key().clone(), u64::to_ne_bytes(new_num).to_vec())
-                {
-                    Ok((_key, value)) => value,
-                    Err(error) => {
-                        drop(entry);
-                        panic!("WAL decrement rejected: {error}");
-                    }
-                };
+                    .try_store_put_event(entry.key().clone(), u64::to_ne_bytes(new_num).to_vec())?;
                 *entry.get_mut() = new_num_bytes;
-                Some(Ok(new_num))
+                Ok(Some(Ok(new_num)))
             }
-            Entry::Vacant(_) => None,
+            Entry::Vacant(_) => Ok(None),
         }
     }
 
@@ -321,7 +399,17 @@ impl<W: Write> DurableKeyValueStore<W> {
     }
 
     pub fn set_number(&self, key: Vec<u8>, number: u64) {
-        self.put(key, u64::to_ne_bytes(number).to_vec());
+        self.try_set_number(key, number)
+            .unwrap_or_else(|error| panic!("WAL set-number rejected: {error}"));
+    }
+
+    /// Persists and publishes a native-endian `u64` value.
+    pub fn try_set_number(&self, key: Vec<u8>, number: u64) -> std::io::Result<()> {
+        self.try_set_number_core(key, number)
+    }
+
+    pub(crate) fn try_set_number_core(&self, key: Vec<u8>, number: u64) -> std::io::Result<()> {
+        self.try_put_core(key, u64::to_ne_bytes(number).to_vec())
     }
 
     #[allow(unused)]
@@ -330,14 +418,21 @@ impl<W: Write> DurableKeyValueStore<W> {
     }
 
     pub fn remove(&self, key: &[u8]) {
+        self.try_remove(key)
+            .unwrap_or_else(|error| panic!("WAL delete rejected: {error}"));
+    }
+
+    /// Persists an outer-key deletion before removing live state.
+    pub fn try_remove(&self, key: &[u8]) -> std::io::Result<()> {
+        self.try_remove_core(key)
+    }
+
+    pub(crate) fn try_remove_core(&self, key: &[u8]) -> std::io::Result<()> {
         let entry = self.store.entry(key.to_vec());
         #[cfg(test)]
         self.mutation_observer
             .notify(key, MutationPhase::AcceptanceEntered);
-        if let Err(error) = self.wal.try_store_delete_event(key) {
-            drop(entry);
-            panic!("WAL delete rejected: {error}");
-        }
+        self.wal.try_store_delete_event(key)?;
         #[cfg(test)]
         self.mutation_observer
             .notify(key, MutationPhase::AcceptedBeforePublication);
@@ -349,6 +444,7 @@ impl<W: Write> DurableKeyValueStore<W> {
         }
         #[cfg(test)]
         self.mutation_observer.notify(key, MutationPhase::Published);
+        Ok(())
     }
 
     pub fn size(&self) -> usize {

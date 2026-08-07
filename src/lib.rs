@@ -1,3 +1,10 @@
+//! Embedded concurrent stores with write-ahead-log recovery.
+//!
+//! Existing constructors and default options retain buffered write-plus-flush
+//! acknowledgements. File-backed stores can opt into [`DurabilityPolicy::Physical`]
+//! for direct per-mutation persistence barriers and crash-safe startup publication.
+//! The policy is selected per opening and is not encoded in WAL bytes.
+
 pub mod key_map_store;
 pub mod key_set_store;
 pub mod key_value_store;
@@ -5,8 +12,13 @@ pub mod model;
 pub mod recovery;
 pub use recovery::{RecoveryError, RecoveryOperation, RecoveryOutcome, RecoveryStatus};
 mod config;
-pub use config::{DurableStoreOptions, TimestampGranularity, TimestampGranularityError};
+mod durability;
+pub use config::{
+    DurabilityPolicy, DurableStoreOptions, TimestampGranularity, TimestampGranularityError,
+};
+pub use durability::{DurabilityCapability, DurabilitySupportError};
 mod wal;
+pub use wal::{MutationFailure, PersistenceOperation};
 
 mod migration;
 
