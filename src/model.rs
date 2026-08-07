@@ -62,7 +62,7 @@ impl SearchKey {
     pub fn into_key_vec(self) -> Vec<Key> {
         self.0
     }
-    
+
     pub fn slice(&self) -> &[Key] {
         self.0.as_slice()
     }
@@ -111,7 +111,7 @@ impl BytesLen for Key {
             Key::U128(_) => 16,
             Key::Char(_) => 4,
             Key::Str(str) => str.bytes_len(),
-            Key::Bytes(bytes) => bytes.len()
+            Key::Bytes(bytes) => bytes.len(),
         }
     }
 }
@@ -166,7 +166,7 @@ impl PartialEq<Self> for SearchKey {
 
 impl PartialOrd for SearchKey {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.0.cmp(&other.0))
+        Some(self.cmp(other))
     }
 }
 
@@ -270,56 +270,41 @@ mod tests {
             std::sync::Arc::new(DashMap::with_capacity(1));
         map.insert("a", vec![1]);
         map.insert("b", vec![2]);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
 
         let t1_map = map.clone();
+        let t1_barrier = barrier.clone();
         let t1 = std::thread::spawn(move || {
-            let opt = t1_map.get_mut("a");
-            if let Some(mut val) = opt {
+            if let Some(mut val) = t1_map.get_mut("a") {
                 val.value_mut().push(1);
+            }
 
-                // std::thread::sleep(Duration::from_secs(1));
-                // println!("after sleep t1");
+            t1_barrier.wait();
 
-                let opt_b = t1_map.get_mut("b");
-                if let Some(mut val_other) = opt_b {
-                    val_other.value_mut().push(1);
-                }
+            if let Some(mut val_other) = t1_map.get_mut("b") {
+                val_other.value_mut().push(1);
             }
         });
 
         let t2_map = map.clone();
+        let t2_barrier = barrier;
         let t2 = std::thread::spawn(move || {
-            let opt = t2_map.get_mut("b");
-            if let Some(mut val) = opt {
+            if let Some(mut val) = t2_map.get_mut("b") {
                 val.value_mut().push(2);
+            }
 
-                // std::thread::sleep(Duration::from_secs(1));
-                // println!("after sleep t2");
+            t2_barrier.wait();
 
-                let opt_a = t2_map.get_mut("a");
-                if let Some(mut val_other) = opt_a {
-                    val_other.value_mut().push(2);
-                }
+            if let Some(mut val_other) = t2_map.get_mut("a") {
+                val_other.value_mut().push(2);
             }
         });
 
         t1.join().unwrap();
         t2.join().unwrap();
 
-        // let opt = map.get_mut("a");
-        // if let Some(mut val) = opt {
-        //     val.push(4);
-        // }
-
-        let opt = map.get("a");
-        if let Some(vec) = opt {
-            println!("a => {:?}", vec.value());
-        }
-
-        let opt = map.get("b");
-        if let Some(vec) = opt {
-            println!("b => {:?}", vec.value());
-        }
+        assert_eq!(map.get("a").unwrap().value(), &vec![1, 1, 2]);
+        assert_eq!(map.get("b").unwrap().value(), &vec![2, 2, 1]);
     }
 
     #[test]

@@ -1,5 +1,16 @@
 /target
 Cargo.lock
+debug/
+release/
+*.rs.bk
+*.rlib
+*.prof*
+*.log
+.env*
+.vscode/
+Thumbs.db
+*.tmp
+*.swp
 .idea
 *.iml
 .gradle

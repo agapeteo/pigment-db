@@ -1,0 +1,41 @@
+name: Recovery
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  recovery:
+    name: Recovery (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: V1 codec, fresh publication, repair, and options
+        run: cargo test wal::truncation_tests -- --test-threads=1
+      - name: Public truncation and timestamp matrices
+        run: cargo test --test truncated_wal -- --test-threads=1
+      - name: Public recovery scenarios
+        run: cargo test --test recovery -- --test-threads=1
+      - name: Publication fault checkpoints
+        run: cargo test wal::recovery::tests -- --test-threads=1
+      - name: Compute persistence scenarios
+        run: cargo test --test compute_persistence -- --test-threads=1
+      - name: Compute WAL fault checkpoints
+        run: cargo test wal::tests::compute_batch -- --test-threads=1
+      - name: Fast mutation ordering contract
+        run: cargo test --test mutation_ordering -- --test-threads=1
+      - name: Mutation WAL rejection checkpoints
+        run: cargo test wal::ordering_tests -- --test-threads=1
+      - name: Set compute publication faults
+        run: cargo test key_set_store::tests:: -- --test-threads=1
+      - name: Map compute publication faults
+        run: cargo test key_map_store::tests:: -- --test-threads=1
+      - name: Offline migration engine
+        run: cargo test migration::tests:: -- --test-threads=1
+      - name: Migration command-line contract
+        run: cargo test --test migration_cli -- --test-threads=1

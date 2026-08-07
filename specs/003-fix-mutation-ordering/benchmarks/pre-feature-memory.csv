@@ -1,0 +1,3 @@
+store,mode,profile,cycles,rss_before_bytes,rss_after_bytes,rss_delta_bytes,retained_keys
+key_value,vector,create_delete,1000,3616768,3846144,229376,0
+key_value,vector,create_delete,1000000,3706880,141799424,138092544,0

@@ -4,79 +4,103 @@ use log::info;
 use std::io::Write;
 use std::path::Path;
 
-use memmap::MmapOptions;
 use std::fs::File;
 
-use crate::wal::WalStorage;
+use crate::wal::format::V1CodecProbe;
+use crate::wal::recovery::{
+    encode_key_set_repair_snapshot, initialize_snapshot, ArtifactPaths, StoreKind,
+};
+use crate::wal::replay::{
+    encode_key_set_snapshot, key_set_is_proper_snapshot_prefix, replay_key_set,
+    replay_key_set_against, replay_key_set_tail,
+};
+use crate::wal::{ComputeAction, WalStorage};
+use crate::{DurableStoreOptions, RecoveryError, RecoveryOutcome, RecoveryStatus};
 use dashmap::mapref::entry::Entry;
 use std::collections::HashSet;
 
-const SET_WAL_FILE_NAME: &str = "set.wal.dat";
-const TMP_SET_WAL_FILE_NAME: &str = ".set.wal.dat";
+#[cfg(test)]
+use crate::test_support::mutation_schedule::{MutationObserver, MutationPhase};
 
+/// Mutations are ordered per logical outer key, while mutations of keys in different data-map shards remain concurrent except during shared WAL acceptance.
+///
+/// Different keys in the same DashMap shard may wait for one another. Compute
+/// callbacks run while that shard is guarded; asynchronous callbacks keep the
+/// guard across `.await`, and recursive access to the same map or shard is
+/// unsupported and may deadlock. A callback panic or cancellation before
+/// acceptance discards its private candidate and releases the guard. These
+/// guarantees do not change any public method signature, callback shape, or
+/// compatibility panic behavior.
 pub struct DurableKeySetStore<W: Write> {
     store: DashMap<Vec<u8>, HashSet<Vec<u8>>>,
     wal: WalStorage<W>,
+    #[cfg(test)]
+    mutation_observer: MutationObserver,
 }
 
 impl DurableKeySetStore<File> {
-    pub fn init_new(store_dir: &str) -> Self {
-        let store_dir_path = Path::new(store_dir);
-        let wal_file_path = store_dir_path.join(SET_WAL_FILE_NAME);
-        let tmp_wal_file_path = store_dir_path.join(TMP_SET_WAL_FILE_NAME);
+    /// Opens a file-backed key/set store and returns structured recovery status
+    /// or error information without panicking for expected startup failures.
+    pub fn try_init_new(
+        store_dir: impl AsRef<Path>,
+    ) -> Result<RecoveryOutcome<Self>, RecoveryError> {
+        Self::try_init_new_configured(store_dir, None)
+    }
 
+    /// Opens a file-backed key/set store with an explicit timestamp configuration.
+    ///
+    /// A missing store is published as a complete V1 header. An existing V1
+    /// store changes configuration only through validated staged compaction;
+    /// complete legacy input remains an explicit CLI-only migration boundary.
+    pub fn try_init_new_with_options(
+        store_dir: impl AsRef<Path>,
+        options: DurableStoreOptions,
+    ) -> Result<RecoveryOutcome<Self>, RecoveryError> {
+        Self::try_init_new_configured(store_dir, Some(options))
+    }
+
+    fn try_init_new_configured(
+        store_dir: impl AsRef<Path>,
+        options: Option<DurableStoreOptions>,
+    ) -> Result<RecoveryOutcome<Self>, RecoveryError> {
+        let paths = ArtifactPaths::new(store_dir.as_ref(), StoreKind::Set);
+        let initialized = initialize_snapshot(
+            &paths,
+            replay_key_set,
+            replay_key_set_tail,
+            replay_key_set_against,
+            encode_key_set_snapshot,
+            encode_key_set_repair_snapshot,
+            key_set_is_proper_snapshot_prefix,
+            Some(V1CodecProbe::encode_header_with_kind(2)),
+            options.map(DurableStoreOptions::granularity_nanos),
+        )?;
         let store = DashMap::new();
-        let mut found_set_wal = wal_file_path.exists();
-
-        if found_set_wal {
-            if std::fs::metadata(&wal_file_path).unwrap().len() == 0 {
-                let _ = std::fs::remove_file(&wal_file_path);
-                found_set_wal = false;
-            } else {
-                let _ = std::fs::rename(&wal_file_path, &tmp_wal_file_path).unwrap();
-            }
+        for (key, values) in initialized.snapshot {
+            store.insert(key, values);
         }
+        Ok(RecoveryOutcome::new(
+            DurableKeySetStore {
+                store,
+                wal: initialized.wal,
+                #[cfg(test)]
+                mutation_observer: MutationObserver::default(),
+            },
+            initialized.status,
+        ))
+    }
 
-        let wal = WalStorage::new_file_based(wal_file_path.as_path());
-
-        if found_set_wal {
-            let file = File::open(&tmp_wal_file_path).unwrap();
-            info!(
-                "found KeySet WAL file: {}, trying to restore...",
-                &wal_file_path.to_str().unwrap()
-            );
-
-            let content_as_slice = unsafe { MmapOptions::new().map(&file).unwrap() };
-
-            let map = crate::wal::read_for_set(content_as_slice.as_ref());
-            info!(
-                "restored map with size: {}, adding new new WAL file",
-                map.len()
-            );
-
-            for (each_key, set) in map {
-                let mut key = each_key;
-                for set_val in &set {
-                    let (k, _) = wal.store_append_to_set_event(key, set_val.to_owned());
-                    key = k;
-                }
-                store.insert(key, set);
-            }
-            info!("{} entries added to store", store.len());
-
-            let _ = std::fs::remove_file(tmp_wal_file_path.as_path());
-            info!(
-                "removed old wal file {}",
-                tmp_wal_file_path.to_str().unwrap()
-            );
-        } else {
-            info!(
-                "no previous wal log found, starting from scratch: {}",
-                &wal_file_path.to_str().unwrap()
-            );
+    /// Opens a file-backed key/set store with the historical panic-on-error API.
+    ///
+    /// This compatibility wrapper delegates to [`Self::try_init_new`] and logs
+    /// successful automatic recovery.
+    pub fn init_new(store_dir: &str) -> Self {
+        let outcome = Self::try_init_new(store_dir).unwrap_or_else(|error| panic!("{error}"));
+        let (store, status) = outcome.into_parts();
+        if status == RecoveryStatus::Recovered {
+            info!("pigment-db recovered key/set WAL in {store_dir}");
         }
-
-        DurableKeySetStore { store, wal }
+        store
     }
 }
 
@@ -86,6 +110,20 @@ impl DurableKeySetStore<Vec<u8>> {
         DurableKeySetStore {
             store: DashMap::new(),
             wal: WalStorage::new_vec_based(),
+            #[cfg(test)]
+            mutation_observer: MutationObserver::default(),
+        }
+    }
+
+    /// Creates a vector-backed key/set store using V1 timestamp configuration.
+    pub fn new_vec_based_with_options(options: DurableStoreOptions) -> Self {
+        let header =
+            V1CodecProbe::encode_header_with_kind_and_granularity(2, options.granularity_nanos());
+        DurableKeySetStore {
+            store: DashMap::new(),
+            wal: WalStorage::new_vec_based_v1(&header),
+            #[cfg(test)]
+            mutation_observer: MutationObserver::default(),
         }
     }
 }
@@ -113,16 +151,54 @@ impl<W: Write> DurableKeySetStore<W> {
     }
 
     pub fn append(&self, key: Vec<u8>, val: Vec<u8>) {
-        let (key, val) = self.wal.store_append_to_set_event(key, val);
-
-        match self.store.get_mut(&key) {
-            None => {
+        match self.store.entry(key) {
+            Entry::Occupied(mut entry) => {
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(entry.key(), MutationPhase::AcceptanceEntered);
+                let val = match self
+                    .wal
+                    .try_store_append_to_set_event_borrowed(entry.key(), val)
+                {
+                    Ok(val) => val,
+                    Err(error) => {
+                        drop(entry);
+                        panic!("WAL set append rejected: {error}");
+                    }
+                };
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
+                entry.get_mut().insert(val);
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(entry.key(), MutationPhase::Published);
+            }
+            Entry::Vacant(entry) => {
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(entry.key(), MutationPhase::AcceptanceEntered);
+                let val = match self
+                    .wal
+                    .try_store_append_to_set_event_borrowed(entry.key(), val)
+                {
+                    Ok(val) => val,
+                    Err(error) => {
+                        drop(entry);
+                        panic!("WAL set append rejected: {error}");
+                    }
+                };
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
+                #[cfg(test)]
+                let published_key = entry.key().clone();
                 let mut new_hashset = HashSet::new();
                 new_hashset.insert(val);
-                self.store.insert(key, new_hashset);
-            }
-            Some(ref mut hashset) => {
-                hashset.insert(val);
+                entry.insert(new_hashset);
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(&published_key, MutationPhase::Published);
             }
         }
     }
@@ -132,70 +208,352 @@ impl<W: Write> DurableKeySetStore<W> {
     }
 
     pub fn remove_from_set(&self, key: Vec<u8>, set_entry: Vec<u8>) {
-        let (key, set_entry) = self.wal.store_remove_from_set_event(key, set_entry);
-
+        #[cfg(test)]
+        let observed_key = key.clone();
+        if let Some(mut entry) = self.store.get_mut(&key) {
+            let removes_final_member = entry.len() == 1 && entry.contains(&set_entry);
+            if !removes_final_member {
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(entry.key(), MutationPhase::AcceptanceEntered);
+                let set_entry = match self.wal.try_store_remove_from_set_event(key, set_entry) {
+                    Ok((_key, set_entry)) => set_entry,
+                    Err(error) => {
+                        drop(entry);
+                        panic!("WAL set removal rejected: {error}");
+                    }
+                };
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
+                entry.remove(&set_entry);
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(entry.key(), MutationPhase::Published);
+                return;
+            }
+        }
         match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
-                entry.get_mut().remove(&set_entry);
-                if entry.get().is_empty() {
-                    self.wal.store_delete_event(entry.key());
+                let removes_final_member =
+                    entry.get().len() == 1 && entry.get().contains(&set_entry);
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(entry.key(), MutationPhase::AcceptanceEntered);
+                if removes_final_member {
+                    if let Err(error) = self.wal.try_store_delete_event(entry.key()) {
+                        drop(entry);
+                        panic!("WAL delete rejected: {error}");
+                    }
+                    #[cfg(test)]
+                    self.mutation_observer
+                        .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
                     entry.remove();
+                } else {
+                    let set_entry = match self
+                        .wal
+                        .try_store_remove_from_set_event(entry.key().clone(), set_entry)
+                    {
+                        Ok((_key, set_entry)) => set_entry,
+                        Err(error) => {
+                            drop(entry);
+                            panic!("WAL set removal rejected: {error}");
+                        }
+                    };
+                    #[cfg(test)]
+                    self.mutation_observer
+                        .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
+                    entry.get_mut().remove(&set_entry);
                 }
             }
-            Entry::Vacant(_) => {}
+            Entry::Vacant(entry) => {
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(entry.key(), MutationPhase::AcceptanceEntered);
+                if let Err(error) = self
+                    .wal
+                    .try_store_remove_from_set_event(entry.key().clone(), set_entry)
+                {
+                    drop(entry);
+                    panic!("WAL set removal rejected: {error}");
+                }
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
+                drop(entry);
+            }
+        }
+        #[cfg(test)]
+        self.mutation_observer
+            .notify(&observed_key, MutationPhase::Published);
+    }
+
+    /// Computes a replacement set on an owned working copy and invokes `func` exactly once.
+    ///
+    /// The accepted net delta is persisted atomically before live publication. Empty results
+    /// remove the outer key, exact no-ops write nothing, and persistence or rollback failures
+    /// are returned as [`std::io::Error`] without publishing callback state. If rollback itself
+    /// fails, live state is still unpublished but artifact repair is outside this API's scope.
+    /// The per-key DashMap entry guard remains held for the operation; stronger cross-key
+    /// synchronization is not provided.
+    pub fn try_compute(
+        &self,
+        key: Vec<u8>,
+        func: impl FnOnce(&mut HashSet<Vec<u8>>),
+    ) -> std::io::Result<()> {
+        match self.store.entry(key.clone()) {
+            Entry::Occupied(mut occupied_entry) => {
+                let original = occupied_entry.get().clone();
+                let mut working = original.clone();
+                func(&mut working);
+
+                if working.is_empty() {
+                    #[cfg(test)]
+                    self.mutation_observer
+                        .notify(&key, MutationPhase::AcceptanceEntered);
+                    self.wal
+                        .commit_set_compute_batch(vec![ComputeAction::Delete {
+                            key: key.clone(),
+                        }])?;
+                    #[cfg(test)]
+                    self.mutation_observer
+                        .notify(&key, MutationPhase::AcceptedBeforePublication);
+                    occupied_entry.remove();
+                    #[cfg(test)]
+                    self.mutation_observer
+                        .notify(&key, MutationPhase::Published);
+                    return Ok(());
+                }
+                if working == original {
+                    return Ok(());
+                }
+
+                let mut additions: Vec<_> = working.difference(&original).cloned().collect();
+                let mut removals: Vec<_> = original.difference(&working).cloned().collect();
+                additions.sort();
+                removals.sort();
+                let mut actions = Vec::with_capacity(additions.len() + removals.len());
+                actions.extend(additions.into_iter().map(|value| ComputeAction::SetAppend {
+                    key: key.clone(),
+                    value,
+                }));
+                actions.extend(removals.into_iter().map(|value| ComputeAction::SetRemove {
+                    key: key.clone(),
+                    value,
+                }));
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(&key, MutationPhase::AcceptanceEntered);
+                self.wal.commit_set_compute_batch(actions)?;
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(&key, MutationPhase::AcceptedBeforePublication);
+                *occupied_entry.get_mut() = working;
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(&key, MutationPhase::Published);
+                Ok(())
+            }
+            Entry::Vacant(vacant_entry) => {
+                let mut working = HashSet::new();
+                func(&mut working);
+                if working.is_empty() {
+                    return Ok(());
+                }
+                let mut additions: Vec<_> = working.iter().cloned().collect();
+                additions.sort();
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(&key, MutationPhase::AcceptanceEntered);
+                self.wal.commit_set_compute_batch(
+                    additions
+                        .into_iter()
+                        .map(|value| ComputeAction::SetAppend {
+                            key: key.clone(),
+                            value,
+                        })
+                        .collect(),
+                )?;
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(&key, MutationPhase::AcceptedBeforePublication);
+                vacant_entry.insert(working);
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(&key, MutationPhase::Published);
+                Ok(())
+            }
         }
     }
 
+    /// Compatibility wrapper for [`Self::try_compute`] that panics on persistence failure.
     pub fn compute(&self, key: Vec<u8>, func: impl FnOnce(&mut HashSet<Vec<u8>>)) {
-        let entry = self.store.entry(key);
-        match entry {
-            Entry::Occupied(mut occupied_entry) => {
-                let set = occupied_entry.get_mut();
-                func(set);
-            }
-            Entry::Vacant(vacant_entry) => {
-                let mut set = HashSet::new();
-                func(&mut set);
-                vacant_entry.insert(set);
-            }
-        };
+        self.try_compute(key, func)
+            .unwrap_or_else(|error| panic!("set compute persistence failed: {error}"));
     }
 
+    /// Asynchronous counterpart to [`Self::try_compute`].
+    ///
+    /// The callback runs exactly once and the per-key entry guard is intentionally held across
+    /// `.await`, matching the historical API boundary. Persistence occurs after the callback;
+    /// empty and no-op results follow the synchronous semantics and errors publish no live state.
+    pub async fn try_compute_async(
+        &self,
+        key: Vec<u8>,
+        func: impl AsyncFnOnce(&mut HashSet<Vec<u8>>),
+    ) -> std::io::Result<()> {
+        match self.store.entry(key.clone()) {
+            Entry::Occupied(mut occupied_entry) => {
+                let original = occupied_entry.get().clone();
+                let mut working = original.clone();
+                func(&mut working).await;
+                if working.is_empty() {
+                    self.wal
+                        .commit_set_compute_batch(vec![ComputeAction::Delete {
+                            key: key.clone(),
+                        }])?;
+                    occupied_entry.remove();
+                    return Ok(());
+                }
+                if working == original {
+                    return Ok(());
+                }
+                let mut additions: Vec<_> = working.difference(&original).cloned().collect();
+                let mut removals: Vec<_> = original.difference(&working).cloned().collect();
+                additions.sort();
+                removals.sort();
+                let mut actions = Vec::with_capacity(additions.len() + removals.len());
+                actions.extend(additions.into_iter().map(|value| ComputeAction::SetAppend {
+                    key: key.clone(),
+                    value,
+                }));
+                actions.extend(removals.into_iter().map(|value| ComputeAction::SetRemove {
+                    key: key.clone(),
+                    value,
+                }));
+                self.wal.commit_set_compute_batch(actions)?;
+                *occupied_entry.get_mut() = working;
+                Ok(())
+            }
+            Entry::Vacant(vacant_entry) => {
+                let mut working = HashSet::new();
+                func(&mut working).await;
+                if working.is_empty() {
+                    return Ok(());
+                }
+                let mut additions: Vec<_> = working.iter().cloned().collect();
+                additions.sort();
+                self.wal.commit_set_compute_batch(
+                    additions
+                        .into_iter()
+                        .map(|value| ComputeAction::SetAppend {
+                            key: key.clone(),
+                            value,
+                        })
+                        .collect(),
+                )?;
+                vacant_entry.insert(working);
+                Ok(())
+            }
+        }
+    }
+
+    /// Compatibility wrapper for [`Self::try_compute_async`] that panics when awaited on error.
     pub async fn compute_async(&self, key: Vec<u8>, func: impl AsyncFnOnce(&mut HashSet<Vec<u8>>)) {
-        let entry = self.store.entry(key);
-        match entry {
-            Entry::Occupied(mut occupied_entry) => {
-                let set = occupied_entry.get_mut();
-                func(set).await;
-            }
-            Entry::Vacant(vacant_entry) => {
-                let mut set = HashSet::new();
-                func(&mut set).await;
-                vacant_entry.insert(set);
-            }
-        };
+        self.try_compute_async(key, func)
+            .await
+            .unwrap_or_else(|error| panic!("async set compute persistence failed: {error}"));
     }
-    pub fn compute_if_present(&self, key: Vec<u8>, func: impl FnOnce(&mut HashSet<Vec<u8>>)) {
-        let entry = self.store.entry(key);
-        match entry {
+    /// Computes only when `key` is present, otherwise returns `Ok(())` without invoking `func`.
+    ///
+    /// Eligible callbacks run once. Accepted empty results delete the outer key, no-ops write
+    /// nothing, and commit/rollback errors leave the original live value unpublished.
+    pub fn try_compute_if_present(
+        &self,
+        key: Vec<u8>,
+        func: impl FnOnce(&mut HashSet<Vec<u8>>),
+    ) -> std::io::Result<()> {
+        match self.store.entry(key.clone()) {
             Entry::Occupied(mut occupied_entry) => {
-                let set = occupied_entry.get_mut();
-                func(set);
+                let original = occupied_entry.get().clone();
+                let mut working = original.clone();
+                func(&mut working);
+                if working.is_empty() {
+                    self.wal
+                        .commit_set_compute_batch(vec![ComputeAction::Delete {
+                            key: key.clone(),
+                        }])?;
+                    occupied_entry.remove();
+                    return Ok(());
+                }
+                if working == original {
+                    return Ok(());
+                }
+                let mut additions: Vec<_> = working.difference(&original).cloned().collect();
+                let mut removals: Vec<_> = original.difference(&working).cloned().collect();
+                additions.sort();
+                removals.sort();
+                let mut actions = Vec::with_capacity(additions.len() + removals.len());
+                actions.extend(additions.into_iter().map(|value| ComputeAction::SetAppend {
+                    key: key.clone(),
+                    value,
+                }));
+                actions.extend(removals.into_iter().map(|value| ComputeAction::SetRemove {
+                    key: key.clone(),
+                    value,
+                }));
+                self.wal.commit_set_compute_batch(actions)?;
+                *occupied_entry.get_mut() = working;
+                Ok(())
             }
-            Entry::Vacant(_) => {}
-        };
+            Entry::Vacant(_) => Ok(()),
+        }
     }
 
-    pub fn compute_if_absent(&self, key: Vec<u8>, func: impl FnOnce(&mut HashSet<Vec<u8>>)) {
-        let entry = self.store.entry(key);
-        match entry {
-            Entry::Occupied(_) => {}
+    /// Compatibility wrapper for [`Self::try_compute_if_present`] that panics on error.
+    pub fn compute_if_present(&self, key: Vec<u8>, func: impl FnOnce(&mut HashSet<Vec<u8>>)) {
+        self.try_compute_if_present(key, func)
+            .unwrap_or_else(|error| panic!("set compute-if-present persistence failed: {error}"));
+    }
+
+    /// Computes only when `key` is absent, otherwise returns `Ok(())` without invoking `func`.
+    ///
+    /// An eligible callback runs once. An empty result creates no key or WAL frame; a non-empty
+    /// result is persisted before publication. Commit/rollback errors publish no callback state.
+    pub fn try_compute_if_absent(
+        &self,
+        key: Vec<u8>,
+        func: impl FnOnce(&mut HashSet<Vec<u8>>),
+    ) -> std::io::Result<()> {
+        match self.store.entry(key.clone()) {
+            Entry::Occupied(_) => Ok(()),
             Entry::Vacant(vacant_entry) => {
-                let mut set = HashSet::new();
-                func(&mut set);
-                vacant_entry.insert(set);
+                let mut working = HashSet::new();
+                func(&mut working);
+                if working.is_empty() {
+                    return Ok(());
+                }
+                let mut additions: Vec<_> = working.iter().cloned().collect();
+                additions.sort();
+                self.wal.commit_set_compute_batch(
+                    additions
+                        .into_iter()
+                        .map(|value| ComputeAction::SetAppend {
+                            key: key.clone(),
+                            value,
+                        })
+                        .collect(),
+                )?;
+                vacant_entry.insert(working);
+                Ok(())
             }
-        };
+        }
+    }
+
+    /// Compatibility wrapper for [`Self::try_compute_if_absent`] that panics on error.
+    pub fn compute_if_absent(&self, key: Vec<u8>, func: impl FnOnce(&mut HashSet<Vec<u8>>)) {
+        self.try_compute_if_absent(key, func)
+            .unwrap_or_else(|error| panic!("set compute-if-absent persistence failed: {error}"));
     }
 
     pub fn remove_from_set_callback(
@@ -204,26 +562,108 @@ impl<W: Write> DurableKeySetStore<W> {
         set_entry: Vec<u8>,
         key_removed_callback: impl FnOnce(&[u8]),
     ) {
-        let (key, set_entry) = self.wal.store_remove_from_set_event(key, set_entry);
-
-        match self.store.entry(key) {
+        #[cfg(test)]
+        let observed_key = key.clone();
+        let mut callback_entry = Some(set_entry);
+        let removed_key = match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
-                entry.get_mut().remove(&set_entry);
-                if entry.get().is_empty() {
-                    self.wal.store_delete_event(entry.key());
+                let removes_final_member = entry.get().len() == 1
+                    && entry
+                        .get()
+                        .contains(callback_entry.as_ref().expect("removal entry"));
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(entry.key(), MutationPhase::AcceptanceEntered);
+                if removes_final_member {
+                    if let Err(error) = self.wal.try_store_delete_event(entry.key()) {
+                        drop(entry);
+                        panic!("WAL delete rejected: {error}");
+                    }
+                    #[cfg(test)]
+                    self.mutation_observer
+                        .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
                     entry.remove();
-
-                    key_removed_callback(&set_entry);
+                    true
+                } else {
+                    let set_entry = callback_entry.take().expect("removal entry");
+                    let set_entry = match self
+                        .wal
+                        .try_store_remove_from_set_event(entry.key().clone(), set_entry)
+                    {
+                        Ok((_key, set_entry)) => set_entry,
+                        Err(error) => {
+                            drop(entry);
+                            panic!("WAL set removal rejected: {error}");
+                        }
+                    };
+                    #[cfg(test)]
+                    self.mutation_observer
+                        .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
+                    entry.get_mut().remove(&set_entry);
+                    false
                 }
             }
-            Entry::Vacant(_) => {}
+            Entry::Vacant(entry) => {
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(entry.key(), MutationPhase::AcceptanceEntered);
+                if let Err(error) = self.wal.try_store_remove_from_set_event(
+                    entry.key().clone(),
+                    callback_entry.take().expect("removal entry"),
+                ) {
+                    drop(entry);
+                    panic!("WAL set removal rejected: {error}");
+                }
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
+                drop(entry);
+                false
+            }
+        };
+        #[cfg(test)]
+        self.mutation_observer
+            .notify(&observed_key, MutationPhase::Published);
+        if removed_key {
+            key_removed_callback(
+                callback_entry
+                    .as_deref()
+                    .expect("final removal callback entry"),
+            );
         }
     }
 
     pub fn remove_key(&self, key: &[u8]) {
-        self.wal.store_delete_event(key);
-
-        self.store.remove(key);
+        match self.store.entry(key.to_vec()) {
+            Entry::Occupied(entry) => {
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(entry.key(), MutationPhase::AcceptanceEntered);
+                if let Err(error) = self.wal.try_store_delete_event(entry.key()) {
+                    drop(entry);
+                    panic!("WAL delete rejected: {error}");
+                }
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
+                entry.remove();
+            }
+            Entry::Vacant(entry) => {
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(entry.key(), MutationPhase::AcceptanceEntered);
+                if let Err(error) = self.wal.try_store_delete_event(entry.key()) {
+                    drop(entry);
+                    panic!("WAL delete rejected: {error}");
+                }
+                #[cfg(test)]
+                self.mutation_observer
+                    .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
+                drop(entry);
+            }
+        }
+        #[cfg(test)]
+        self.mutation_observer.notify(key, MutationPhase::Published);
     }
 
     pub fn size(&self) -> usize {
@@ -231,7 +671,71 @@ impl<W: Write> DurableKeySetStore<W> {
     }
 }
 
+#[cfg(test)]
+#[path = "mutation_ordering_tests/key_set.rs"]
+mod mutation_ordering_tests;
+
+#[cfg(test)]
 mod tests {
+
+    use super::{DurableKeySetStore, MutationObserver};
+    use crate::wal::WalStorage;
+    use dashmap::DashMap;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct FaultState {
+        bytes: Vec<u8>,
+        fail_after: Option<usize>,
+        fail_flush: bool,
+    }
+
+    #[derive(Clone, Default)]
+    struct FaultWriter(Arc<Mutex<FaultState>>);
+
+    impl Write for FaultWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut state = self.0.lock().unwrap();
+            match state.fail_after {
+                Some(0) => Err(io::Error::other("injected write failure")),
+                Some(remaining) => {
+                    let written = remaining.min(bytes.len());
+                    state.bytes.extend_from_slice(&bytes[..written]);
+                    state.fail_after = Some(remaining - written);
+                    Ok(written)
+                }
+                None => {
+                    state.bytes.extend_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.0.lock().unwrap().fail_flush {
+                Err(io::Error::other("injected flush failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn rollback(writer: &mut FaultWriter, checkpoint: usize) -> io::Result<()> {
+        writer.0.lock().unwrap().bytes.truncate(checkpoint);
+        Ok(())
+    }
+
+    fn fault_store() -> (DurableKeySetStore<FaultWriter>, Arc<Mutex<FaultState>>) {
+        let writer = FaultWriter::default();
+        let state = Arc::clone(&writer.0);
+        let store = DurableKeySetStore {
+            store: DashMap::new(),
+            wal: WalStorage::new_with_rollback(writer, rollback),
+            mutation_observer: MutationObserver::default(),
+        };
+        (store, state)
+    }
 
     #[test]
     fn simple_test() {
@@ -252,25 +756,25 @@ mod tests {
 
         let res_a = store.get_hashset(b"a").unwrap();
 
-        assert_eq!(res_a.contains(&b"apple".to_vec()[..]), true);
-        assert_eq!(res_a.contains(&b"article".to_vec()[..]), true);
-        assert_eq!(res_a.contains(&b"atmosphere".to_vec()[..]), true);
-        assert_eq!(res_a.contains(&b"banana".to_vec()[..]), false);
+        assert!(res_a.contains(&b"apple".to_vec()[..]));
+        assert!(res_a.contains(&b"article".to_vec()[..]));
+        assert!(res_a.contains(&b"atmosphere".to_vec()[..]));
+        assert!(!res_a.contains(&b"banana".to_vec()[..]));
 
         store.remove_from_set(b"a".to_vec(), b"article".to_vec());
         let res_a = store.get_hashset(b"a").unwrap();
-        assert_eq!(res_a.contains(&b"article".to_vec()[..]), false);
+        assert!(!res_a.contains(&b"article".to_vec()[..]));
 
         let res_b = store.get_hashset(b"b").unwrap();
         assert_eq!(res_b.len(), 1);
-        assert_eq!(res_b.contains(&b"banana".to_vec()[..]), true);
-        assert_eq!(res_b.contains(&b"apple".to_vec()[..]), false);
+        assert!(res_b.contains(&b"banana".to_vec()[..]));
+        assert!(!res_b.contains(&b"apple".to_vec()[..]));
 
         let res_c = store.get_hashset(b"c").unwrap();
         assert_eq!(res_c.len(), 2);
-        assert_eq!(res_c.contains(&b"cinema".to_vec()[..]), true);
-        assert_eq!(res_c.contains(&b"cinamon".to_vec()[..]), true);
-        assert_eq!(res_c.contains(&b"apple".to_vec()[..]), false);
+        assert!(res_c.contains(&b"cinema".to_vec()[..]));
+        assert!(res_c.contains(&b"cinamon".to_vec()[..]));
+        assert!(!res_c.contains(&b"apple".to_vec()[..]));
 
         store.remove_key(b"b");
         assert_eq!(store.size(), 2);
@@ -357,5 +861,168 @@ mod tests {
 
         store.remove_from_set(b"b".to_vec(), b"banana".to_vec());
         assert_eq!(store.size(), 0);
+    }
+
+    #[test]
+    fn partial_write_rejection_keeps_set_live_and_replay_state() {
+        let (store, state) = fault_store();
+        store.append(b"key".to_vec(), b"original".to_vec());
+        let prefix = state.lock().unwrap().bytes.clone();
+        state.lock().unwrap().fail_after = Some(5);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+
+        assert!(store
+            .try_compute(b"key".to_vec(), |set| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                set.insert(b"rejected".to_vec());
+            })
+            .is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            store.get_hashset(b"key").unwrap(),
+            [b"original".to_vec()].into_iter().collect()
+        );
+        assert_eq!(state.lock().unwrap().bytes, prefix);
+        assert_eq!(
+            crate::wal::read_for_set(&prefix)
+                .get(b"key".as_slice())
+                .unwrap(),
+            &[b"original".to_vec()].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn flush_rejection_errors_or_panics_without_set_publication() {
+        for compatibility in [false, true] {
+            let (store, state) = fault_store();
+            store.append(b"key".to_vec(), b"original".to_vec());
+            let prefix = state.lock().unwrap().bytes.clone();
+            state.lock().unwrap().fail_flush = true;
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if compatibility {
+                    store.compute(b"key".to_vec(), |set| {
+                        set.insert(b"rejected".to_vec());
+                    });
+                    Ok(())
+                } else {
+                    store.try_compute(b"key".to_vec(), |set| {
+                        set.insert(b"rejected".to_vec());
+                    })
+                }
+            }));
+            assert_eq!(outcome.is_err(), compatibility);
+            if !compatibility {
+                assert!(outcome.unwrap().is_err());
+            }
+            assert_eq!(
+                store.get_hashset(b"key").unwrap(),
+                [b"original".to_vec()].into_iter().collect()
+            );
+            assert_eq!(state.lock().unwrap().bytes, prefix);
+            assert_eq!(
+                crate::wal::read_for_set(&prefix)
+                    .get(b"key".as_slice())
+                    .unwrap(),
+                &[b"original".to_vec()].into_iter().collect()
+            );
+        }
+    }
+
+    #[test]
+    fn conditional_rejection_preserves_set_eligibility_and_state() {
+        for present in [true, false] {
+            for compatibility in [false, true] {
+                let (store, state) = fault_store();
+                if present {
+                    store.append(b"key".to_vec(), b"original".to_vec());
+                }
+                state.lock().unwrap().fail_flush = true;
+                let calls = std::sync::atomic::AtomicUsize::new(0);
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if present {
+                        if compatibility {
+                            store.compute_if_present(b"key".to_vec(), |set| {
+                                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                set.insert(b"rejected".to_vec());
+                            });
+                            Ok(())
+                        } else {
+                            store.try_compute_if_present(b"key".to_vec(), |set| {
+                                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                set.insert(b"rejected".to_vec());
+                            })
+                        }
+                    } else if compatibility {
+                        store.compute_if_absent(b"key".to_vec(), |set| {
+                            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            set.insert(b"rejected".to_vec());
+                        });
+                        Ok(())
+                    } else {
+                        store.try_compute_if_absent(b"key".to_vec(), |set| {
+                            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            set.insert(b"rejected".to_vec());
+                        })
+                    }
+                }));
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert_eq!(outcome.is_err(), compatibility);
+                if !compatibility {
+                    assert!(outcome.unwrap().is_err());
+                }
+                assert_eq!(store.contains_key(b"key"), present);
+                if present {
+                    assert_eq!(
+                        store.get_hashset(b"key").unwrap(),
+                        [b"original".to_vec()].into_iter().collect()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn async_rejection_errors_or_panics_without_set_publication() {
+        fn block_on<F: std::future::Future>(future: F) -> F::Output {
+            use std::pin::pin;
+            use std::task::{Context, Poll, Waker};
+            let waker = Waker::noop();
+            let mut context = Context::from_waker(waker);
+            let mut future = pin!(future);
+            loop {
+                if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+                    return value;
+                }
+            }
+        }
+        for compatibility in [false, true] {
+            let (store, state) = fault_store();
+            store.append(b"key".to_vec(), b"original".to_vec());
+            state.lock().unwrap().fail_flush = true;
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if compatibility {
+                    block_on(store.compute_async(b"key".to_vec(), async |set| {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        set.insert(b"rejected".to_vec());
+                    }));
+                    Ok(())
+                } else {
+                    block_on(store.try_compute_async(b"key".to_vec(), async |set| {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        set.insert(b"rejected".to_vec());
+                    }))
+                }
+            }));
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(outcome.is_err(), compatibility);
+            if !compatibility {
+                assert!(outcome.unwrap().is_err());
+            }
+            assert_eq!(
+                store.get_hashset(b"key").unwrap(),
+                [b"original".to_vec()].into_iter().collect()
+            );
+        }
     }
 }
