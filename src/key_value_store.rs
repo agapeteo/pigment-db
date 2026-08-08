@@ -297,7 +297,11 @@ impl<W: Write> DurableKeyValueStore<W> {
     }
 
     #[allow(clippy::result_unit_err)]
-    /// Persists a numeric increment while preserving the nested invalid-value result.
+    /// Persists a numeric increment while preserving the nested numeric-error result.
+    ///
+    /// The inner result is `Err(())` when the current value is not a native-endian
+    /// `u64` or when the addition would overflow. Rejected increments leave both
+    /// live and persisted state unchanged.
     pub fn try_increment_or_init(
         &self,
         key: Vec<u8>,
@@ -323,7 +327,9 @@ impl<W: Write> DurableKeyValueStore<W> {
                         }
                     };
                 let cur_num = u64::from_ne_bytes(bytes_arr);
-                let new_num = cur_num + increment_by;
+                let Some(new_num) = cur_num.checked_add(increment_by) else {
+                    return Ok(Err(()));
+                };
                 let (_key, new_num_bytes) = self
                     .wal
                     .try_store_put_event(entry.key().clone(), u64::to_ne_bytes(new_num).to_vec())?;
