@@ -1,13 +1,13 @@
 //! Key/set truncation and recovery matrix.
 
-use super::support::assert_v1_timestamp_contract;
+use super::support::assert_v2_timestamp_contract;
 use pigment_db::key_set_store::DurableKeySetStore;
 use pigment_db::{DurableStoreOptions, RecoveryStatus, TimestampGranularity};
 use std::fs;
 use std::time::Duration;
 
 #[test]
-fn fresh_key_set_uses_v1_header() {
+fn fresh_key_set_uses_v2_header() {
     let directory = tempfile::tempdir().unwrap();
 
     let outcome = DurableKeySetStore::try_init_new(directory.path()).unwrap();
@@ -15,12 +15,13 @@ fn fresh_key_set_uses_v1_header() {
     drop(outcome);
 
     let bytes = fs::read(directory.path().join("set.wal.dat")).unwrap();
-    assert_eq!(bytes.len(), 40);
+    assert_eq!(bytes.len(), 64);
     assert_eq!(&bytes[..8], b"PIGWAL\r\n");
+    assert_eq!(u16::from_le_bytes(bytes[8..10].try_into().unwrap()), 2);
     assert_eq!(bytes[12], 2);
     assert_eq!(
-        u32::from_le_bytes(bytes[36..40].try_into().unwrap()),
-        crc32fast::hash(&bytes[..36])
+        u32::from_le_bytes(bytes[60..64].try_into().unwrap()),
+        crc32fast::hash(&bytes[..60])
     );
     assert!(!directory.path().join(".set.wal.dat.next").exists());
 }
@@ -33,7 +34,8 @@ fn assert_set_prefix_for_every_cut(label: &str, accepted: &[u8], final_group: &[
         interrupted.extend_from_slice(&final_group[..group_cut]);
         fs::write(active, interrupted).unwrap();
 
-        let outcome = DurableKeySetStore::try_init_new(directory.path()).unwrap();
+        let outcome = DurableKeySetStore::try_init_new(directory.path())
+            .unwrap_or_else(|error| panic!("{label} cut={group_cut}: {error:?}"));
         assert_eq!(
             outcome.status(),
             RecoveryStatus::Recovered,
@@ -118,7 +120,7 @@ fn key_set_timestamp_groups_are_repeatable_across_reopens() {
     });
     drop(store);
 
-    assert_v1_timestamp_contract(
+    assert_v2_timestamp_contract(
         &fs::read(directory.path().join("set.wal.dat")).unwrap(),
         granularity,
     );

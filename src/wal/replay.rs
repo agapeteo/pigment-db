@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
-use super::format::V1CodecProbe;
+use super::format::{V1CodecProbe, V2CodecProbe};
 use super::model::{
     crc, KeyValueData, StoredAction, DELETE_ACT, MAP_PUT_ACT, MAP_REMOVE_ACT, PUT_ACT,
     SET_APPEND_ACT, SET_REMOVE_ACT,
@@ -206,6 +206,14 @@ fn checked_replay_frames(
             .collect();
     }
 
+    let version = bytes
+        .get(8..10)
+        .and_then(|value| value.try_into().ok())
+        .map(u16::from_le_bytes);
+    if version == Some(2) {
+        return checked_v2_replay_frames(bytes, expected_kind);
+    }
+
     let header_valid = bytes.len() >= V1CodecProbe::HEADER_LEN
         && V1CodecProbe::magic_is_valid(bytes)
         && V1CodecProbe::version_is_valid(bytes)
@@ -298,6 +306,148 @@ fn checked_replay_frames(
     Ok(frames)
 }
 
+fn checked_v2_replay_frames(
+    bytes: &[u8],
+    expected_kind: u8,
+) -> Result<Vec<ReplayFrame<'_>>, ValidationError> {
+    let mut frames = Vec::new();
+    let mut v2_offsets = Vec::new();
+    let mut cursor = 0_usize;
+    let mut previous_segment = None::<(u64, u64, usize)>;
+    while cursor < bytes.len() {
+        let segment_start = cursor;
+        let header_end = segment_start
+            .checked_add(V2CodecProbe::HEADER_LEN)
+            .filter(|end| *end <= bytes.len())
+            .ok_or(ValidationError::Truncated {
+                offset: segment_start,
+            })?;
+        let header = &bytes[segment_start..header_end];
+        if !V2CodecProbe::header_is_valid(header)
+            || V2CodecProbe::header_kind(header) != Some(expected_kind)
+        {
+            return Err(ValidationError::InvalidPayload {
+                offset: segment_start,
+            });
+        }
+        let segment_id = V2CodecProbe::header_segment_id(header).unwrap();
+        let segment_base = V2CodecProbe::header_segment_base(header).unwrap();
+        if let Some((previous_id, previous_base, previous_start)) = previous_segment {
+            let expected_id =
+                previous_id
+                    .checked_add(1)
+                    .ok_or(ValidationError::InvalidPayload {
+                        offset: segment_start,
+                    })?;
+            let previous_len = u64::try_from(segment_start - previous_start).map_err(|_| {
+                ValidationError::InvalidPayload {
+                    offset: segment_start,
+                }
+            })?;
+            let expected_base =
+                previous_base
+                    .checked_add(previous_len)
+                    .ok_or(ValidationError::InvalidPayload {
+                        offset: segment_start,
+                    })?;
+            if segment_id != expected_id || segment_base != expected_base {
+                return Err(ValidationError::InvalidPayload {
+                    offset: segment_start,
+                });
+            }
+        }
+        previous_segment = Some((segment_id, segment_base, segment_start));
+        cursor = header_end;
+
+        while cursor < bytes.len() && !bytes[cursor..].starts_with(b"PIGWAL\r\n") {
+            let offset = cursor;
+            let fixed_header_end = offset
+                .checked_add(54)
+                .filter(|end| *end <= bytes.len())
+                .ok_or(ValidationError::Truncated { offset })?;
+            let payload_len_u64 = u64::from_le_bytes(
+                bytes[offset + 6..offset + 14]
+                    .try_into()
+                    .expect("fixed V2 header bounds checked"),
+            );
+            let payload_len = usize::try_from(payload_len_u64)
+                .map_err(|_| ValidationError::InvalidPayload { offset })?;
+            let end = offset
+                .checked_add(V2CodecProbe::EMPTY_RECORD_LEN)
+                .and_then(|fixed| fixed.checked_add(payload_len))
+                .filter(|end| *end <= bytes.len())
+                .ok_or(ValidationError::Truncated { offset })?;
+            let frame = &bytes[offset..end];
+            let action = frame[3];
+            let local_start = u64::try_from(offset - segment_start)
+                .map_err(|_| ValidationError::InvalidPayload { offset })?;
+            let global_start = segment_base
+                .checked_add(local_start)
+                .ok_or(ValidationError::InvalidPayload { offset })?;
+            let structurally_valid = fixed_header_end <= bytes.len()
+                && V2CodecProbe::record_marker_is_valid(frame)
+                && V2CodecProbe::record_version_is_valid(frame)
+                && V2CodecProbe::record_action_is_valid(frame)
+                && V2CodecProbe::record_header_length_is_valid(frame)
+                && V2CodecProbe::record_length_complement_is_valid(frame)
+                && V2CodecProbe::record_physical_start_is_valid(frame, global_start)
+                && V2CodecProbe::record_mutation_start_is_valid(frame, segment_base)
+                && V2CodecProbe::record_index_count_are_valid(frame)
+                && V2CodecProbe::record_timestamp_bucket(frame).is_some()
+                && V2CodecProbe::payload_is_valid(
+                    expected_kind,
+                    action,
+                    &frame[54..54 + payload_len],
+                )
+                && V2CodecProbe::record_crc_is_valid(frame);
+            if !structurally_valid {
+                return Err(ValidationError::InvalidPayload { offset });
+            }
+            frames.push(ReplayFrame {
+                action,
+                data: &frame[54..54 + payload_len],
+                start_offset: offset,
+                end_offset: end,
+                group_index: u32::from_le_bytes(frame[38..42].try_into().unwrap()),
+                group_count: u32::from_le_bytes(frame[42..46].try_into().unwrap()),
+                timestamp_bucket: u64::from_le_bytes(frame[46..54].try_into().unwrap()),
+            });
+            v2_offsets.push((
+                global_start,
+                u64::from_le_bytes(frame[30..38].try_into().unwrap()),
+            ));
+            cursor = end;
+        }
+    }
+
+    let mut group_start = 0;
+    while group_start < frames.len() {
+        let mutation_start = v2_offsets[group_start].1;
+        let count = frames[group_start].group_count as usize;
+        if mutation_start != v2_offsets[group_start].0
+            || frames[group_start].group_index != 0
+            || group_start + count > frames.len()
+        {
+            return Err(ValidationError::Truncated {
+                offset: frames[group_start].start_offset,
+            });
+        }
+        for group_index in 0..count {
+            if v2_offsets[group_start + group_index].1 != mutation_start
+                || frames[group_start + group_index].group_index != group_index as u32
+                || frames[group_start + group_index].group_count != count as u32
+            {
+                return Err(ValidationError::InvalidPayload {
+                    offset: frames[group_start + group_index].start_offset,
+                });
+            }
+        }
+        group_start += count;
+    }
+
+    Ok(frames)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReplaySnapshot<S> {
     pub(crate) snapshot: S,
@@ -310,7 +460,14 @@ pub(crate) struct ReplaySnapshot<S> {
 }
 
 fn initial_timestamp_state(bytes: &[u8]) -> (u64, u64) {
-    if bytes.starts_with(b"PIGWAL\r\n") && bytes.len() >= V1CodecProbe::HEADER_LEN {
+    if bytes.get(8..10) == Some(2_u16.to_le_bytes().as_slice())
+        && bytes.len() >= V2CodecProbe::HEADER_LEN
+    {
+        (
+            V2CodecProbe::header_granularity(bytes).unwrap(),
+            V2CodecProbe::header_base_bucket(bytes).unwrap_or(0),
+        )
+    } else if bytes.starts_with(b"PIGWAL\r\n") && bytes.len() >= V1CodecProbe::HEADER_LEN {
         let granularity = V1CodecProbe::granularity(bytes).unwrap();
         let base_bucket = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
         (granularity, base_bucket)
@@ -326,7 +483,7 @@ pub(crate) enum TailReplay<S> {
     RecoverableTail {
         replay: ReplaySnapshot<S>,
         tail_offset: usize,
-        accepted_header: Option<[u8; V1CodecProbe::HEADER_LEN]>,
+        accepted_header: Option<Vec<u8>>,
     },
     Invalid(ValidationError),
 }
@@ -348,6 +505,9 @@ fn replay_v1_tail<S>(
     expected_kind: u8,
     replay: fn(&[u8]) -> Result<ReplaySnapshot<S>, ValidationError>,
 ) -> TailReplay<S> {
+    if bytes.get(8..10) == Some(2_u16.to_le_bytes().as_slice()) {
+        return replay_v2_tail(bytes, expected_kind, replay);
+    }
     if let Some(offset) = terminal_fragment_start(bytes, expected_kind) {
         let accepted = match replay(&bytes[..offset]) {
             Ok(accepted) => Some((accepted, offset)),
@@ -369,7 +529,7 @@ fn replay_v1_tail<S>(
             return TailReplay::RecoverableTail {
                 replay: accepted,
                 tail_offset,
-                accepted_header: bytes[..V1CodecProbe::HEADER_LEN].try_into().ok(),
+                accepted_header: bytes.get(..V1CodecProbe::HEADER_LEN).map(<[u8]>::to_vec),
             };
         }
     }
@@ -423,11 +583,234 @@ fn replay_v1_tail<S>(
             TailReplay::RecoverableTail {
                 replay: accepted,
                 tail_offset,
-                accepted_header: bytes[..V1CodecProbe::HEADER_LEN].try_into().ok(),
+                accepted_header: bytes.get(..V1CodecProbe::HEADER_LEN).map(<[u8]>::to_vec),
             }
         }
         Err(error) => TailReplay::Invalid(error),
     }
+}
+
+fn replay_v2_tail<S>(
+    bytes: &[u8],
+    expected_kind: u8,
+    replay: fn(&[u8]) -> Result<ReplaySnapshot<S>, ValidationError>,
+) -> TailReplay<S> {
+    match replay(bytes) {
+        Ok(replayed) => TailReplay::Complete(replayed),
+        Err(error @ ValidationError::Truncated { offset })
+            if bytes
+                .get(..V2CodecProbe::HEADER_LEN)
+                .is_some_and(V2CodecProbe::header_is_valid)
+                && (incomplete_v2_record_matches(
+                    &bytes[offset..],
+                    offset,
+                    bytes,
+                    expected_kind,
+                ) || complete_v2_group_prefix(
+                    &bytes[offset..],
+                    offset,
+                    bytes,
+                    expected_kind,
+                )
+                .is_some()) =>
+        {
+            match replay(&bytes[..offset]) {
+                Ok(accepted) => TailReplay::RecoverableTail {
+                    replay: accepted,
+                    tail_offset: offset,
+                    accepted_header: bytes.get(..V2CodecProbe::HEADER_LEN).map(<[u8]>::to_vec),
+                },
+                Err(ValidationError::Truncated {
+                    offset: group_start,
+                }) if group_start < offset => {
+                    let Some(group) = complete_v2_group_prefix(
+                        &bytes[group_start..offset],
+                        group_start,
+                        bytes,
+                        expected_kind,
+                    ) else {
+                        return TailReplay::Invalid(error);
+                    };
+                    if !incomplete_v2_group_member_matches(&bytes[offset..], offset, bytes, group) {
+                        return TailReplay::Invalid(error);
+                    }
+                    match replay(&bytes[..group_start]) {
+                        Ok(accepted) => TailReplay::RecoverableTail {
+                            replay: accepted,
+                            tail_offset: group_start,
+                            accepted_header: bytes
+                                .get(..V2CodecProbe::HEADER_LEN)
+                                .map(<[u8]>::to_vec),
+                        },
+                        Err(_) => TailReplay::Invalid(error),
+                    }
+                }
+                Err(_) => TailReplay::Invalid(error),
+            }
+        }
+        Err(error) => TailReplay::Invalid(error),
+    }
+}
+
+fn incomplete_v2_record_matches(
+    fragment: &[u8],
+    offset: usize,
+    bytes: &[u8],
+    expected_kind: u8,
+) -> bool {
+    if fragment.is_empty() {
+        return false;
+    }
+    let marker = [0xa7, 0xd1];
+    let header_len = 54_u16.to_le_bytes();
+    if !present_field_prefix_matches(fragment, 0, &marker)
+        || !present_field_prefix_matches(fragment, 2, &[2])
+        || fragment
+            .get(3)
+            .is_some_and(|action| !action_matches_kind(expected_kind, *action))
+        || !present_field_prefix_matches(fragment, 4, &header_len)
+    {
+        return false;
+    }
+    let Some(header) = bytes.get(..V2CodecProbe::HEADER_LEN) else {
+        return false;
+    };
+    let Some(segment_base) = V2CodecProbe::header_segment_base(header) else {
+        return false;
+    };
+    let Some(global_start) = segment_base.checked_add(offset as u64) else {
+        return false;
+    };
+    if !present_field_prefix_matches(fragment, 22, &global_start.to_le_bytes()) {
+        return false;
+    }
+    if let Some(length) = fragment
+        .get(6..14)
+        .and_then(|value| value.try_into().ok())
+        .map(u64::from_le_bytes)
+    {
+        if !present_field_prefix_matches(fragment, 14, &(!length).to_le_bytes()) {
+            return false;
+        }
+        let Ok(payload_len) = usize::try_from(length) else {
+            return false;
+        };
+        let Some(complete_len) = V2CodecProbe::EMPTY_RECORD_LEN.checked_add(payload_len) else {
+            return false;
+        };
+        if fragment.len() >= complete_len {
+            return false;
+        }
+        if fragment.len() >= 54 + payload_len {
+            let Some(action) = fragment.get(3).copied() else {
+                return false;
+            };
+            if !V2CodecProbe::payload_is_valid(
+                expected_kind,
+                action,
+                &fragment[54..54 + payload_len],
+            ) {
+                return false;
+            }
+            let available_footer = fragment.len().saturating_sub(54 + payload_len).min(8);
+            if fragment[54 + payload_len..54 + payload_len + available_footer]
+                != global_start.to_le_bytes()[..available_footer]
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[derive(Clone, Copy)]
+struct OpenV2Group {
+    mutation_start: u64,
+    next_index: u32,
+    count: u32,
+    timestamp_bucket: u64,
+}
+
+fn complete_v2_group_prefix(
+    prefix: &[u8],
+    group_start: usize,
+    bytes: &[u8],
+    expected_kind: u8,
+) -> Option<OpenV2Group> {
+    let header = bytes.get(..V2CodecProbe::HEADER_LEN)?;
+    let segment_base = V2CodecProbe::header_segment_base(header)?;
+    let mutation_start = segment_base.checked_add(group_start as u64)?;
+    let mut cursor = 0_usize;
+    let mut next_index = 0_u32;
+    let mut declared_count = None;
+    let mut timestamp_bucket = None;
+    while cursor < prefix.len() {
+        let frame_start = group_start.checked_add(cursor)?;
+        let frame_tail = &prefix[cursor..];
+        let payload_len = frame_tail
+            .get(6..14)
+            .and_then(|value| value.try_into().ok())
+            .map(u64::from_le_bytes)
+            .and_then(|value| usize::try_from(value).ok())?;
+        let frame_len = V2CodecProbe::EMPTY_RECORD_LEN.checked_add(payload_len)?;
+        let frame = frame_tail.get(..frame_len)?;
+        let global_start = segment_base.checked_add(frame_start as u64)?;
+        let count = u32::from_le_bytes(frame.get(42..46)?.try_into().ok()?);
+        let timestamp = u64::from_le_bytes(frame.get(46..54)?.try_into().ok()?);
+        if !V2CodecProbe::record_marker_is_valid(frame)
+            || !V2CodecProbe::record_version_is_valid(frame)
+            || !V2CodecProbe::record_action_is_valid(frame)
+            || !V2CodecProbe::record_header_length_is_valid(frame)
+            || !V2CodecProbe::record_length_complement_is_valid(frame)
+            || !V2CodecProbe::record_physical_start_is_valid(frame, global_start)
+            || u64::from_le_bytes(frame.get(30..38)?.try_into().ok()?) != mutation_start
+            || u32::from_le_bytes(frame.get(38..42)?.try_into().ok()?) != next_index
+            || declared_count.is_some_and(|declared| declared != count)
+            || timestamp_bucket.is_some_and(|declared| declared != timestamp)
+            || !V2CodecProbe::payload_is_valid(
+                expected_kind,
+                frame[3],
+                &frame[54..54 + payload_len],
+            )
+            || !V2CodecProbe::record_crc_is_valid(frame)
+        {
+            return None;
+        }
+        declared_count = Some(count);
+        timestamp_bucket = Some(timestamp);
+        next_index = next_index.checked_add(1)?;
+        cursor = cursor.checked_add(frame_len)?;
+    }
+    let count = declared_count?;
+    (next_index > 0 && next_index < count).then_some(OpenV2Group {
+        mutation_start,
+        next_index,
+        count,
+        timestamp_bucket: timestamp_bucket?,
+    })
+}
+
+fn incomplete_v2_group_member_matches(
+    fragment: &[u8],
+    physical_start: usize,
+    bytes: &[u8],
+    group: OpenV2Group,
+) -> bool {
+    let Some(header) = bytes.get(..V2CodecProbe::HEADER_LEN) else {
+        return false;
+    };
+    let Some(segment_base) = V2CodecProbe::header_segment_base(header) else {
+        return false;
+    };
+    let Some(physical_start) = segment_base.checked_add(physical_start as u64) else {
+        return false;
+    };
+    group.next_index < group.count
+        && present_field_prefix_matches(fragment, 22, &physical_start.to_le_bytes())
+        && present_field_prefix_matches(fragment, 30, &group.mutation_start.to_le_bytes())
+        && present_field_prefix_matches(fragment, 38, &group.next_index.to_le_bytes())
+        && present_field_prefix_matches(fragment, 42, &group.count.to_le_bytes())
+        && present_field_prefix_matches(fragment, 46, &group.timestamp_bucket.to_le_bytes())
 }
 
 fn terminal_fragment_start(bytes: &[u8], expected_kind: u8) -> Option<usize> {
@@ -698,7 +1081,9 @@ fn replay_key_value_with_target(
 fn append_action(bytes: &mut Vec<u8>, action: &StoredAction) {
     bytes.extend_from_slice(&action.act_type().to_ne_bytes());
     bytes.extend_from_slice(&action.crc().to_ne_bytes());
-    bytes.extend_from_slice(&action.data_size().to_ne_bytes());
+    let data_size =
+        u32::try_from(action.data_size()).expect("legacy snapshot payload must fit u32");
+    bytes.extend_from_slice(&data_size.to_ne_bytes());
     bytes.extend_from_slice(action.data());
     bytes.extend_from_slice(&action.start_offset().to_ne_bytes());
 }
@@ -944,7 +1329,37 @@ pub(crate) fn key_map_is_proper_snapshot_prefix(
 #[cfg(test)]
 mod tests {
     use super::{append_action, replay_key_value, CheckedFrames, ValidationError};
+    use crate::wal::format::{V2CodecProbe, V2HeaderProbeFields, V2RecordProbeFields};
     use crate::wal::model::{KeyValueData, StoredAction};
+
+    #[test]
+    fn complete_v2_key_value_record_replays() {
+        let mut bytes = V2CodecProbe::encode_header(V2HeaderProbeFields {
+            kind: 1,
+            granularity_nanos: 60_000_000_000,
+            base_bucket: 0,
+            segment_id: 0,
+            segment_base: 0,
+        })
+        .to_vec();
+        let payload =
+            bincode::serialize(&KeyValueData::new(b"key".to_vec(), b"value".to_vec())).unwrap();
+        bytes.extend_from_slice(&V2CodecProbe::encode_complete_record(V2RecordProbeFields {
+            action: 1,
+            payload: &payload,
+            physical_start: V2CodecProbe::HEADER_LEN as u64,
+            mutation_start: V2CodecProbe::HEADER_LEN as u64,
+            index: 0,
+            count: 1,
+            timestamp_bucket: 0,
+        }));
+
+        let replay = replay_key_value(&bytes).expect("complete V2 record must replay");
+        assert_eq!(
+            replay.snapshot.get(b"key".as_slice()),
+            Some(&b"value".to_vec())
+        );
+    }
 
     #[test]
     fn complete_replay_does_not_retain_a_snapshot_per_frame() {

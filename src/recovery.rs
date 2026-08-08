@@ -1,10 +1,10 @@
 //! Recovery-aware initialization contracts.
 //!
-//! Normal startup creates or opens the portable, boundary-aware V1 WAL through
-//! validated same-directory staging. Complete legacy WALs are never rewritten
-//! implicitly: callers receive [`RecoveryError::MigrationRequired`] and must use
-//! the standalone `pigment-db-migrate` command. Truncated or corrupt input is
-//! preserved for diagnosis.
+//! Normal startup creates or opens a portable V2 WAL segment chain through
+//! validated same-directory staging. Complete legacy and V1 WALs are never
+//! rewritten implicitly: callers receive [`RecoveryError::MigrationRequired`]
+//! and must use the standalone `pigment-db-migrate` command. Truncated or
+//! corrupt input is preserved for diagnosis.
 
 use std::error::Error;
 use std::fmt;
@@ -85,7 +85,7 @@ pub enum RecoveryError {
     /// Capability failures occur before authority-changing startup work. Once
     /// all required preflights succeed, later failures use [`Self::Io`].
     UnsupportedDurability { source: DurabilitySupportError },
-    /// A complete legacy WAL must be converted with the standalone migration tool.
+    /// A complete legacy or V1 WAL must be converted with the standalone migration tool.
     MigrationRequired { path: PathBuf },
     /// Replay provenance could not prove which candidate is authoritative.
     AuthorityUndetermined {
@@ -108,7 +108,7 @@ impl fmt::Display for RecoveryError {
             Self::UnsupportedDurability { source } => write!(formatter, "{source}"),
             Self::MigrationRequired { path } => write!(
                 formatter,
-                "legacy WAL requires explicit migration with pigment-db-migrate: {}",
+                "legacy or V1 WAL requires explicit migration with pigment-db-migrate: {}",
                 path.display()
             ),
             Self::AuthorityUndetermined {

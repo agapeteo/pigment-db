@@ -1,7 +1,8 @@
 //! RED–GREEN tests for private durability state machines.
 
 use super::{
-    format::V1CodecProbe, ComputeAction, PersistenceOperation, PrivateMutationFailure, WalStorage,
+    format::{V1CodecProbe, V2CodecProbe},
+    ComputeAction, PersistenceOperation, PrivateMutationFailure, WalStorage,
 };
 use crate::config::DurabilityPolicy;
 use crate::durability::{
@@ -380,7 +381,7 @@ fn failed_staging_cleanup_is_diagnosed_as_the_only_remaining_non_authority() {
     assert!(!active.exists());
     assert_eq!(
         std::fs::read(&staging).unwrap().len(),
-        V1CodecProbe::HEADER_LEN
+        V2CodecProbe::HEADER_LEN
     );
 }
 
@@ -410,13 +411,13 @@ fn fresh_publication_requires_parent_barrier_before_store_exposure() {
     assert_eq!(directory_barrier_calls(directory.path()), 1);
     assert_eq!(
         std::fs::read(&active).unwrap().len(),
-        V1CodecProbe::HEADER_LEN
+        V2CodecProbe::HEADER_LEN
     );
     assert!(DurableKeyValueStore::try_init_new(directory.path()).is_ok());
 }
 
 #[test]
-fn active_replacement_stops_after_failed_backup_authority_barrier() {
+fn deferred_granularity_rotation_fails_closed_when_directory_barrier_fails() {
     let directory = tempfile::tempdir().unwrap();
     drop(DurableKeyValueStore::try_init_new(directory.path()).unwrap());
     let active = directory.path().join("kv.wal.dat");
@@ -429,28 +430,35 @@ fn active_replacement_stops_after_failed_backup_authority_barrier() {
     let options =
         crate::config::durability_probe_options(true).with_timestamp_granularity(granularity);
 
-    let error =
-        match DurableKeyValueStore::try_init_new_with_probe_options(directory.path(), options) {
-            Err(error) => error,
-            Ok(_) => panic!("failed backup authority barrier must stop publication"),
-        };
-
-    assert!(matches!(
-        error,
-        crate::RecoveryError::Io {
-            operation: crate::RecoveryOperation::Publish,
-            ref path,
-            ..
-        } if path == directory.path()
-    ));
+    let outcome =
+        DurableKeyValueStore::try_init_new_with_probe_options(directory.path(), options).unwrap();
+    assert_eq!(directory_barrier_calls(directory.path()), 0);
+    let error = outcome
+        .store()
+        .try_put(b"rejected".to_vec(), b"value".to_vec())
+        .expect_err("failed rotation publication barrier must reject the mutation");
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
     assert_eq!(directory_barrier_calls(directory.path()), 1);
-    assert!(!active.exists());
-    assert_eq!(std::fs::read(&recovery).unwrap(), original);
-    assert!(staging.is_file());
+    assert!(active.is_file());
+    assert_eq!(
+        std::fs::read(
+            directory
+                .path()
+                .join("kv.wal.dat.segment-00000000000000000000")
+        )
+        .unwrap(),
+        original
+    );
+    assert!(!recovery.exists());
+    assert!(!staging.exists());
+    assert!(outcome
+        .store()
+        .try_put(b"later".to_vec(), b"value".to_vec())
+        .is_err());
 }
 
 #[test]
-fn active_replacement_keeps_recovery_when_publication_barrier_fails() {
+fn deferred_granularity_rotation_publishes_one_new_segment_before_mutation() {
     let directory = tempfile::tempdir().unwrap();
     drop(DurableKeyValueStore::try_init_new(directory.path()).unwrap());
     let recovery = directory.path().join(".kv.wal.dat");
@@ -460,29 +468,29 @@ fn active_replacement_keeps_recovery_when_publication_barrier_fails() {
     let options =
         crate::config::durability_probe_options(true).with_timestamp_granularity(granularity);
 
-    let error =
-        match DurableKeyValueStore::try_init_new_with_probe_options(directory.path(), options) {
-            Err(error) => error,
-            Ok(_) => panic!("failed replacement publication barrier must not expose a store"),
-        };
-
-    assert!(matches!(
-        error,
-        crate::RecoveryError::Io {
-            operation: crate::RecoveryOperation::Publish,
-            ref path,
-            ..
-        } if path == directory.path()
-    ));
-    assert_eq!(directory_barrier_calls(directory.path()), 2);
+    let outcome =
+        DurableKeyValueStore::try_init_new_with_probe_options(directory.path(), options).unwrap();
+    assert_eq!(directory_barrier_calls(directory.path()), 0);
+    outcome
+        .store()
+        .try_put(b"accepted".to_vec(), b"value".to_vec())
+        .unwrap();
+    assert_eq!(directory_barrier_calls(directory.path()), 1);
     assert!(directory.path().join("kv.wal.dat").is_file());
-    assert!(recovery.is_file());
+    assert!(!recovery.exists());
+    let active = std::fs::read(directory.path().join("kv.wal.dat")).unwrap();
+    assert_eq!(
+        u64::from_le_bytes(active[16..24].try_into().unwrap()),
+        1_000_000_000
+    );
 }
 
 #[test]
-fn active_replacement_cleanup_barrier_failure_preserves_new_authority() {
+fn opening_with_changed_granularity_does_not_rewrite_immutable_segment() {
     let directory = tempfile::tempdir().unwrap();
     drop(DurableKeyValueStore::try_init_new(directory.path()).unwrap());
+    let active = directory.path().join("kv.wal.dat");
+    let original = std::fs::read(&active).unwrap();
     let _fault =
         fail_directory_barrier_for(directory.path().to_path_buf(), 3, std::io::ErrorKind::Other);
     let granularity = crate::TimestampGranularity::try_from(Duration::from_secs(1)).unwrap();
@@ -492,11 +500,12 @@ fn active_replacement_cleanup_barrier_failure_preserves_new_authority() {
     let outcome =
         DurableKeyValueStore::try_init_new_with_probe_options(directory.path(), options).unwrap();
 
-    assert_eq!(directory_barrier_calls(directory.path()), 3);
+    assert_eq!(directory_barrier_calls(directory.path()), 0);
     assert_eq!(
         outcome.store().runtime_policy_probe(),
         DurabilityPolicy::Physical
     );
+    assert_eq!(std::fs::read(active).unwrap(), original);
     drop(outcome);
     assert!(DurableKeyValueStore::try_init_new(directory.path()).is_ok());
 }
@@ -536,21 +545,36 @@ fn recovery_authority_remains_available_when_publication_barrier_fails() {
 fn active_cleanup_removal_failure_defers_only_obsolete_recovery() {
     let directory = tempfile::tempdir().unwrap();
     drop(DurableKeyValueStore::try_init_new(directory.path()).unwrap());
-    let recovery = directory.path().join(".kv.wal.dat");
-    let cleanup_fault = fail_cleanup_for(recovery.clone());
-    let granularity = crate::TimestampGranularity::try_from(Duration::from_secs(1)).unwrap();
-    let options =
-        crate::config::durability_probe_options(true).with_timestamp_granularity(granularity);
+    let staging = directory.path().join(".kv.wal.dat.next");
+    std::fs::write(&staging, b"obsolete-rotation-staging").unwrap();
+    let cleanup_fault = fail_cleanup_for(staging.clone());
 
-    let outcome =
-        DurableKeyValueStore::try_init_new_with_probe_options(directory.path(), options).unwrap();
+    let outcome = DurableKeyValueStore::try_init_new_with_probe_options(
+        directory.path(),
+        crate::config::durability_probe_options(true),
+    )
+    .unwrap();
 
     assert!(directory.path().join("kv.wal.dat").is_file());
-    assert!(recovery.is_file());
-    assert_eq!(directory_barrier_calls(directory.path()), 2);
+    assert!(staging.is_file());
     drop(outcome);
     drop(cleanup_fault);
     assert!(DurableKeyValueStore::try_init_new(directory.path()).is_ok());
+    assert!(!staging.exists());
+}
+
+#[test]
+fn prepared_v2_repair_preserves_an_offset_above_four_gibibytes() {
+    let file = tempfile::tempfile().unwrap();
+    let offset = u64::from(u32::MAX) + 4096;
+    file.set_len(offset).unwrap();
+
+    let wal =
+        WalStorage::from_prepared_file_v2_with_timestamp_state(file, offset, 60_000_000_000, 0);
+
+    let state = wal.wal_state.read().unwrap();
+    assert_eq!(state.offset, offset);
+    assert_eq!(state.active_len, offset);
 }
 
 #[test]
@@ -661,7 +685,7 @@ fn failed_physical_barrier_does_not_advance_offset_or_timestamp_bucket() {
 
     assert!(error.to_string().contains("data barrier"));
     let state = wal.wal_state.read().unwrap();
-    assert_eq!(state.offset, V1CodecProbe::HEADER_LEN as u32);
+    assert_eq!(state.offset, V1CodecProbe::HEADER_LEN as u64);
     assert_eq!(state.last_bucket, 0);
     assert_eq!(handle.data_barrier_calls(), 1);
     assert_eq!(handle.truncate_calls(), 1);
@@ -906,14 +930,14 @@ fn confirmed_rejection_restores_checkpoint_and_allows_the_next_mutation() {
         .unwrap_err();
     {
         let state = wal.wal_state.read().unwrap();
-        assert_eq!(state.offset, V1CodecProbe::HEADER_LEN as u32);
+        assert_eq!(state.offset, V1CodecProbe::HEADER_LEN as u64);
         assert_eq!(state.last_bucket, 0);
     }
 
     wal.try_store_put_event(b"accepted".to_vec(), b"new".to_vec())
         .unwrap();
     let state = wal.wal_state.read().unwrap();
-    assert!(state.offset > V1CodecProbe::HEADER_LEN as u32);
+    assert!(state.offset > V1CodecProbe::HEADER_LEN as u64);
     assert_eq!(handle.truncate_calls(), 1);
     assert_eq!(handle.full_barrier_calls(), 1);
     assert_eq!(handle.data_barrier_calls(), 1);

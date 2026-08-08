@@ -1,6 +1,6 @@
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::RwLock;
 
 use log::{error, info};
@@ -10,7 +10,7 @@ use crate::wal::model::*;
 use std::array::TryFromSliceError;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::convert::TryInto;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_GRANULARITY_NANOS: u64 = 60_000_000_000;
@@ -39,7 +39,8 @@ mod ordering_tests;
 mod durability_tests;
 
 struct WalState<W: Write> {
-    offset: u32,
+    offset: u64,
+    active_len: u64,
     writer: W,
     rollback: Option<fn(&mut W, usize) -> std::io::Result<()>>,
     health: WalHealth,
@@ -50,12 +51,36 @@ struct WalState<W: Write> {
     durability_policy: crate::config::DurabilityPolicy,
     data_barrier: Option<crate::durability::DataBarrier<W>>,
     rollback_barrier: Option<crate::durability::DataBarrier<W>>,
+    rotation: Option<RotationSupport<W>>,
+    frame_buffer: Vec<u8>,
+}
+
+struct RotationSupport<W: Write> {
+    state: FileRotationState,
+    rotate: fn(
+        &mut W,
+        &mut FileRotationState,
+        u64,
+        u64,
+        crate::config::DurabilityPolicy,
+    ) -> std::io::Result<()>,
+}
+
+struct FileRotationState {
+    active_path: PathBuf,
+    kind: u8,
+    segment_id: u64,
+    segment_base: u64,
+    target_bytes: u64,
+    force_before_next_mutation: bool,
+    failed_closed: bool,
 }
 
 #[derive(Clone, Copy)]
 enum WalFormat {
     Legacy,
     V1,
+    V2,
 }
 
 enum WalHealth {
@@ -175,6 +200,7 @@ impl WalStorage<File> {
 
         let wal_state = WalState {
             offset: 0,
+            active_len: 0,
             writer: file,
             rollback: Some(rollback_file),
             health: WalHealth::Ready,
@@ -185,6 +211,8 @@ impl WalStorage<File> {
             durability_policy: crate::config::DurabilityPolicy::Buffered,
             data_barrier: Some(crate::durability::synchronize_file_data),
             rollback_barrier: Some(crate::durability::synchronize_file_all),
+            rotation: None,
+            frame_buffer: Vec::new(),
         };
         let wal_state = RwLock::new(wal_state);
 
@@ -219,6 +247,21 @@ impl WalStorage<File> {
         )
     }
 
+    pub(crate) fn try_open_file_based_v2_with_timestamp_state(
+        file_path: &Path,
+        validated_len: u64,
+        granularity_nanos: u64,
+        last_bucket: u64,
+    ) -> std::io::Result<Self> {
+        Self::try_open_file_based_with_format(
+            file_path,
+            validated_len,
+            WalFormat::V2,
+            granularity_nanos,
+            last_bucket,
+        )
+    }
+
     fn try_open_file_based_with_format(
         file_path: &Path,
         validated_len: u64,
@@ -226,12 +269,7 @@ impl WalStorage<File> {
         granularity_nanos: u64,
         last_bucket: u64,
     ) -> std::io::Result<Self> {
-        let offset = u32::try_from(validated_len).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "WAL length exceeds supported offset range",
-            )
-        })?;
+        let offset = validated_len;
         let file = OpenOptions::new().append(true).open(file_path)?;
         if file.metadata()?.len() != validated_len {
             return Err(std::io::Error::new(
@@ -243,6 +281,7 @@ impl WalStorage<File> {
         Ok(Self {
             wal_state: RwLock::new(WalState {
                 offset,
+                active_len: validated_len,
                 writer: file,
                 rollback: Some(rollback_file),
                 health: WalHealth::Ready,
@@ -253,6 +292,8 @@ impl WalStorage<File> {
                 durability_policy: crate::config::DurabilityPolicy::Buffered,
                 data_barrier: Some(crate::durability::synchronize_file_data),
                 rollback_barrier: Some(crate::durability::synchronize_file_all),
+                rotation: None,
+                frame_buffer: Vec::new(),
             }),
         })
     }
@@ -270,7 +311,8 @@ impl WalStorage<File> {
     ) -> Self {
         Self {
             wal_state: RwLock::new(WalState {
-                offset,
+                offset: u64::from(offset),
+                active_len: u64::from(offset),
                 writer: file,
                 rollback: Some(rollback_file),
                 health: WalHealth::Ready,
@@ -281,6 +323,34 @@ impl WalStorage<File> {
                 durability_policy: crate::config::DurabilityPolicy::Buffered,
                 data_barrier: Some(crate::durability::synchronize_file_data),
                 rollback_barrier: Some(crate::durability::synchronize_file_all),
+                rotation: None,
+                frame_buffer: Vec::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn from_prepared_file_v2_with_timestamp_state(
+        file: File,
+        offset: u64,
+        granularity_nanos: u64,
+        last_bucket: u64,
+    ) -> Self {
+        Self {
+            wal_state: RwLock::new(WalState {
+                offset,
+                active_len: offset,
+                writer: file,
+                rollback: Some(rollback_file),
+                health: WalHealth::Ready,
+                format: WalFormat::V2,
+                granularity_nanos,
+                last_bucket,
+                clock: system_unix_nanos,
+                durability_policy: crate::config::DurabilityPolicy::Buffered,
+                data_barrier: Some(crate::durability::synchronize_file_data),
+                rollback_barrier: Some(crate::durability::synchronize_file_all),
+                rotation: None,
+                frame_buffer: Vec::new(),
             }),
         }
     }
@@ -289,6 +359,165 @@ impl WalStorage<File> {
     pub(crate) fn sync_all(&self) -> std::io::Result<()> {
         self.wal_state.read().unwrap().writer.sync_all()
     }
+
+    pub(crate) fn enable_file_rotation(
+        &self,
+        active_path: PathBuf,
+        target_bytes: u64,
+        requested_granularity_nanos: Option<u64>,
+    ) -> std::io::Result<()> {
+        let mut header = [0_u8; format::V2CodecProbe::HEADER_LEN];
+        let mut header_file = File::open(&active_path)?;
+        header_file.read_exact(&mut header)?;
+        if !format::V2CodecProbe::header_is_valid(&header) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "active WAL is not a valid V2 segment",
+            ));
+        }
+        let kind = format::V2CodecProbe::header_kind(&header).unwrap();
+        let segment_id = format::V2CodecProbe::header_segment_id(&header).unwrap();
+        let segment_base = format::V2CodecProbe::header_segment_base(&header).unwrap();
+        let persisted_granularity = format::V2CodecProbe::header_granularity(&header).unwrap();
+        let active_len = header_file.metadata()?.len();
+
+        let mut state = self.wal_state.write().unwrap();
+        if !matches!(state.format, WalFormat::V2) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "runtime rotation requires V2 WAL storage",
+            ));
+        }
+        state.active_len = active_len;
+        state.offset = segment_base.checked_add(active_len).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "V2 global offset overflow")
+        })?;
+        let force_before_next_mutation =
+            requested_granularity_nanos.is_some_and(|requested| requested != persisted_granularity);
+        state.granularity_nanos = requested_granularity_nanos.unwrap_or(persisted_granularity);
+        state.rotation = Some(RotationSupport {
+            state: FileRotationState {
+                active_path,
+                kind,
+                segment_id,
+                segment_base,
+                target_bytes,
+                force_before_next_mutation,
+                failed_closed: false,
+            },
+            rotate: rotate_file_segment,
+        });
+        Ok(())
+    }
+}
+
+fn sealed_segment_path(active_path: &Path, segment_id: u64) -> std::io::Result<PathBuf> {
+    let file_name = active_path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "active WAL path has no file name",
+        )
+    })?;
+    Ok(active_path.with_file_name(format!(
+        "{}.segment-{segment_id:020}",
+        file_name.to_string_lossy()
+    )))
+}
+
+fn rotation_staging_path(active_path: &Path) -> std::io::Result<PathBuf> {
+    let file_name = active_path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "active WAL path has no file name",
+        )
+    })?;
+    Ok(active_path.with_file_name(format!(".{}.next", file_name.to_string_lossy())))
+}
+
+fn rotate_file_segment(
+    writer: &mut File,
+    rotation: &mut FileRotationState,
+    granularity_nanos: u64,
+    last_bucket: u64,
+    durability_policy: crate::config::DurabilityPolicy,
+) -> std::io::Result<()> {
+    let active_len = writer.metadata()?.len();
+    let next_segment_id = rotation.segment_id.checked_add(1).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "V2 segment id overflow")
+    })?;
+    let next_segment_base = rotation
+        .segment_base
+        .checked_add(active_len)
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "V2 segment base overflow")
+        })?;
+    let sealed_path = sealed_segment_path(&rotation.active_path, rotation.segment_id)?;
+    let staging_path = rotation_staging_path(&rotation.active_path)?;
+    let header = format::V2CodecProbe::encode_header(format::V2HeaderProbeFields {
+        kind: rotation.kind,
+        granularity_nanos,
+        base_bucket: last_bucket,
+        segment_id: next_segment_id,
+        segment_base: next_segment_base,
+    });
+
+    let mut staging = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&staging_path)?;
+    let prepare_result = (|| {
+        staging.write_all(&header)?;
+        staging.flush()?;
+        if durability_policy == crate::config::DurabilityPolicy::Physical {
+            staging.sync_all()?;
+        }
+        writer.flush()?;
+        if durability_policy == crate::config::DurabilityPolicy::Physical {
+            writer.sync_data()?;
+        }
+        Ok::<(), std::io::Error>(())
+    })();
+    if let Err(error) = prepare_result {
+        drop(staging);
+        let _ = std::fs::remove_file(&staging_path);
+        return Err(error);
+    }
+    drop(staging);
+
+    std::fs::rename(&rotation.active_path, &sealed_path)?;
+    if let Err(publish_error) = std::fs::rename(&staging_path, &rotation.active_path) {
+        let restore_result = std::fs::rename(&sealed_path, &rotation.active_path);
+        return match restore_result {
+            Ok(()) => Err(publish_error),
+            Err(restore_error) => {
+                rotation.failed_closed = true;
+                Err(std::io::Error::other(format!(
+                    "V2 rotation publication failed ({publish_error}); active restoration failed ({restore_error})"
+                )))
+            }
+        };
+    }
+    rotation.segment_id = next_segment_id;
+    rotation.segment_base = next_segment_base;
+    let reopened = OpenOptions::new()
+        .append(true)
+        .open(&rotation.active_path)
+        .inspect_err(|_| {
+            rotation.failed_closed = true;
+        })?;
+    *writer = reopened;
+    if durability_policy == crate::config::DurabilityPolicy::Physical {
+        let parent = rotation
+            .active_path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("active WAL path has no parent"))?;
+        if let Err(error) = crate::durability::synchronize_directory(parent) {
+            rotation.failed_closed = true;
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 impl WalStorage<Vec<u8>> {
@@ -297,6 +526,7 @@ impl WalStorage<Vec<u8>> {
 
         let wal_state = WalState {
             offset: 0,
+            active_len: 0,
             writer: vec,
             rollback: Some(rollback_vec),
             health: WalHealth::Ready,
@@ -307,6 +537,8 @@ impl WalStorage<Vec<u8>> {
             durability_policy: crate::config::DurabilityPolicy::Buffered,
             data_barrier: None,
             rollback_barrier: None,
+            rotation: None,
+            frame_buffer: Vec::new(),
         };
         let wal_state = RwLock::new(wal_state);
 
@@ -331,7 +563,8 @@ impl WalStorage<Vec<u8>> {
 
         Self {
             wal_state: RwLock::new(WalState {
-                offset: header.len() as u32,
+                offset: header.len() as u64,
+                active_len: header.len() as u64,
                 writer: header.to_vec(),
                 rollback: Some(rollback_vec),
                 health: WalHealth::Ready,
@@ -342,6 +575,8 @@ impl WalStorage<Vec<u8>> {
                 durability_policy: crate::config::DurabilityPolicy::Buffered,
                 data_barrier: None,
                 rollback_barrier: None,
+                rotation: None,
+                frame_buffer: Vec::new(),
             }),
         }
     }
@@ -392,6 +627,7 @@ impl<W: Write> WalStorage<W> {
         Self {
             wal_state: RwLock::new(WalState {
                 offset: 0,
+                active_len: 0,
                 writer,
                 rollback: Some(rollback),
                 health: WalHealth::Ready,
@@ -402,6 +638,8 @@ impl<W: Write> WalStorage<W> {
                 durability_policy: crate::config::DurabilityPolicy::Buffered,
                 data_barrier: None,
                 rollback_barrier: None,
+                rotation: None,
+                frame_buffer: Vec::new(),
             }),
         }
     }
@@ -413,7 +651,8 @@ impl<W: Write> WalStorage<W> {
     ) -> Self {
         Self {
             wal_state: RwLock::new(WalState {
-                offset: format::V1CodecProbe::HEADER_LEN as u32,
+                offset: format::V1CodecProbe::HEADER_LEN as u64,
+                active_len: format::V1CodecProbe::HEADER_LEN as u64,
                 writer,
                 rollback: Some(rollback),
                 health: WalHealth::Ready,
@@ -424,6 +663,8 @@ impl<W: Write> WalStorage<W> {
                 durability_policy: crate::config::DurabilityPolicy::Buffered,
                 data_barrier: None,
                 rollback_barrier: None,
+                rotation: None,
+                frame_buffer: Vec::new(),
             }),
         }
     }
@@ -471,7 +712,86 @@ impl<W: Write> WalStorage<W> {
 
         let mut state = self.wal_state.write().unwrap();
         ensure_ready(&state.health)?;
-        let checkpoint = state.offset;
+        if matches!(state.format, WalFormat::V2) {
+            let count = u32::try_from(actions.len()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "V2 compute group has too many actions",
+                )
+            })?;
+            let stored = actions
+                .into_iter()
+                .map(|action| stored_compute_action(0, action))
+                .collect::<Vec<_>>();
+            let encoded_len = stored.iter().try_fold(0_u64, |total, action| {
+                total
+                    .checked_add(format::V2CodecProbe::EMPTY_RECORD_LEN as u64)
+                    .and_then(|total| total.checked_add(action.data().len() as u64))
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "V2 compute group length overflow",
+                        )
+                    })
+            })?;
+            maybe_rotate_before(&mut state, encoded_len)?;
+            let checkpoint = state.offset;
+            let physical_checkpoint = state.active_len;
+            let timestamp_bucket = requested_timestamp_bucket(&state);
+            let mut bytes = Vec::new();
+            let mut offset = checkpoint;
+            for (index, stored) in stored.iter().enumerate() {
+                let frame =
+                    format::V2CodecProbe::encode_complete_record(format::V2RecordProbeFields {
+                        action: *stored.act_type(),
+                        payload: stored.data(),
+                        physical_start: offset,
+                        mutation_start: checkpoint,
+                        index: index as u32,
+                        count,
+                        timestamp_bucket,
+                    });
+                offset = offset.checked_add(frame.len() as u64).ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "V2 WAL offset overflow")
+                })?;
+                bytes.extend_from_slice(&frame);
+            }
+            if let Err(write_error) = state.writer.write_all(&bytes) {
+                return Err(rollback_or_fail(
+                    &mut state,
+                    physical_checkpoint,
+                    PersistenceOperation::Write,
+                    write_error,
+                ));
+            }
+            if let Err(flush_error) = state.writer.flush() {
+                return Err(rollback_or_fail(
+                    &mut state,
+                    physical_checkpoint,
+                    PersistenceOperation::Flush,
+                    flush_error,
+                ));
+            }
+            if let Err(barrier_error) = synchronize_if_physical(&mut state) {
+                return Err(rollback_or_fail(
+                    &mut state,
+                    physical_checkpoint,
+                    PersistenceOperation::SynchronizeData,
+                    barrier_error,
+                ));
+            }
+            state.last_bucket = timestamp_bucket;
+            state.offset = offset;
+            state.active_len = physical_checkpoint + encoded_len;
+            return Ok(());
+        }
+        let checkpoint = u32::try_from(state.offset).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "legacy/V1 WAL offset exceeds u32",
+            )
+        })?;
+        let physical_checkpoint = state.active_len;
         if encode_v1 && matches!(state.format, WalFormat::V1) {
             let count = u32::try_from(actions.len()).map_err(|_| {
                 std::io::Error::new(
@@ -484,6 +804,7 @@ impl<W: Write> WalStorage<W> {
             let mut offset = checkpoint;
             for (index, action) in actions.into_iter().enumerate() {
                 let stored = stored_compute_action(offset, action);
+                legacy_data_size(&stored)?;
                 let frame =
                     format::V1CodecProbe::encode_complete_record(format::RecordProbeFields {
                         action: *stored.act_type(),
@@ -512,7 +833,7 @@ impl<W: Write> WalStorage<W> {
             if let Err(write_error) = state.writer.write_all(&bytes) {
                 return Err(rollback_or_fail(
                     &mut state,
-                    checkpoint,
+                    physical_checkpoint,
                     PersistenceOperation::Write,
                     write_error,
                 ));
@@ -520,7 +841,7 @@ impl<W: Write> WalStorage<W> {
             if let Err(flush_error) = state.writer.flush() {
                 return Err(rollback_or_fail(
                     &mut state,
-                    checkpoint,
+                    physical_checkpoint,
                     PersistenceOperation::Flush,
                     flush_error,
                 ));
@@ -528,20 +849,21 @@ impl<W: Write> WalStorage<W> {
             if let Err(barrier_error) = synchronize_if_physical(&mut state) {
                 return Err(rollback_or_fail(
                     &mut state,
-                    checkpoint,
+                    physical_checkpoint,
                     PersistenceOperation::SynchronizeData,
                     barrier_error,
                 ));
             }
             state.last_bucket = timestamp_bucket;
-            state.offset = offset;
+            state.offset = u64::from(offset);
+            state.active_len = u64::from(offset);
             return Ok(());
         }
-        let (bytes, accepted_offset) = encode_compute_batch(checkpoint, actions);
+        let (bytes, accepted_offset) = encode_compute_batch(checkpoint, actions)?;
         if let Err(write_error) = state.writer.write_all(&bytes) {
             return Err(rollback_or_fail(
                 &mut state,
-                checkpoint,
+                physical_checkpoint,
                 PersistenceOperation::Write,
                 write_error,
             ));
@@ -549,12 +871,13 @@ impl<W: Write> WalStorage<W> {
         if let Err(flush_error) = state.writer.flush() {
             return Err(rollback_or_fail(
                 &mut state,
-                checkpoint,
+                physical_checkpoint,
                 PersistenceOperation::Flush,
                 flush_error,
             ));
         }
-        state.offset = accepted_offset;
+        state.offset = u64::from(accepted_offset);
+        state.active_len = u64::from(accepted_offset);
         Ok(())
     }
 
@@ -564,12 +887,12 @@ impl<W: Write> WalStorage<W> {
         value: Vec<u8>,
     ) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
         let key_value = KeyValueData::new(key, value);
-        self.try_accept_action(|offset| StoredAction::put_action(offset, &key_value))?;
+        self.try_accept_action(|offset| StoredAction::prepare_put(offset, &key_value))?;
         Ok(key_value.owned_key_value())
     }
 
     #[cfg(test)]
-    fn offset(&self) -> u32 {
+    fn offset(&self) -> u64 {
         self.wal_state.read().unwrap().offset
     }
 
@@ -586,7 +909,7 @@ impl<W: Write> WalStorage<W> {
     }
 
     pub(crate) fn try_store_delete_event(&self, key: &[u8]) -> std::io::Result<()> {
-        self.try_accept_action(|offset| StoredAction::delete_action(offset, key))
+        self.try_accept_action(|offset| StoredAction::prepare_delete(offset, key))
     }
 
     #[cfg(test)]
@@ -603,7 +926,7 @@ impl<W: Write> WalStorage<W> {
         set_key: Vec<u8>,
     ) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
         let key_value = KeyValueData::new(key, set_key);
-        self.try_accept_action(|offset| StoredAction::append_to_set(offset, &key_value))?;
+        self.try_accept_action(|offset| StoredAction::prepare_append_to_set(offset, &key_value))?;
         Ok(key_value.owned_key_value())
     }
 
@@ -612,7 +935,9 @@ impl<W: Write> WalStorage<W> {
         key: &[u8],
         value: Vec<u8>,
     ) -> std::io::Result<Vec<u8>> {
-        self.try_accept_action(|offset| StoredAction::append_to_set_borrowed(offset, key, &value))?;
+        self.try_accept_action(|offset| {
+            StoredAction::prepare_append_to_set_borrowed(offset, key, &value)
+        })?;
         Ok(value)
     }
 
@@ -629,7 +954,7 @@ impl<W: Write> WalStorage<W> {
         value: Vec<u8>,
     ) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
         let key_value = KeyValueData::new(key, value);
-        self.try_accept_action(|offset| StoredAction::remove_from_set(offset, &key_value))?;
+        self.try_accept_action(|offset| StoredAction::prepare_remove_from_set(offset, &key_value))?;
         Ok(key_value.owned_key_value())
     }
 
@@ -653,11 +978,7 @@ impl<W: Write> WalStorage<W> {
     ) -> std::io::Result<(Vec<u8>, SearchKey, Vec<u8>)> {
         let entry = SortedMapEntry::new(key, search_key, element);
         let data = bincode::serialize(&entry).expect("sorted element should serialize");
-        let data_size = u32::try_from(data.len()).expect("sorted element exceeds WAL limit");
-        let crc = model::crc(&data);
-        self.try_accept_action(move |offset| {
-            StoredAction::new(MAP_PUT_ACT, crc, data_size, data, *offset)
-        })?;
+        self.try_accept_action(move |offset| StoredAction::prepare_sorted_map_put(offset, data))?;
         Ok(entry.entry())
     }
 
@@ -679,17 +1000,82 @@ impl<W: Write> WalStorage<W> {
     ) -> std::io::Result<(Vec<u8>, SearchKey)> {
         let sorted_map_key = SortedMapKey::new(key, search_key);
         self.try_accept_action(|offset| {
-            StoredAction::remove_from_sorted_map(offset, &sorted_map_key)
+            StoredAction::prepare_remove_from_sorted_map(offset, &sorted_map_key)
         })?;
         Ok(sorted_map_key.owned())
     }
 
     fn try_accept_action(&self, build: impl FnOnce(&u32) -> StoredAction) -> std::io::Result<()> {
+        let mut action = build(&0);
         let mut state = self.wal_state.write().unwrap();
         ensure_ready(&state.health)?;
-        let checkpoint = state.offset;
-        let action = build(&checkpoint);
+        if matches!(state.format, WalFormat::V2) {
+            let encoded_len = (format::V2CodecProbe::EMPTY_RECORD_LEN as u64)
+                .checked_add(action.data().len() as u64)
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "V2 frame length overflow")
+                })?;
+            maybe_rotate_before(&mut state, encoded_len)?;
+            let checkpoint = state.offset;
+            let physical_checkpoint = state.active_len;
+            let timestamp_bucket = requested_timestamp_bucket(&state);
+            let mut frame = std::mem::take(&mut state.frame_buffer);
+            format::V2CodecProbe::encode_complete_record_into(
+                &mut frame,
+                format::V2RecordProbeFields {
+                    action: *action.act_type(),
+                    payload: action.data(),
+                    physical_start: checkpoint,
+                    mutation_start: checkpoint,
+                    index: 0,
+                    count: 1,
+                    timestamp_bucket,
+                },
+            );
+            let frame_len = frame.len() as u64;
+            let accepted_offset = checkpoint.checked_add(frame_len).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "V2 WAL offset overflow")
+            })?;
+            let write_result = state.writer.write_all(&frame);
+            state.frame_buffer = frame;
+            if let Err(write_error) = write_result {
+                return Err(rollback_or_fail(
+                    &mut state,
+                    physical_checkpoint,
+                    PersistenceOperation::Write,
+                    write_error,
+                ));
+            }
+            if let Err(flush_error) = state.writer.flush() {
+                return Err(rollback_or_fail(
+                    &mut state,
+                    physical_checkpoint,
+                    PersistenceOperation::Flush,
+                    flush_error,
+                ));
+            }
+            if let Err(barrier_error) = synchronize_if_physical(&mut state) {
+                return Err(rollback_or_fail(
+                    &mut state,
+                    physical_checkpoint,
+                    PersistenceOperation::SynchronizeData,
+                    barrier_error,
+                ));
+            }
+            state.last_bucket = timestamp_bucket;
+            state.offset = accepted_offset;
+            state.active_len = physical_checkpoint + encoded_len;
+            return Ok(());
+        }
+        let checkpoint = u32::try_from(state.offset).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "legacy/V1 WAL offset exceeds u32",
+            )
+        })?;
+        let physical_checkpoint = state.active_len;
         if matches!(state.format, WalFormat::V1) {
+            legacy_data_size(&action)?;
             let timestamp_bucket = requested_timestamp_bucket(&state);
             let frame = format::V1CodecProbe::encode_complete_record(format::RecordProbeFields {
                 action: *action.act_type(),
@@ -713,7 +1099,7 @@ impl<W: Write> WalStorage<W> {
             if let Err(write_error) = state.writer.write_all(&frame) {
                 return Err(rollback_or_fail(
                     &mut state,
-                    checkpoint,
+                    physical_checkpoint,
                     PersistenceOperation::Write,
                     write_error,
                 ));
@@ -721,7 +1107,7 @@ impl<W: Write> WalStorage<W> {
             if let Err(flush_error) = state.writer.flush() {
                 return Err(rollback_or_fail(
                     &mut state,
-                    checkpoint,
+                    physical_checkpoint,
                     PersistenceOperation::Flush,
                     flush_error,
                 ));
@@ -729,26 +1115,78 @@ impl<W: Write> WalStorage<W> {
             if let Err(barrier_error) = synchronize_if_physical(&mut state) {
                 return Err(rollback_or_fail(
                     &mut state,
-                    checkpoint,
+                    physical_checkpoint,
                     PersistenceOperation::SynchronizeData,
                     barrier_error,
                 ));
             }
             state.last_bucket = timestamp_bucket;
-            state.offset = accepted_offset;
+            state.offset = u64::from(accepted_offset);
+            state.active_len = u64::from(accepted_offset);
             return Ok(());
         }
+        action.set_start_offset(checkpoint);
+        action.ensure_payload_crc();
         if let Err(write_error) = write_fallible(&mut state.writer, &action) {
             return Err(rollback_or_fail(
                 &mut state,
-                checkpoint,
+                physical_checkpoint,
                 PersistenceOperation::Write,
                 write_error,
             ));
         }
-        increment_offset(&mut state.offset, &action);
+        let mut accepted_offset = checkpoint;
+        increment_offset(&mut accepted_offset, &action)?;
+        state.offset = u64::from(accepted_offset);
+        state.active_len = u64::from(accepted_offset);
         Ok(())
     }
+}
+
+fn maybe_rotate_before<W: Write>(
+    state: &mut WalState<W>,
+    encoded_mutation_len: u64,
+) -> std::io::Result<()> {
+    let should_rotate = state.rotation.as_ref().is_some_and(|rotation| {
+        rotation.state.force_before_next_mutation
+            || (state.active_len > format::V2CodecProbe::HEADER_LEN as u64
+                && state
+                    .active_len
+                    .checked_add(encoded_mutation_len)
+                    .is_none_or(|next_len| next_len > rotation.state.target_bytes))
+    });
+    if !should_rotate {
+        return Ok(());
+    }
+
+    let mut rotation = state.rotation.take().expect("rotation support checked");
+    let prior_segment_id = rotation.state.segment_id;
+    let result = (rotation.rotate)(
+        &mut state.writer,
+        &mut rotation.state,
+        state.granularity_nanos,
+        state.last_bucket,
+        state.durability_policy,
+    );
+    if result.is_ok() || rotation.state.segment_id != prior_segment_id {
+        rotation.state.force_before_next_mutation = false;
+        state.active_len = format::V2CodecProbe::HEADER_LEN as u64;
+        state.offset = rotation
+            .state
+            .segment_base
+            .checked_add(state.active_len)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "V2 global offset overflow")
+            })?;
+    }
+    if result.is_err() && rotation.state.failed_closed {
+        state.health = WalHealth::FailedRollback {
+            original: "V2 segment rotation could not establish durable publication".to_owned(),
+            rollback: "the WAL instance must be reopened before another mutation".to_owned(),
+        };
+    }
+    state.rotation = Some(rotation);
+    result
 }
 
 fn requested_timestamp_bucket<W: Write>(state: &WalState<W>) -> u64 {
@@ -780,12 +1218,18 @@ fn ensure_ready(health: &WalHealth) -> std::io::Result<()> {
 
 fn rollback_or_fail<W: Write>(
     state: &mut WalState<W>,
-    checkpoint: u32,
+    checkpoint: u64,
     operation: PersistenceOperation,
     original: std::io::Error,
 ) -> std::io::Error {
     let truncate_result = match state.rollback {
-        Some(rollback) => rollback(&mut state.writer, checkpoint as usize),
+        Some(rollback) => match usize::try_from(checkpoint) {
+            Ok(checkpoint) => rollback(&mut state.writer, checkpoint),
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "rollback checkpoint exceeds platform usize",
+            )),
+        },
         None => Err(std::io::Error::other("rollback unavailable")),
     };
     if let Err(rollback_error) = truncate_result {
@@ -897,7 +1341,10 @@ fn stored_compute_action(offset: u32, action: ComputeAction) -> StoredAction {
     }
 }
 
-fn encode_compute_batch(start_offset: u32, actions: Vec<ComputeAction>) -> (Vec<u8>, u32) {
+fn encode_compute_batch(
+    start_offset: u32,
+    actions: Vec<ComputeAction>,
+) -> std::io::Result<(Vec<u8>, u32)> {
     let mut bytes = Vec::new();
     let mut offset = start_offset;
     for action in actions {
@@ -923,27 +1370,46 @@ fn encode_compute_batch(start_offset: u32, actions: Vec<ComputeAction>) -> (Vec<
         };
         bytes.extend_from_slice(&stored.act_type().to_ne_bytes());
         bytes.extend_from_slice(&stored.crc().to_ne_bytes());
-        bytes.extend_from_slice(&stored.data_size().to_ne_bytes());
+        let data_size = legacy_data_size(&stored)?;
+        bytes.extend_from_slice(&data_size.to_ne_bytes());
         bytes.extend_from_slice(stored.data());
         bytes.extend_from_slice(&stored.start_offset().to_ne_bytes());
-        increment_offset(&mut offset, &stored);
+        increment_offset(&mut offset, &stored)?;
     }
-    (bytes, offset)
+    Ok((bytes, offset))
 }
 
 fn write_fallible<W: Write>(file: &mut W, put_action: &StoredAction) -> std::io::Result<()> {
     file.write_all(&put_action.act_type().to_ne_bytes())?;
     file.write_all(&put_action.crc().to_ne_bytes())?;
-    file.write_all(&put_action.data_size().to_ne_bytes())?;
+    file.write_all(&legacy_data_size(put_action)?.to_ne_bytes())?;
     file.write_all(put_action.data())?;
     file.write_all(&put_action.start_offset().to_ne_bytes())?;
     file.flush()
 }
 
-fn increment_offset(offset: &mut u32, put_action: &StoredAction) {
+fn legacy_data_size(action: &StoredAction) -> std::io::Result<u32> {
+    u32::try_from(action.data_size()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "legacy/V1 WAL payload exceeds u32",
+        )
+    })
+}
+
+fn increment_offset(offset: &mut u32, put_action: &StoredAction) -> std::io::Result<()> {
     let fixed_block_len = FIXED_BLOCK_LEN as u32;
-    let new_offset = put_action.start_offset() + put_action.data_size() + fixed_block_len;
-    *offset = new_offset;
+    *offset = put_action
+        .start_offset()
+        .checked_add(legacy_data_size(put_action)?)
+        .and_then(|end| end.checked_add(fixed_block_len))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "legacy/V1 WAL offset overflow",
+            )
+        })?;
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -1120,7 +1586,7 @@ fn build_action(offset: &mut usize, bytes: &[u8]) -> StoredAction {
     let start_offset = u32::from_ne_bytes(block_start_arr);
     *offset += &block_start_len;
 
-    StoredAction::new(act_type, crc, data_size, data, start_offset)
+    StoredAction::new(act_type, crc, data, start_offset)
 }
 
 #[allow(dead_code)]
@@ -1326,7 +1792,7 @@ mod tests {
             read_for_set(&state.bytes).get(b"key".as_slice()),
             Some(&[b"new".to_vec()].into_iter().collect())
         );
-        assert_eq!(wal.offset(), state.bytes.len() as u32);
+        assert_eq!(wal.offset(), state.bytes.len() as u64);
     }
 
     #[test]

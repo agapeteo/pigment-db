@@ -33,7 +33,7 @@ fn set_present_to_empty_is_one_outer_delete() {
         assert!(!store.contains_key(b"key"));
         assert_eq!(
             wal_bytes(directory.path(), "set.wal.dat").len() - before,
-            46 + b"key".len()
+            66 + b"key".len()
         );
         drop(store);
         assert_set_reopens(directory.path(), b"key", &None);
@@ -90,7 +90,7 @@ fn map_present_to_empty_is_one_outer_delete() {
         assert!(!store.contains_key(b"key"));
         assert_eq!(
             wal_bytes(directory.path(), "map.wal.dat").len() - before,
-            46 + b"key".len()
+            66 + b"key".len()
         );
         drop(store);
         assert_map_reopens(directory.path(), b"key", &None);

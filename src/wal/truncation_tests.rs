@@ -1,7 +1,8 @@
 //! Runtime RED–GREEN tracers for V1 format, publication, repair, and recovery.
 
 use super::format::{
-    HeaderProbeClassification, RecordBoundsError, RecordProbeFields, V1CodecProbe,
+    HeaderProbeClassification, RecordBoundsError, RecordProbeFields, V1CodecProbe, V2CodecProbe,
+    V2HeaderProbeFields, V2RecordProbeFields,
 };
 use super::model::{
     KeyValueData, DELETE_ACT, MAP_PUT_ACT, MAP_REMOVE_ACT, PUT_ACT, SET_APPEND_ACT, SET_REMOVE_ACT,
@@ -59,6 +60,29 @@ fn header_version_is_strict() {
     let mut unsupported = encoded;
     unsupported[8..10].copy_from_slice(&2_u16.to_le_bytes());
     assert!(!V1CodecProbe::version_is_valid(&unsupported));
+}
+
+#[test]
+fn v2_header_carries_segment_identity_and_global_base() {
+    let segment_base = u64::from(u32::MAX) + 100;
+    let encoded = V2CodecProbe::encode_header(V2HeaderProbeFields {
+        kind: 2,
+        granularity_nanos: 7,
+        base_bucket: 11,
+        segment_id: 3,
+        segment_base,
+    });
+
+    assert_eq!(encoded.len(), V2CodecProbe::HEADER_LEN);
+    assert!(V2CodecProbe::header_is_valid(&encoded));
+    assert_eq!(V2CodecProbe::header_kind(&encoded), Some(2));
+    assert_eq!(V2CodecProbe::header_granularity(&encoded), Some(7));
+    assert_eq!(V2CodecProbe::header_base_bucket(&encoded), Some(11));
+    assert_eq!(V2CodecProbe::header_segment_id(&encoded), Some(3));
+    assert_eq!(
+        V2CodecProbe::header_segment_base(&encoded),
+        Some(segment_base)
+    );
 }
 
 #[test]
@@ -559,6 +583,34 @@ fn record_offset_overflow_is_explicit() {
     assert_eq!(
         V1CodecProbe::checked_record_end(u32::MAX - 46, 0, 46),
         Ok(u32::MAX)
+    );
+}
+
+#[test]
+fn v2_record_offsets_extend_beyond_the_v1_u32_boundary() {
+    let physical_start = u64::from(u32::MAX) + 17;
+    let payload = b"beyond-v1";
+    let encoded = V2CodecProbe::encode_complete_record(V2RecordProbeFields {
+        action: PUT_ACT,
+        payload,
+        physical_start,
+        mutation_start: physical_start,
+        index: 0,
+        count: 1,
+        timestamp_bucket: 9,
+    });
+
+    assert_eq!(
+        encoded.len(),
+        V2CodecProbe::EMPTY_RECORD_LEN + payload.len()
+    );
+    assert!(V2CodecProbe::record_physical_start_is_valid(
+        &encoded,
+        physical_start
+    ));
+    assert_eq!(
+        V2CodecProbe::checked_record_end(physical_start, payload.len() as u64, encoded.len()),
+        Ok(physical_start + encoded.len() as u64)
     );
 }
 
@@ -1288,7 +1340,7 @@ fn vector_backed_storage_exposes_only_a_complete_v1_header() {
     let state = wal.wal_state.read().unwrap();
 
     assert_eq!(state.writer, header);
-    assert_eq!(state.offset, V1CodecProbe::HEADER_LEN as u32);
+    assert_eq!(state.offset, V1CodecProbe::HEADER_LEN as u64);
     assert!(V1CodecProbe::header_crc_is_valid(&state.writer));
 }
 
@@ -1832,7 +1884,7 @@ fn incomplete_first_action_preserves_header_and_empty_accepted_state() {
     assert_eq!(tail_offset, V1CodecProbe::HEADER_LEN);
     assert_eq!(replay.byte_len, V1CodecProbe::HEADER_LEN as u64);
     assert!(replay.snapshot.is_empty());
-    assert_eq!(accepted_header, Some(header));
+    assert_eq!(accepted_header, Some(header.to_vec()));
 }
 
 fn two_record_stream(

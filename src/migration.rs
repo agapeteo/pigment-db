@@ -1,4 +1,4 @@
-//! Private offline legacy-to-V1 migration engine.
+//! Private offline WAL-to-V2 migration and compaction engine.
 
 #![allow(dead_code)]
 
@@ -7,11 +7,12 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::model::SortedMapEntry;
-use crate::wal::format::{RecordProbeFields, V1CodecProbe};
+use crate::wal::format::{V2CodecProbe, V2HeaderProbeFields, V2RecordProbeFields};
 use crate::wal::model::{KeyValueData, MAP_PUT_ACT, SET_APPEND_ACT};
 use crate::wal::replay::{
-    replay_key_map, replay_key_set, replay_key_value, KeyMapSnapshot, KeySetSnapshot,
-    KeyValueSnapshot, ValidationError,
+    replay_key_map, replay_key_map_tail, replay_key_set, replay_key_set_tail, replay_key_value,
+    replay_key_value_tail, KeyMapSnapshot, KeySetSnapshot, KeyValueSnapshot, ReplaySnapshot,
+    TailReplay, ValidationError,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,6 +60,7 @@ pub(crate) struct HandledMigrationFailure {
 pub(crate) struct CapturedSource {
     pub(crate) path: PathBuf,
     pub(crate) bytes: Vec<u8>,
+    artifacts: Vec<(PathBuf, Vec<u8>)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -186,7 +188,7 @@ impl MigrationProbe {
                 let partial_len = item
                     .replacement
                     .len()
-                    .min(V1CodecProbe::HEADER_LEN.saturating_sub(1))
+                    .min(V2CodecProbe::HEADER_LEN.saturating_sub(1))
                     .max(1);
                 output
                     .write_all(&item.replacement[..partial_len])
@@ -233,46 +235,51 @@ impl MigrationProbe {
         granularity: u64,
     ) -> Result<PreparedMigration, MigrationFailure> {
         let source = Self::capture_source(&discovered.path, false)?;
-        if source.bytes.starts_with(b"PIGWAL\r\n") {
-            return Err(MigrationFailure {
-                checkpoint: MigrationCheckpoint::Preflight,
-                path: source.path,
-                detail: "V1 source is already current and is not migratable".to_owned(),
-            });
-        }
         let (replacement, entries, output_name) = match discovered.family {
             MigrationFamily::Value => {
-                let snapshot = replay_key_value(&source.bytes)
-                    .map_err(|error| Self::legacy_validation_failure(&source.path, error))?
-                    .snapshot;
+                let replayed = Self::replay_migratable_source(
+                    &source.bytes,
+                    replay_key_value,
+                    replay_key_value_tail,
+                )
+                .map_err(|error| Self::legacy_validation_failure(&source.path, error))?;
+                let last_bucket = replayed.last_bucket;
+                let snapshot = replayed.snapshot;
                 let entries = snapshot.len();
                 (
-                    Self::encode_key_value_snapshot(
-                        &snapshot,
-                        V1CodecProbe::encode_header_with_kind_and_granularity(1, granularity),
-                    ),
+                    Self::encode_key_value_snapshot(&snapshot, granularity, last_bucket),
                     entries,
                     "kv.wal.dat",
                 )
             }
             MigrationFamily::Set => {
-                let snapshot = replay_key_set(&source.bytes)
-                    .map_err(|error| Self::legacy_validation_failure(&source.path, error))?
-                    .snapshot;
+                let replayed = Self::replay_migratable_source(
+                    &source.bytes,
+                    replay_key_set,
+                    replay_key_set_tail,
+                )
+                .map_err(|error| Self::legacy_validation_failure(&source.path, error))?;
+                let last_bucket = replayed.last_bucket;
+                let snapshot = replayed.snapshot;
                 let entries = snapshot.values().map(std::collections::HashSet::len).sum();
                 (
-                    Self::encode_key_set_snapshot(&snapshot, granularity),
+                    Self::encode_key_set_snapshot(&snapshot, granularity, last_bucket),
                     entries,
                     "set.wal.dat",
                 )
             }
             MigrationFamily::Map => {
-                let snapshot = replay_key_map(&source.bytes)
-                    .map_err(|error| Self::legacy_validation_failure(&source.path, error))?
-                    .snapshot;
+                let replayed = Self::replay_migratable_source(
+                    &source.bytes,
+                    replay_key_map,
+                    replay_key_map_tail,
+                )
+                .map_err(|error| Self::legacy_validation_failure(&source.path, error))?;
+                let last_bucket = replayed.last_bucket;
+                let snapshot = replayed.snapshot;
                 let entries = snapshot.values().map(std::collections::BTreeMap::len).sum();
                 (
-                    Self::encode_key_map_snapshot(&snapshot, granularity),
+                    Self::encode_key_map_snapshot(&snapshot, granularity, last_bucket),
                     entries,
                     "map.wal.dat",
                 )
@@ -285,6 +292,26 @@ impl MigrationProbe {
             replacement,
             entries,
         })
+    }
+
+    fn replay_migratable_source<S>(
+        bytes: &[u8],
+        replay: fn(&[u8]) -> Result<ReplaySnapshot<S>, ValidationError>,
+        replay_tail: fn(&[u8]) -> TailReplay<S>,
+    ) -> Result<ReplaySnapshot<S>, ValidationError> {
+        match replay(bytes) {
+            Ok(replayed) => Ok(replayed),
+            Err(_original) if bytes.get(8..10) == Some(1_u16.to_le_bytes().as_slice()) => {
+                match replay_tail(bytes) {
+                    TailReplay::Complete(replayed)
+                    | TailReplay::RecoverableTail {
+                        replay: replayed, ..
+                    } => Ok(replayed),
+                    TailReplay::Invalid(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn legacy_validation_failure(path: &Path, error: ValidationError) -> MigrationFailure {
@@ -319,7 +346,7 @@ impl MigrationProbe {
             let original = MigrationFailure {
                 checkpoint: MigrationCheckpoint::WriteOutput,
                 path: path.to_path_buf(),
-                detail: "reopened migration output failed exact V1/config/logical validation"
+                detail: "reopened migration output failed exact V2/config/logical validation"
                     .to_owned(),
             };
             Err(Self::handle_failure_with_cleanup(original, registry, None))
@@ -347,7 +374,7 @@ impl MigrationProbe {
             ));
         }
 
-        let replacement = Self::key_value_snapshot_to_v1_with_granularity(&snapshot, granularity);
+        let replacement = Self::key_value_snapshot_to_v2_with_granularity(&snapshot, granularity);
         let output_path = destination.join("kv.wal.dat");
         let output = match Self::create_output(&output_path, &mut registry, false) {
             Ok(output) => output,
@@ -418,14 +445,44 @@ impl MigrationProbe {
             };
             return Err(Self::handle_failure_with_cleanup(original, registry, None));
         }
-        std::fs::read(&captured.path).map_err(|error| {
+        let mut current_paths = match Self::source_artifact_paths(&captured.path) {
+            Ok(paths) => paths,
+            Err(failure) => {
+                let original = MigrationFailure {
+                    checkpoint: MigrationCheckpoint::FinalSourceRead,
+                    path: failure.path,
+                    detail: failure.detail,
+                };
+                return Err(Self::handle_failure_with_cleanup(original, registry, None));
+            }
+        };
+        current_paths.push(captured.path.clone());
+        let captured_paths = captured
+            .artifacts
+            .iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>();
+        if current_paths.iter().ne(captured_paths) {
             let original = MigrationFailure {
-                checkpoint: MigrationCheckpoint::FinalSourceRead,
+                checkpoint: MigrationCheckpoint::SourceChanged,
                 path: captured.path.clone(),
-                detail: error.to_string(),
+                detail: "source artifact set changed during offline migration".to_owned(),
             };
-            Self::handle_failure_with_cleanup(original, registry, None)
-        })
+            return Err(Self::handle_failure_with_cleanup(original, registry, None));
+        }
+        let mut combined = Vec::new();
+        for (path, _) in &captured.artifacts {
+            let bytes = std::fs::read(path).map_err(|error| {
+                let original = MigrationFailure {
+                    checkpoint: MigrationCheckpoint::FinalSourceRead,
+                    path: path.clone(),
+                    detail: error.to_string(),
+                };
+                Self::handle_failure_with_cleanup(original, registry, None)
+            })?;
+            combined.extend_from_slice(&bytes);
+        }
+        Ok(combined)
     }
 
     pub(crate) fn validate_reopened_key_value(
@@ -436,13 +493,15 @@ impl MigrationProbe {
         registry: &mut OwnedPathRegistry,
     ) -> Result<Vec<u8>, HandledMigrationFailure> {
         let validation = (|| -> Result<(), String> {
-            if bytes.len() < V1CodecProbe::HEADER_LEN || !bytes.starts_with(b"PIGWAL\r\n") {
-                return Err("reopened migration output is not V1".to_owned());
+            if bytes.len() < V2CodecProbe::HEADER_LEN
+                || !V2CodecProbe::header_is_valid(&bytes[..V2CodecProbe::HEADER_LEN])
+            {
+                return Err("reopened migration output is not V2".to_owned());
             }
             let actual_granularity = u64::from_le_bytes(
                 bytes[16..24]
                     .try_into()
-                    .expect("V1 header length checked before granularity read"),
+                    .expect("V2 header length checked before granularity read"),
             );
             if actual_granularity != expected_granularity {
                 return Err(format!(
@@ -779,16 +838,6 @@ impl MigrationProbe {
         path: &Path,
         inject_read_failure: bool,
     ) -> Result<CapturedSource, MigrationFailure> {
-        let mut source =
-            OpenOptions::new()
-                .read(true)
-                .open(path)
-                .map_err(|error| MigrationFailure {
-                    checkpoint: MigrationCheckpoint::InitialSourceRead,
-                    path: path.to_path_buf(),
-                    detail: error.to_string(),
-                })?;
-        let mut bytes = Vec::new();
         if inject_read_failure {
             return Err(MigrationFailure {
                 checkpoint: MigrationCheckpoint::InitialSourceRead,
@@ -796,59 +845,141 @@ impl MigrationProbe {
                 detail: "injected initial source read failure".to_owned(),
             });
         }
-        source
-            .read_to_end(&mut bytes)
-            .map_err(|error| MigrationFailure {
-                checkpoint: MigrationCheckpoint::InitialSourceRead,
-                path: path.to_path_buf(),
-                detail: error.to_string(),
-            })?;
+        let mut artifact_paths = Self::source_artifact_paths(path)?;
+        artifact_paths.push(path.to_path_buf());
+        let mut bytes = Vec::new();
+        let mut artifacts = Vec::with_capacity(artifact_paths.len());
+        for artifact_path in artifact_paths {
+            let mut source =
+                OpenOptions::new()
+                    .read(true)
+                    .open(&artifact_path)
+                    .map_err(|error| MigrationFailure {
+                        checkpoint: MigrationCheckpoint::InitialSourceRead,
+                        path: artifact_path.clone(),
+                        detail: error.to_string(),
+                    })?;
+            let mut artifact_bytes = Vec::new();
+            source
+                .read_to_end(&mut artifact_bytes)
+                .map_err(|error| MigrationFailure {
+                    checkpoint: MigrationCheckpoint::InitialSourceRead,
+                    path: artifact_path.clone(),
+                    detail: error.to_string(),
+                })?;
+            bytes.extend_from_slice(&artifact_bytes);
+            artifacts.push((artifact_path, artifact_bytes));
+        }
         Ok(CapturedSource {
             path: path.to_path_buf(),
             bytes,
+            artifacts,
         })
     }
 
-    pub(crate) fn key_value_snapshot_to_v1(snapshot: &KeyValueSnapshot) -> Vec<u8> {
-        Self::encode_key_value_snapshot(snapshot, V1CodecProbe::encode_header())
+    fn source_artifact_paths(path: &Path) -> Result<Vec<PathBuf>, MigrationFailure> {
+        let parent = path.parent().ok_or_else(|| MigrationFailure {
+            checkpoint: MigrationCheckpoint::Preflight,
+            path: path.to_path_buf(),
+            detail: "canonical WAL source has no parent directory".to_owned(),
+        })?;
+        let file_name = path
+            .file_name()
+            .expect("canonical WAL source must have a file name")
+            .to_string_lossy();
+        let prefix = format!("{file_name}.segment-");
+        let entries = std::fs::read_dir(parent).map_err(|error| MigrationFailure {
+            checkpoint: MigrationCheckpoint::InitialSourceRead,
+            path: parent.to_path_buf(),
+            detail: error.to_string(),
+        })?;
+        let mut segments = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| MigrationFailure {
+                checkpoint: MigrationCheckpoint::InitialSourceRead,
+                path: parent.to_path_buf(),
+                detail: error.to_string(),
+            })?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(id) = name.strip_prefix(&prefix) else {
+                continue;
+            };
+            if id.len() != 20 || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(MigrationFailure {
+                    checkpoint: MigrationCheckpoint::Preflight,
+                    path: entry.path(),
+                    detail: "invalid V2 segment identifier".to_owned(),
+                });
+            }
+            let id = id.parse::<u64>().map_err(|_| MigrationFailure {
+                checkpoint: MigrationCheckpoint::Preflight,
+                path: entry.path(),
+                detail: "invalid V2 segment identifier".to_owned(),
+            })?;
+            segments.push((id, entry.path()));
+        }
+        segments.sort_by_key(|(id, _)| *id);
+        Ok(segments.into_iter().map(|(_, path)| path).collect())
+    }
+
+    pub(crate) fn key_value_snapshot_to_v2(snapshot: &KeyValueSnapshot) -> Vec<u8> {
+        Self::encode_key_value_snapshot(snapshot, 60_000_000_000, 0)
     }
 
     fn encode_key_value_snapshot(
         snapshot: &KeyValueSnapshot,
-        header: [u8; V1CodecProbe::HEADER_LEN],
+        granularity: u64,
+        last_bucket: u64,
     ) -> Vec<u8> {
+        let header = V2CodecProbe::encode_header(V2HeaderProbeFields {
+            kind: 1,
+            granularity_nanos: granularity,
+            base_bucket: last_bucket,
+            segment_id: 0,
+            segment_base: 0,
+        });
         let mut converted = header.to_vec();
         let mut entries = snapshot.iter().collect::<Vec<_>>();
         entries.sort_by_key(|(key, _)| *key);
         for (key, value) in entries {
             let payload = bincode::serialize(&KeyValueData::new(key.clone(), value.clone()))
                 .expect("captured legacy key/value state must encode");
-            let start = converted.len() as u32;
-            converted.extend_from_slice(&V1CodecProbe::encode_complete_record(RecordProbeFields {
-                action: 1,
-                payload: &payload,
-                physical_start: start,
-                mutation_start: start,
-                index: 0,
-                count: 1,
-                timestamp_bucket: 0,
-            }));
+            let start = converted.len() as u64;
+            converted.extend_from_slice(&V2CodecProbe::encode_complete_record(
+                V2RecordProbeFields {
+                    action: 1,
+                    payload: &payload,
+                    physical_start: start,
+                    mutation_start: start,
+                    index: 0,
+                    count: 1,
+                    timestamp_bucket: last_bucket,
+                },
+            ));
         }
         converted
     }
 
-    pub(crate) fn key_value_snapshot_to_v1_with_granularity(
+    pub(crate) fn key_value_snapshot_to_v2_with_granularity(
         snapshot: &KeyValueSnapshot,
         granularity_nanos: u64,
     ) -> Vec<u8> {
-        Self::encode_key_value_snapshot(
-            snapshot,
-            V1CodecProbe::encode_header_with_granularity(granularity_nanos),
-        )
+        Self::encode_key_value_snapshot(snapshot, granularity_nanos, 0)
     }
 
-    fn encode_key_set_snapshot(snapshot: &KeySetSnapshot, granularity: u64) -> Vec<u8> {
-        let header = V1CodecProbe::encode_header_with_kind_and_granularity(2, granularity);
+    fn encode_key_set_snapshot(
+        snapshot: &KeySetSnapshot,
+        granularity: u64,
+        last_bucket: u64,
+    ) -> Vec<u8> {
+        let header = V2CodecProbe::encode_header(V2HeaderProbeFields {
+            kind: 2,
+            granularity_nanos: granularity,
+            base_bucket: last_bucket,
+            segment_id: 0,
+            segment_base: 0,
+        });
         let mut converted = header.to_vec();
         let mut keys = snapshot.keys().collect::<Vec<_>>();
         keys.sort();
@@ -858,14 +989,29 @@ impl MigrationProbe {
             for value in values {
                 let payload = bincode::serialize(&KeyValueData::new(key.clone(), value.clone()))
                     .expect("captured legacy key/set state must encode");
-                Self::append_v1_snapshot_record(&mut converted, SET_APPEND_ACT, &payload);
+                Self::append_v2_snapshot_record(
+                    &mut converted,
+                    SET_APPEND_ACT,
+                    &payload,
+                    last_bucket,
+                );
             }
         }
         converted
     }
 
-    fn encode_key_map_snapshot(snapshot: &KeyMapSnapshot, granularity: u64) -> Vec<u8> {
-        let header = V1CodecProbe::encode_header_with_kind_and_granularity(3, granularity);
+    fn encode_key_map_snapshot(
+        snapshot: &KeyMapSnapshot,
+        granularity: u64,
+        last_bucket: u64,
+    ) -> Vec<u8> {
+        let header = V2CodecProbe::encode_header(V2HeaderProbeFields {
+            kind: 3,
+            granularity_nanos: granularity,
+            base_bucket: last_bucket,
+            segment_id: 0,
+            segment_base: 0,
+        });
         let mut converted = header.to_vec();
         let mut keys = snapshot.keys().collect::<Vec<_>>();
         keys.sort();
@@ -877,22 +1023,27 @@ impl MigrationProbe {
                     value.clone(),
                 ))
                 .expect("captured legacy key/map state must encode");
-                Self::append_v1_snapshot_record(&mut converted, MAP_PUT_ACT, &payload);
+                Self::append_v2_snapshot_record(&mut converted, MAP_PUT_ACT, &payload, last_bucket);
             }
         }
         converted
     }
 
-    fn append_v1_snapshot_record(converted: &mut Vec<u8>, action: u8, payload: &[u8]) {
-        let start = converted.len() as u32;
-        converted.extend_from_slice(&V1CodecProbe::encode_complete_record(RecordProbeFields {
+    fn append_v2_snapshot_record(
+        converted: &mut Vec<u8>,
+        action: u8,
+        payload: &[u8],
+        timestamp_bucket: u64,
+    ) {
+        let start = converted.len() as u64;
+        converted.extend_from_slice(&V2CodecProbe::encode_complete_record(V2RecordProbeFields {
             action,
             payload,
             physical_start: start,
             mutation_start: start,
             index: 0,
             count: 1,
-            timestamp_bucket: 0,
+            timestamp_bucket,
         }));
     }
 }
@@ -975,7 +1126,7 @@ fn resolve_destination(destination: &Path) -> Result<PathBuf, String> {
 mod tests {
     use super::{MigrationCheckpoint, MigrationFamily, MigrationProbe, OwnedPathRegistry};
     use crate::model::{SearchKey, SortedMapEntry};
-    use crate::wal::format::V1CodecProbe;
+    use crate::wal::format::{V1CodecProbe, V2CodecProbe};
     use crate::wal::replay::{replay_key_map, replay_key_set, replay_key_value};
 
     #[test]
@@ -985,7 +1136,7 @@ mod tests {
             (b"beta".to_vec(), b"two".to_vec()),
         ]);
 
-        let converted = MigrationProbe::key_value_snapshot_to_v1(&snapshot);
+        let converted = MigrationProbe::key_value_snapshot_to_v2(&snapshot);
 
         assert!(converted.starts_with(b"PIGWAL\r\n"));
         assert_eq!(converted[12], 1);
@@ -1005,7 +1156,7 @@ mod tests {
         let selected = 123_456_789_u64;
 
         let converted =
-            MigrationProbe::key_value_snapshot_to_v1_with_granularity(&snapshot, selected);
+            MigrationProbe::key_value_snapshot_to_v2_with_granularity(&snapshot, selected);
 
         assert_eq!(
             u64::from_le_bytes(converted[16..24].try_into().unwrap()),
@@ -1318,7 +1469,7 @@ mod tests {
     #[test]
     fn partial_output_header_or_body_write_composes_owned_cleanup() {
         let snapshot = std::collections::HashMap::from([(b"key".to_vec(), b"value".to_vec())]);
-        let replacement = MigrationProbe::key_value_snapshot_to_v1(&snapshot);
+        let replacement = MigrationProbe::key_value_snapshot_to_v2(&snapshot);
         for cut in [V1CodecProbe::HEADER_LEN - 1, replacement.len() - 1] {
             let root = tempfile::tempdir().unwrap();
             let source = root.path().join("source.wal");
@@ -1356,7 +1507,7 @@ mod tests {
     #[test]
     fn output_flush_failure_composes_owned_cleanup() {
         let snapshot = std::collections::HashMap::from([(b"key".to_vec(), b"value".to_vec())]);
-        let replacement = MigrationProbe::key_value_snapshot_to_v1(&snapshot);
+        let replacement = MigrationProbe::key_value_snapshot_to_v2(&snapshot);
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source.wal");
         std::fs::write(&source, b"immutable-source").unwrap();
@@ -1394,7 +1545,7 @@ mod tests {
     #[test]
     fn output_sync_failure_composes_owned_cleanup() {
         let snapshot = std::collections::HashMap::from([(b"key".to_vec(), b"value".to_vec())]);
-        let replacement = MigrationProbe::key_value_snapshot_to_v1(&snapshot);
+        let replacement = MigrationProbe::key_value_snapshot_to_v2(&snapshot);
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source.wal");
         std::fs::write(&source, b"immutable-source").unwrap();
@@ -1433,7 +1584,7 @@ mod tests {
     #[test]
     fn output_reopen_read_failure_composes_owned_cleanup() {
         let snapshot = std::collections::HashMap::from([(b"key".to_vec(), b"value".to_vec())]);
-        let replacement = MigrationProbe::key_value_snapshot_to_v1(&snapshot);
+        let replacement = MigrationProbe::key_value_snapshot_to_v2(&snapshot);
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source.wal");
         std::fs::write(&source, b"immutable-source").unwrap();
@@ -1470,7 +1621,7 @@ mod tests {
     }
 
     #[test]
-    fn reopened_output_validation_rejects_malformed_v1_and_cleans_owned_paths() {
+    fn reopened_output_validation_rejects_malformed_v2_and_cleans_owned_paths() {
         assert_reopened_validation_rejected(b"not-v1".to_vec(), 60_000_000_000);
     }
 
@@ -1478,7 +1629,7 @@ mod tests {
     fn reopened_output_validation_rejects_wrong_granularity_and_cleans_owned_paths() {
         let snapshot = std::collections::HashMap::from([(b"key".to_vec(), b"value".to_vec())]);
         let candidate =
-            MigrationProbe::key_value_snapshot_to_v1_with_granularity(&snapshot, 123_456_789);
+            MigrationProbe::key_value_snapshot_to_v2_with_granularity(&snapshot, 123_456_789);
         assert_reopened_validation_rejected(candidate, 60_000_000_000);
     }
 
@@ -1486,7 +1637,7 @@ mod tests {
     fn reopened_output_validation_rejects_wrong_logical_state_and_cleans_owned_paths() {
         let wrong_snapshot =
             std::collections::HashMap::from([(b"other".to_vec(), b"state".to_vec())]);
-        let candidate = MigrationProbe::key_value_snapshot_to_v1(&wrong_snapshot);
+        let candidate = MigrationProbe::key_value_snapshot_to_v2(&wrong_snapshot);
         assert_reopened_validation_rejected(candidate, 60_000_000_000);
     }
 
@@ -1547,7 +1698,53 @@ mod tests {
     }
 
     #[test]
-    fn complete_single_family_migration_preserves_source_and_publishes_validated_v1() {
+    fn newly_added_segment_after_capture_cleans_owned_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        let source_path = source.join("kv.wal.dat");
+        std::fs::write(&source_path, b"captured-active").unwrap();
+        let captured = MigrationProbe::capture_source(&source_path, false).unwrap();
+        let destination = root.path().join("destination");
+        let mut registry = OwnedPathRegistry::default();
+        MigrationProbe::create_destination(&destination, &mut registry).unwrap();
+        let output_path = destination.join("kv.wal.dat");
+        drop(MigrationProbe::create_output(&output_path, &mut registry, false).unwrap());
+        let added = source.join("kv.wal.dat.segment-00000000000000000000");
+        std::fs::write(&added, b"new-segment").unwrap();
+
+        let handled = MigrationProbe::reread_source(&captured, false, &mut registry)
+            .expect_err("a newly added segment must invalidate the offline capture");
+
+        assert_eq!(
+            handled.original.checkpoint,
+            MigrationCheckpoint::SourceChanged
+        );
+        assert_eq!(handled.original.path, source_path);
+        assert!(handled.cleanup.is_none());
+        assert_eq!(registry.attempted(), [output_path, destination.clone()]);
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(added).unwrap(), b"new-segment");
+    }
+
+    #[test]
+    fn malformed_segment_name_is_rejected_during_source_capture() {
+        let root = tempfile::tempdir().unwrap();
+        let source_path = root.path().join("kv.wal.dat");
+        std::fs::write(&source_path, b"active").unwrap();
+        let malformed = root.path().join("kv.wal.dat.segment-not-a-number");
+        std::fs::write(&malformed, b"unexpected-segment").unwrap();
+
+        let failure = MigrationProbe::capture_source(&source_path, false)
+            .expect_err("segment-like names must use the canonical identifier grammar");
+
+        assert_eq!(failure.checkpoint, MigrationCheckpoint::Preflight);
+        assert_eq!(failure.path, malformed);
+        assert_eq!(std::fs::read(source_path).unwrap(), b"active");
+    }
+
+    #[test]
+    fn complete_single_family_migration_preserves_source_and_publishes_validated_v2() {
         let root = tempfile::tempdir().unwrap();
         let source_path = root.path().join("kv.wal.dat");
         let source_bytes = legacy_put_bytes(b"key", b"value");
@@ -1665,9 +1862,9 @@ mod tests {
             assert!(replay_key_value(&kv).unwrap().snapshot.is_empty(), "{case}");
             assert!(replay_key_set(&set).unwrap().snapshot.is_empty(), "{case}");
             assert!(replay_key_map(&map).unwrap().snapshot.is_empty(), "{case}");
-            assert_eq!(kv.len(), V1CodecProbe::HEADER_LEN, "{case}");
-            assert_eq!(set.len(), V1CodecProbe::HEADER_LEN, "{case}");
-            assert_eq!(map.len(), V1CodecProbe::HEADER_LEN, "{case}");
+            assert_eq!(kv.len(), V2CodecProbe::HEADER_LEN, "{case}");
+            assert_eq!(set.len(), V2CodecProbe::HEADER_LEN, "{case}");
+            assert_eq!(map.len(), V2CodecProbe::HEADER_LEN, "{case}");
             for name in ["kv.wal.dat", "set.wal.dat", "map.wal.dat"] {
                 assert_eq!(std::fs::read(source.join(name)).unwrap(), legacy, "{case}");
             }

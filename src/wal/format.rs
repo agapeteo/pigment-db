@@ -34,6 +34,29 @@ pub(crate) struct RecordProbeFields<'a> {
     pub(crate) timestamp_bucket: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct V2CodecProbe;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct V2HeaderProbeFields {
+    pub(crate) kind: u8,
+    pub(crate) granularity_nanos: u64,
+    pub(crate) base_bucket: u64,
+    pub(crate) segment_id: u64,
+    pub(crate) segment_base: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct V2RecordProbeFields<'a> {
+    pub(crate) action: u8,
+    pub(crate) payload: &'a [u8],
+    pub(crate) physical_start: u64,
+    pub(crate) mutation_start: u64,
+    pub(crate) index: u32,
+    pub(crate) count: u32,
+    pub(crate) timestamp_bucket: u64,
+}
+
 impl V1CodecProbe {
     pub(crate) const HEADER_LEN: usize = 40;
     pub(crate) const EMPTY_RECORD_LEN: usize = 46;
@@ -414,5 +437,284 @@ impl V1CodecProbe {
         let crc_start = 42 + payload_len;
         let crc = crc32fast::hash(&bytes[..crc_start]);
         bytes[crc_start..crc_start + 4].copy_from_slice(&crc.to_le_bytes());
+    }
+}
+
+impl V2CodecProbe {
+    pub(crate) const HEADER_LEN: usize = 64;
+    pub(crate) const EMPTY_RECORD_LEN: usize = 66;
+    const MAGIC: [u8; 8] = *b"PIGWAL\r\n";
+    const VERSION: u16 = 2;
+    const TIMESTAMP_UNIT_UNIX_NANOS: u8 = 1;
+    const RECORD_MARKER: [u8; 2] = [0xa7, 0xd1];
+    const RECORD_VERSION: u8 = 2;
+    const RECORD_HEADER_LEN: u16 = 54;
+
+    pub(crate) fn encode_header(fields: V2HeaderProbeFields) -> [u8; Self::HEADER_LEN] {
+        let mut bytes = [0; Self::HEADER_LEN];
+        bytes[..Self::MAGIC.len()].copy_from_slice(&Self::MAGIC);
+        bytes[8..10].copy_from_slice(&Self::VERSION.to_le_bytes());
+        bytes[10..12].copy_from_slice(&(Self::HEADER_LEN as u16).to_le_bytes());
+        bytes[12] = fields.kind;
+        bytes[13] = Self::TIMESTAMP_UNIT_UNIX_NANOS;
+        bytes[16..24].copy_from_slice(&fields.granularity_nanos.to_le_bytes());
+        bytes[24..32].copy_from_slice(&fields.base_bucket.to_le_bytes());
+        bytes[32..40].copy_from_slice(&fields.segment_id.to_le_bytes());
+        bytes[40..48].copy_from_slice(&fields.segment_base.to_le_bytes());
+        let crc = crc32fast::hash(&bytes[..60]);
+        bytes[60..64].copy_from_slice(&crc.to_le_bytes());
+        bytes
+    }
+
+    pub(crate) fn header_is_valid(bytes: &[u8]) -> bool {
+        if bytes.len() != Self::HEADER_LEN
+            || bytes.get(..8) != Some(Self::MAGIC.as_slice())
+            || bytes.get(8..10) != Some(Self::VERSION.to_le_bytes().as_slice())
+            || bytes.get(10..12) != Some((Self::HEADER_LEN as u16).to_le_bytes().as_slice())
+            || !bytes.get(12).is_some_and(|kind| matches!(*kind, 1..=3))
+            || bytes.get(13) != Some(&Self::TIMESTAMP_UNIT_UNIX_NANOS)
+            || bytes.get(14..16) != Some(0_u16.to_le_bytes().as_slice())
+            || Self::header_granularity(bytes) == Some(0)
+            || !bytes
+                .get(48..60)
+                .is_some_and(|reserved| reserved.iter().all(|byte| *byte == 0))
+        {
+            return false;
+        }
+        let Some(stored_crc) = bytes
+            .get(60..64)
+            .and_then(|value| value.try_into().ok())
+            .map(u32::from_le_bytes)
+        else {
+            return false;
+        };
+        stored_crc == crc32fast::hash(&bytes[..60])
+    }
+
+    pub(crate) fn header_kind(bytes: &[u8]) -> Option<u8> {
+        bytes.get(12).copied()
+    }
+
+    pub(crate) fn header_granularity(bytes: &[u8]) -> Option<u64> {
+        bytes
+            .get(16..24)
+            .and_then(|value| value.try_into().ok())
+            .map(u64::from_le_bytes)
+    }
+
+    pub(crate) fn header_base_bucket(bytes: &[u8]) -> Option<u64> {
+        bytes
+            .get(24..32)
+            .and_then(|value| value.try_into().ok())
+            .map(u64::from_le_bytes)
+    }
+
+    pub(crate) fn header_segment_id(bytes: &[u8]) -> Option<u64> {
+        bytes
+            .get(32..40)
+            .and_then(|value| value.try_into().ok())
+            .map(u64::from_le_bytes)
+    }
+
+    pub(crate) fn header_segment_base(bytes: &[u8]) -> Option<u64> {
+        bytes
+            .get(40..48)
+            .and_then(|value| value.try_into().ok())
+            .map(u64::from_le_bytes)
+    }
+
+    pub(crate) fn encode_complete_record(fields: V2RecordProbeFields<'_>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        Self::encode_complete_record_into(&mut bytes, fields);
+        bytes
+    }
+
+    pub(crate) fn encode_complete_record_into(
+        bytes: &mut Vec<u8>,
+        fields: V2RecordProbeFields<'_>,
+    ) {
+        let payload_len = u64::try_from(fields.payload.len()).expect("payload length must fit u64");
+        let encoded_len = Self::EMPTY_RECORD_LEN
+            .checked_add(fields.payload.len())
+            .expect("encoded V2 record length must fit usize");
+        bytes.clear();
+        bytes.reserve(encoded_len);
+        bytes.extend_from_slice(&Self::RECORD_MARKER);
+        bytes.extend_from_slice(&[Self::RECORD_VERSION, fields.action]);
+        bytes.extend_from_slice(&Self::RECORD_HEADER_LEN.to_le_bytes());
+        bytes.extend_from_slice(&payload_len.to_le_bytes());
+        bytes.extend_from_slice(&(!payload_len).to_le_bytes());
+        bytes.extend_from_slice(&fields.physical_start.to_le_bytes());
+        bytes.extend_from_slice(&fields.mutation_start.to_le_bytes());
+        bytes.extend_from_slice(&fields.index.to_le_bytes());
+        bytes.extend_from_slice(&fields.count.to_le_bytes());
+        bytes.extend_from_slice(&fields.timestamp_bucket.to_le_bytes());
+        bytes.extend_from_slice(fields.payload);
+        bytes.extend_from_slice(&fields.physical_start.to_le_bytes());
+        let crc = crc32fast::hash(bytes);
+        bytes.extend_from_slice(&crc.to_le_bytes());
+        debug_assert_eq!(bytes.len(), encoded_len);
+    }
+
+    pub(crate) fn checked_record_end(
+        physical_start: u64,
+        payload_len: u64,
+        available_record_len: usize,
+    ) -> Result<u64, RecordBoundsError> {
+        let record_len = payload_len
+            .checked_add(Self::EMPTY_RECORD_LEN as u64)
+            .ok_or(RecordBoundsError::Overflow)?;
+        let physical_end = physical_start
+            .checked_add(record_len)
+            .ok_or(RecordBoundsError::Overflow)?;
+        if u64::try_from(available_record_len).map_err(|_| RecordBoundsError::Overflow)?
+            < record_len
+        {
+            return Err(RecordBoundsError::Truncated);
+        }
+        Ok(physical_end)
+    }
+
+    pub(crate) fn record_physical_start_is_valid(bytes: &[u8], actual_start: u64) -> bool {
+        let Some(header_start) = bytes
+            .get(22..30)
+            .and_then(|value| value.try_into().ok())
+            .map(u64::from_le_bytes)
+        else {
+            return false;
+        };
+        let Some(payload_len) = bytes
+            .get(6..14)
+            .and_then(|value| value.try_into().ok())
+            .map(u64::from_le_bytes)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            return false;
+        };
+        let Some(footer_start) = 54_usize.checked_add(payload_len) else {
+            return false;
+        };
+        let Some(footer_end) = footer_start.checked_add(8) else {
+            return false;
+        };
+        let Some(footer_start_value) = bytes
+            .get(footer_start..footer_end)
+            .and_then(|value| value.try_into().ok())
+            .map(u64::from_le_bytes)
+        else {
+            return false;
+        };
+        header_start == actual_start && footer_start_value == actual_start
+    }
+
+    pub(crate) fn record_marker_is_valid(bytes: &[u8]) -> bool {
+        bytes.get(..2) == Some(Self::RECORD_MARKER.as_slice())
+    }
+
+    pub(crate) fn record_version_is_valid(bytes: &[u8]) -> bool {
+        bytes.get(2) == Some(&Self::RECORD_VERSION)
+    }
+
+    pub(crate) fn record_action_is_valid(bytes: &[u8]) -> bool {
+        bytes.get(3).is_some_and(|action| matches!(*action, 0..=5))
+    }
+
+    pub(crate) fn record_header_length_is_valid(bytes: &[u8]) -> bool {
+        bytes
+            .get(4..6)
+            .and_then(|value| value.try_into().ok())
+            .map(u16::from_le_bytes)
+            == Some(Self::RECORD_HEADER_LEN)
+    }
+
+    pub(crate) fn record_length_complement_is_valid(bytes: &[u8]) -> bool {
+        let Some(length) = bytes
+            .get(6..14)
+            .and_then(|value| value.try_into().ok())
+            .map(u64::from_le_bytes)
+        else {
+            return false;
+        };
+        let Some(complement) = bytes
+            .get(14..22)
+            .and_then(|value| value.try_into().ok())
+            .map(u64::from_le_bytes)
+        else {
+            return false;
+        };
+        complement == !length
+    }
+
+    pub(crate) fn record_mutation_start_is_valid(bytes: &[u8], segment_base: u64) -> bool {
+        let Some(physical_start) = bytes
+            .get(22..30)
+            .and_then(|value| value.try_into().ok())
+            .map(u64::from_le_bytes)
+        else {
+            return false;
+        };
+        let Some(mutation_start) = bytes
+            .get(30..38)
+            .and_then(|value| value.try_into().ok())
+            .map(u64::from_le_bytes)
+        else {
+            return false;
+        };
+        mutation_start >= segment_base.saturating_add(Self::HEADER_LEN as u64)
+            && mutation_start <= physical_start
+    }
+
+    pub(crate) fn record_index_count_are_valid(bytes: &[u8]) -> bool {
+        let Some(index) = bytes
+            .get(38..42)
+            .and_then(|value| value.try_into().ok())
+            .map(u32::from_le_bytes)
+        else {
+            return false;
+        };
+        let Some(count) = bytes
+            .get(42..46)
+            .and_then(|value| value.try_into().ok())
+            .map(u32::from_le_bytes)
+        else {
+            return false;
+        };
+        count != 0 && index < count
+    }
+
+    pub(crate) fn record_timestamp_bucket(bytes: &[u8]) -> Option<u64> {
+        bytes
+            .get(46..54)
+            .and_then(|value| value.try_into().ok())
+            .map(u64::from_le_bytes)
+    }
+
+    pub(crate) fn payload_is_valid(store_kind: u8, action: u8, payload: &[u8]) -> bool {
+        V1CodecProbe::payload_is_valid(store_kind, action, payload)
+    }
+
+    pub(crate) fn record_crc_is_valid(bytes: &[u8]) -> bool {
+        let Some(payload_len) = bytes
+            .get(6..14)
+            .and_then(|value| value.try_into().ok())
+            .map(u64::from_le_bytes)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            return false;
+        };
+        let Some(crc_start) = 62_usize.checked_add(payload_len) else {
+            return false;
+        };
+        let Some(crc_end) = crc_start.checked_add(4) else {
+            return false;
+        };
+        let Some(stored) = bytes
+            .get(crc_start..crc_end)
+            .and_then(|value| value.try_into().ok())
+            .map(u32::from_le_bytes)
+        else {
+            return false;
+        };
+        stored == crc32fast::hash(&bytes[..crc_start])
     }
 }

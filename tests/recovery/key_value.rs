@@ -298,19 +298,21 @@ fn proper_compacted_snapshot_prefix_selects_legacy() {
             .into_store(),
     );
     let legacy = std::fs::read(legacy_source.path().join("kv.wal.dat")).unwrap();
-    let first_start = 40;
-    let first_data_len = u32::from_le_bytes(
-        legacy[first_start + 6..first_start + 10]
+    let first_start = 64;
+    let first_data_len = usize::try_from(u64::from_le_bytes(
+        legacy[first_start + 6..first_start + 14]
             .try_into()
             .unwrap(),
-    ) as usize;
-    let first_frame_end = first_start + 46 + first_data_len;
-    let second_data_len = u32::from_le_bytes(
-        legacy[first_frame_end + 6..first_frame_end + 10]
+    ))
+    .unwrap();
+    let first_frame_end = first_start + 66 + first_data_len;
+    let second_data_len = usize::try_from(u64::from_le_bytes(
+        legacy[first_frame_end + 6..first_frame_end + 14]
             .try_into()
             .unwrap(),
-    ) as usize;
-    let second_frame_end = first_frame_end + 46 + second_data_len;
+    ))
+    .unwrap();
+    let second_frame_end = first_frame_end + 66 + second_data_len;
 
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(

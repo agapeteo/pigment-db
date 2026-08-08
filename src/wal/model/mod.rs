@@ -48,18 +48,16 @@ impl KeyValueData {
 pub struct StoredAction {
     act_type: u8,
     crc: u32,
-    data_size: u32,
     data: Vec<u8>,
     start_offset: u32,
 }
 
 impl StoredAction {
     #[allow(dead_code)]
-    pub fn new(act_type: u8, crc: u32, data_size: u32, data: Vec<u8>, start_offset: u32) -> Self {
+    pub fn new(act_type: u8, crc: u32, data: Vec<u8>, start_offset: u32) -> Self {
         StoredAction {
             act_type,
             crc,
-            data_size,
             data,
             start_offset,
         }
@@ -67,18 +65,68 @@ impl StoredAction {
 }
 
 impl StoredAction {
+    fn prepared(act_type: u8, data: Vec<u8>, start_offset: u32) -> Self {
+        StoredAction {
+            act_type,
+            crc: 0,
+            data,
+            start_offset,
+        }
+    }
+
+    pub fn prepare_put(offset: &u32, key_value: &KeyValueData) -> Self {
+        let data =
+            bincode::serialize(&key_value).expect("key_value should be serialized with bincode");
+        Self::prepared(PUT_ACT, data, *offset)
+    }
+
+    pub fn prepare_delete(offset: &u32, key: &[u8]) -> Self {
+        Self::prepared(DELETE_ACT, key.to_vec(), *offset)
+    }
+
+    #[cfg(test)]
+    pub fn prepare_append_to_set(offset: &u32, key_value: &KeyValueData) -> Self {
+        let data =
+            bincode::serialize(&key_value).expect("key_value should be serialized with bincode");
+        Self::prepared(SET_APPEND_ACT, data, *offset)
+    }
+
+    pub fn prepare_append_to_set_borrowed(offset: &u32, key: &[u8], value: &[u8]) -> Self {
+        let data = bincode::serialize(&KeyValueDataRef { key, value })
+            .expect("borrowed key/value should be serialized with bincode");
+        Self::prepared(SET_APPEND_ACT, data, *offset)
+    }
+
+    pub fn prepare_remove_from_set(offset: &u32, key_value: &KeyValueData) -> Self {
+        let data =
+            bincode::serialize(&key_value).expect("key_value should be serialized with bincode");
+        Self::prepared(SET_REMOVE_ACT, data, *offset)
+    }
+
+    pub fn prepare_sorted_map_put(offset: &u32, data: Vec<u8>) -> Self {
+        Self::prepared(MAP_PUT_ACT, data, *offset)
+    }
+
+    pub fn prepare_remove_from_sorted_map(offset: &u32, search_map_key: &SortedMapKey) -> Self {
+        let data = bincode::serialize(search_map_key)
+            .expect("map entry should be serialized with bincode");
+        Self::prepared(MAP_REMOVE_ACT, data, *offset)
+    }
+
+    pub fn ensure_payload_crc(&mut self) {
+        self.crc = crc(&self.data);
+    }
+
     pub fn put_action(offset: &u32, key_value: &KeyValueData) -> Self {
         let act_type = PUT_ACT;
         let data =
             bincode::serialize(&key_value).expect("key_value should be serialized with bincode");
         let crc = crc(&data);
-        let data_size = data.len() as u32;
         let start_offset = *offset;
 
         StoredAction {
             act_type,
             crc,
-            data_size,
             data,
             start_offset,
         }
@@ -88,13 +136,11 @@ impl StoredAction {
         let act_type = DELETE_ACT;
         let crc = crc(key);
         let data = key.to_vec();
-        let data_size = data.len() as u32;
         let start_offset = *offset;
 
         StoredAction {
             act_type,
             crc,
-            data_size,
             data,
             start_offset,
         }
@@ -105,30 +151,11 @@ impl StoredAction {
         let data =
             bincode::serialize(&key_value).expect("key_value should be serialized with bincode");
         let crc = crc(&data);
-        let data_size = data.len() as u32;
         let start_offset = *offset;
 
         StoredAction {
             act_type,
             crc,
-            data_size,
-            data,
-            start_offset,
-        }
-    }
-
-    pub fn append_to_set_borrowed(offset: &u32, key: &[u8], value: &[u8]) -> Self {
-        let act_type = SET_APPEND_ACT;
-        let data = bincode::serialize(&KeyValueDataRef { key, value })
-            .expect("borrowed key/value should be serialized with bincode");
-        let crc = crc(&data);
-        let data_size = data.len() as u32;
-        let start_offset = *offset;
-
-        StoredAction {
-            act_type,
-            crc,
-            data_size,
             data,
             start_offset,
         }
@@ -139,13 +166,11 @@ impl StoredAction {
         let data =
             bincode::serialize(&key_value).expect("key_value should be serialized with bincode");
         let crc = crc(&data);
-        let data_size = data.len() as u32;
         let start_offset = *offset;
 
         StoredAction {
             act_type,
             crc,
-            data_size,
             data,
             start_offset,
         }
@@ -156,13 +181,11 @@ impl StoredAction {
         let data =
             bincode::serialize(&entry).expect("sorted element should be serialized with bincode");
         let crc = crc(&data);
-        let data_size = data.len() as u32;
         let start_offset = *offset;
 
         StoredAction {
             act_type,
             crc,
-            data_size,
             data,
             start_offset,
         }
@@ -173,13 +196,11 @@ impl StoredAction {
         let data = bincode::serialize(search_map_key)
             .expect("map entry should be serialized with bincode");
         let crc = crc(&data);
-        let data_size = data.len() as u32;
         let start_offset = *offset;
 
         StoredAction {
             act_type,
             crc,
-            data_size,
             data,
             start_offset,
         }
@@ -193,8 +214,8 @@ impl StoredAction {
         &self.crc
     }
 
-    pub fn data_size(&self) -> &u32 {
-        &self.data_size
+    pub fn data_size(&self) -> usize {
+        self.data.len()
     }
 
     pub fn data(&self) -> &[u8] {
@@ -203,6 +224,10 @@ impl StoredAction {
 
     pub fn start_offset(&self) -> &u32 {
         &self.start_offset
+    }
+
+    pub fn set_start_offset(&mut self, start_offset: u32) {
+        self.start_offset = start_offset;
     }
 }
 

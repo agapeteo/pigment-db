@@ -13,7 +13,9 @@ use crate::durability::{
     preflight_directory, preflight_file, preflight_file_handle, synchronize_directory,
     validate_compile_target,
 };
-use crate::wal::format::{HeaderProbeClassification, V1CodecProbe};
+use crate::wal::format::{
+    HeaderProbeClassification, V1CodecProbe, V2CodecProbe, V2HeaderProbeFields,
+};
 use crate::wal::replay::{CheckedFrames, ReplaySnapshot, TailReplay, ValidationError};
 use crate::wal::WalStorage;
 use crate::{RecoveryError, RecoveryOperation, RecoveryStatus};
@@ -51,6 +53,43 @@ impl ArtifactPaths {
             staging: directory.join(format!(".{file_name}.next")),
         }
     }
+}
+
+fn sealed_segment_paths(paths: &ArtifactPaths) -> Result<Vec<PathBuf>, RecoveryError> {
+    let parent = paths
+        .active
+        .parent()
+        .expect("WAL artifact must have a parent directory");
+    if !parent.exists() {
+        return Ok(Vec::new());
+    }
+    let active_name = paths
+        .active
+        .file_name()
+        .expect("WAL artifact must have a file name")
+        .to_string_lossy();
+    let prefix = format!("{active_name}.segment-");
+    let entries = fs::read_dir(parent)
+        .map_err(|source| io_failure(RecoveryOperation::Inspect, parent, source))?;
+    let mut segments = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|source| io_failure(RecoveryOperation::Inspect, parent, source))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(id) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if id.len() != 20 || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let id = id
+            .parse::<u64>()
+            .map_err(|_| RecoveryError::InvalidArtifact { path: entry.path() })?;
+        segments.push((id, entry.path()));
+    }
+    segments.sort_by_key(|(id, _)| *id);
+    Ok(segments.into_iter().map(|(_, path)| path).collect())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -358,7 +397,7 @@ pub(crate) struct FreshPublicationFailure {
 
 pub(crate) fn write_fresh_header_prefix(
     mut staging: std::fs::File,
-    header: &[u8; 40],
+    header: &[u8],
     written_len: usize,
     registry: &mut FreshCleanupRegistry,
 ) -> Result<std::fs::File, FreshPublicationFailure> {
@@ -392,7 +431,7 @@ pub(crate) fn readback_fresh_header(
     mut staging: std::fs::File,
     inject_read_failure: bool,
     registry: &mut FreshCleanupRegistry,
-) -> Result<(std::fs::File, [u8; 40]), FreshPublicationFailure> {
+) -> Result<(std::fs::File, Vec<u8>), FreshPublicationFailure> {
     let persisted = if inject_read_failure {
         Err(io::Error::other("injected staged-header read failure"))
     } else {
@@ -403,10 +442,13 @@ pub(crate) fn readback_fresh_header(
     };
 
     match persisted {
-        Ok(bytes) if bytes.len() == 40 => {
-            let mut header = [0; 40];
-            header.copy_from_slice(&bytes);
-            Ok((staging, header))
+        Ok(bytes)
+            if matches!(
+                bytes.len(),
+                V1CodecProbe::HEADER_LEN | V2CodecProbe::HEADER_LEN
+            ) =>
+        {
+            Ok((staging, bytes))
         }
         Ok(_) | Err(_) => {
             drop(staging);
@@ -417,11 +459,11 @@ pub(crate) fn readback_fresh_header(
 
 pub(crate) fn validate_fresh_header(
     staging: std::fs::File,
-    persisted: &[u8; 40],
-    expected: &[u8; 40],
+    persisted: &[u8],
+    expected: &[u8],
     registry: &mut FreshCleanupRegistry,
 ) -> Result<std::fs::File, FreshPublicationFailure> {
-    let valid = V1CodecProbe::classify_header(persisted) == HeaderProbeClassification::Valid
+    let valid_v1 = V1CodecProbe::classify_header(persisted) == HeaderProbeClassification::Valid
         && V1CodecProbe::magic_is_valid(persisted)
         && V1CodecProbe::version_is_valid(persisted)
         && V1CodecProbe::header_length_is_valid(persisted)
@@ -430,8 +472,8 @@ pub(crate) fn validate_fresh_header(
         && V1CodecProbe::flags_are_valid(persisted)
         && V1CodecProbe::granularity_is_valid(persisted)
         && V1CodecProbe::reserved_is_valid(persisted)
-        && V1CodecProbe::header_crc_is_valid(persisted)
-        && persisted == expected;
+        && V1CodecProbe::header_crc_is_valid(persisted);
+    let valid = (valid_v1 || V2CodecProbe::header_is_valid(persisted)) && persisted == expected;
     if valid {
         Ok(staging)
     } else {
@@ -459,8 +501,23 @@ pub(crate) fn sync_fresh_header(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn prepare_fresh_append(
+    staging: std::fs::File,
+    inject_failure: bool,
+    registry: &mut FreshCleanupRegistry,
+) -> Result<std::fs::File, FreshPublicationFailure> {
+    prepare_fresh_append_at(
+        staging,
+        V1CodecProbe::HEADER_LEN as u64,
+        inject_failure,
+        registry,
+    )
+}
+
+fn prepare_fresh_append_at(
     mut staging: std::fs::File,
+    append_offset: u64,
     inject_failure: bool,
     registry: &mut FreshCleanupRegistry,
 ) -> Result<std::fs::File, FreshPublicationFailure> {
@@ -470,9 +527,9 @@ pub(crate) fn prepare_fresh_append(
         ))
     } else {
         staging
-            .seek(SeekFrom::Start(V1CodecProbe::HEADER_LEN as u64))
+            .seek(SeekFrom::Start(append_offset))
             .and_then(|offset| {
-                (offset == V1CodecProbe::HEADER_LEN as u64)
+                (offset == append_offset)
                     .then_some(())
                     .ok_or_else(|| io::Error::other("unexpected append offset"))
             })
@@ -528,6 +585,7 @@ pub(crate) fn handoff_fresh_handle(
     Ok(published.handle)
 }
 
+#[allow(dead_code)]
 pub(crate) fn initialize_fresh_v1(
     paths: &ArtifactPaths,
     header: &[u8; V1CodecProbe::HEADER_LEN],
@@ -583,6 +641,67 @@ pub(crate) fn initialize_fresh_v1(
         V1CodecProbe::HEADER_LEN as u32,
         granularity_nanos,
         base_bucket,
+    ))
+}
+
+pub(crate) fn initialize_fresh_v2(
+    paths: &ArtifactPaths,
+    header: &[u8; V2CodecProbe::HEADER_LEN],
+    durability_policy: DurabilityPolicy,
+) -> Result<WalStorage<std::fs::File>, RecoveryError> {
+    let mut registry = FreshCleanupRegistry::default();
+    let staging = create_fresh_staging(paths, &mut registry)?;
+    let staging = write_fresh_header_prefix(staging, header, header.len(), &mut registry)
+        .map_err(fresh_publication_error)?;
+    let staging =
+        flush_fresh_header(staging, false, &mut registry).map_err(fresh_publication_error)?;
+    let (staging, persisted) =
+        readback_fresh_header(staging, false, &mut registry).map_err(fresh_publication_error)?;
+    let staging = validate_fresh_header(staging, &persisted, header, &mut registry)
+        .map_err(fresh_publication_error)?;
+    let staging = if durability_policy == DurabilityPolicy::Physical {
+        if let Err(mut source) = preflight_file_handle(&staging, &paths.staging) {
+            drop(staging);
+            let cleanup_failed = registry.cleanup().is_err();
+            if cleanup_failed {
+                log::warn!(
+                    "failed to remove non-authoritative staging after content preflight failure: {}",
+                    paths.staging.display()
+                );
+                source = diagnose_staging_cleanup_failure(source, &paths.staging);
+            }
+            return Err(RecoveryError::UnsupportedDurability { source });
+        }
+        staging
+    } else {
+        sync_fresh_header(staging, false, &mut registry).map_err(fresh_publication_error)?
+    };
+    let staging = prepare_fresh_append_at(
+        staging,
+        V2CodecProbe::HEADER_LEN as u64,
+        false,
+        &mut registry,
+    )
+    .map_err(fresh_publication_error)?;
+    let published = publish_fresh_header(staging, paths, false, &mut registry)
+        .map_err(fresh_publication_error)?;
+    if durability_policy == DurabilityPolicy::Physical {
+        let parent = paths
+            .active
+            .parent()
+            .expect("WAL artifact must have a parent directory");
+        synchronize_directory(parent)
+            .map_err(|source| io_failure(RecoveryOperation::Publish, parent, source))?;
+    }
+    let handle = match handoff_fresh_handle(published) {
+        Ok(handle) => handle,
+        Err(_) => unreachable!("prepared fresh handle handoff is infallible"),
+    };
+    Ok(WalStorage::from_prepared_file_v2_with_timestamp_state(
+        handle,
+        V2CodecProbe::HEADER_LEN as u64,
+        V2CodecProbe::header_granularity(header).unwrap(),
+        V2CodecProbe::header_base_bucket(header).unwrap_or(0),
     ))
 }
 
@@ -1327,7 +1446,7 @@ pub(crate) fn initialize_snapshot<S: Clone + Eq + Default>(
     fresh_header: Option<[u8; V1CodecProbe::HEADER_LEN]>,
     requested_granularity_nanos: Option<u64>,
 ) -> Result<InitializedWal<S>, RecoveryError> {
-    initialize_snapshot_with_policy(
+    initialize_snapshot_impl(
         paths,
         replay,
         replay_tail,
@@ -1338,6 +1457,7 @@ pub(crate) fn initialize_snapshot<S: Clone + Eq + Default>(
         fresh_header,
         requested_granularity_nanos,
         DurabilityPolicy::Buffered,
+        true,
     )
 }
 
@@ -1354,14 +1474,43 @@ pub(crate) fn initialize_snapshot_with_policy<S: Clone + Eq + Default>(
     requested_granularity_nanos: Option<u64>,
     durability_policy: DurabilityPolicy,
 ) -> Result<InitializedWal<S>, RecoveryError> {
+    initialize_snapshot_impl(
+        paths,
+        replay,
+        replay_tail,
+        replay_against,
+        encode,
+        encode_repair,
+        is_proper_snapshot_prefix,
+        fresh_header,
+        requested_granularity_nanos,
+        durability_policy,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn initialize_snapshot_impl<S: Clone + Eq + Default>(
+    paths: &ArtifactPaths,
+    replay: fn(&[u8]) -> Result<ReplaySnapshot<S>, ValidationError>,
+    replay_tail: fn(&[u8]) -> TailReplay<S>,
+    replay_against: fn(&[u8], &S) -> Result<ReplaySnapshot<S>, ValidationError>,
+    encode: fn(&S) -> Vec<u8>,
+    encode_repair: fn(&S, &[u8; V1CodecProbe::HEADER_LEN]) -> Vec<u8>,
+    is_proper_snapshot_prefix: fn(&S, &S) -> bool,
+    fresh_header: Option<[u8; V1CodecProbe::HEADER_LEN]>,
+    requested_granularity_nanos: Option<u64>,
+    durability_policy: DurabilityPolicy,
+    allow_v1_startup: bool,
+) -> Result<InitializedWal<S>, RecoveryError> {
     if durability_policy == DurabilityPolicy::Physical {
         validate_compile_target()
             .map_err(|source| RecoveryError::UnsupportedDurability { source })?;
     }
-    let active_exists = artifact_exists(&paths.active)?;
+    let mut active_exists = artifact_exists(&paths.active)?;
     let legacy_exists = artifact_exists(&paths.legacy)?;
     let had_staging = artifact_exists(&paths.staging)?;
-    let active_bytes = if active_exists {
+    let mut active_bytes = if active_exists {
         Some(
             fs::read(&paths.active)
                 .map_err(|source| io_failure(RecoveryOperation::Open, &paths.active, source))?,
@@ -1369,6 +1518,7 @@ pub(crate) fn initialize_snapshot_with_policy<S: Clone + Eq + Default>(
     } else {
         None
     };
+    let sealed_paths = sealed_segment_paths(paths)?;
     let legacy_bytes = if legacy_exists {
         Some(
             fs::read(&paths.legacy)
@@ -1377,15 +1527,234 @@ pub(crate) fn initialize_snapshot_with_policy<S: Clone + Eq + Default>(
     } else {
         None
     };
-    let active_is_v1 = active_bytes
+    if !sealed_paths.is_empty() {
+        if had_staging && active_exists {
+            if let Err(error) = remove_obsolete(&paths.staging) {
+                log::warn!(
+                    "deferred stale V2 rotation staging cleanup for {}: {}",
+                    paths.staging.display(),
+                    error
+                );
+            }
+        } else if had_staging {
+            let staging_bytes = fs::read(&paths.staging)
+                .map_err(|source| io_failure(RecoveryOperation::Open, &paths.staging, source))?;
+            let mut candidate_chain = Vec::new();
+            for segment_path in &sealed_paths {
+                let segment = fs::read(segment_path)
+                    .map_err(|source| io_failure(RecoveryOperation::Open, segment_path, source))?;
+                candidate_chain.extend_from_slice(&segment);
+            }
+            candidate_chain.extend_from_slice(&staging_bytes);
+            replay(&candidate_chain).map_err(|_| RecoveryError::InvalidArtifact {
+                path: paths.staging.clone(),
+            })?;
+            if legacy_bytes
+                .as_deref()
+                .is_some_and(|legacy| !legacy.starts_with(&staging_bytes))
+            {
+                return Err(RecoveryError::AuthorityUndetermined {
+                    active_path: None,
+                    recovery_path: Some(paths.legacy.clone()),
+                });
+            }
+            if durability_policy == DurabilityPolicy::Physical {
+                preflight_file(&paths.staging)
+                    .map_err(|source| RecoveryError::UnsupportedDurability { source })?;
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&paths.staging)
+                    .and_then(|file| file.sync_all())
+                    .map_err(|source| {
+                        io_failure(RecoveryOperation::WriteStaging, &paths.staging, source)
+                    })?;
+            }
+            fs::rename(&paths.staging, &paths.active)
+                .map_err(|source| io_failure(RecoveryOperation::Publish, &paths.active, source))?;
+            if durability_policy == DurabilityPolicy::Physical {
+                let parent = paths
+                    .active
+                    .parent()
+                    .expect("WAL artifact must have a parent directory");
+                synchronize_directory(parent)
+                    .map_err(|source| io_failure(RecoveryOperation::Publish, parent, source))?;
+            }
+            active_exists = true;
+            active_bytes = Some(staging_bytes);
+        }
+        if !active_exists {
+            return Err(RecoveryError::AuthorityUndetermined {
+                active_path: None,
+                recovery_path: None,
+            });
+        }
+        let mut chain = Vec::new();
+        for segment_path in &sealed_paths {
+            let segment = fs::read(segment_path)
+                .map_err(|source| io_failure(RecoveryOperation::Open, segment_path, source))?;
+            chain.extend_from_slice(&segment);
+        }
+        let active_segment = active_bytes
+            .as_deref()
+            .expect("active existence checked for segmented chain");
+        let sealed_len = chain.len();
+        chain.extend_from_slice(active_segment);
+        let replayed = match replay(&chain) {
+            Ok(replayed) => replayed,
+            Err(_) => {
+                let TailReplay::RecoverableTail {
+                    tail_offset,
+                    accepted_header: Some(header),
+                    ..
+                } = replay_tail(active_segment)
+                else {
+                    return Err(RecoveryError::InvalidArtifact {
+                        path: paths.active.clone(),
+                    });
+                };
+                if header.get(8..10) != Some(2_u16.to_le_bytes().as_slice()) {
+                    return Err(RecoveryError::InvalidArtifact {
+                        path: paths.active.clone(),
+                    });
+                }
+                let replacement = active_segment
+                    .get(..tail_offset)
+                    .ok_or_else(|| RecoveryError::InvalidArtifact {
+                        path: paths.active.clone(),
+                    })?
+                    .to_vec();
+                let mut accepted_chain = chain[..sealed_len].to_vec();
+                accepted_chain.extend_from_slice(&replacement);
+                let accepted =
+                    replay(&accepted_chain).map_err(|_| RecoveryError::InvalidArtifact {
+                        path: paths.active.clone(),
+                    })?;
+                if durability_policy == DurabilityPolicy::Physical {
+                    let parent = paths
+                        .active
+                        .parent()
+                        .expect("WAL artifact must have a parent directory");
+                    preflight_directory(parent)
+                        .map_err(|source| RecoveryError::UnsupportedDurability { source })?;
+                    preflight_file(&paths.active)
+                        .map_err(|source| RecoveryError::UnsupportedDurability { source })?;
+                }
+                let expected = replacement.clone();
+                let completed = publish_validated_repair_with_policy(
+                    paths,
+                    RepairAuthority::Active {
+                        obsolete_recovery: legacy_bytes.as_deref(),
+                    },
+                    &replacement,
+                    |persisted| persisted == expected,
+                    durability_policy,
+                )?;
+                let offset = u64::try_from(replacement.len()).map_err(|_| {
+                    RecoveryError::InvalidArtifact {
+                        path: paths.active.clone(),
+                    }
+                })?;
+                let initialized = InitializedWal {
+                    snapshot: accepted.snapshot,
+                    wal: WalStorage::from_prepared_file_v2_with_timestamp_state(
+                        completed.handle,
+                        offset,
+                        accepted.granularity_nanos,
+                        accepted.last_bucket,
+                    ),
+                    status: completed.status,
+                };
+                initialized.wal.set_runtime_policy(durability_policy);
+                return Ok(initialized);
+            }
+        };
+        if let Some(legacy) = legacy_bytes.as_deref() {
+            if !legacy.starts_with(active_segment) {
+                return Err(RecoveryError::AuthorityUndetermined {
+                    active_path: Some(paths.active.clone()),
+                    recovery_path: Some(paths.legacy.clone()),
+                });
+            }
+            if let Err(error) = remove_obsolete(&paths.legacy) {
+                log::warn!(
+                    "deferred stale segmented WAL recovery cleanup for {}: {}",
+                    paths.legacy.display(),
+                    error
+                );
+            }
+        }
+        if durability_policy == DurabilityPolicy::Physical {
+            validate_compile_target()
+                .map_err(|source| RecoveryError::UnsupportedDurability { source })?;
+            preflight_file(&paths.active)
+                .map_err(|source| RecoveryError::UnsupportedDurability { source })?;
+        }
+        let wal = WalStorage::try_open_file_based_v2_with_timestamp_state(
+            &paths.active,
+            active_segment.len() as u64,
+            replayed.granularity_nanos,
+            replayed.last_bucket,
+        )
+        .map_err(|source| io_failure(RecoveryOperation::Open, &paths.active, source))?;
+        wal.set_runtime_policy(durability_policy);
+        return Ok(InitializedWal {
+            snapshot: replayed.snapshot,
+            wal,
+            status: if had_staging {
+                RecoveryStatus::Recovered
+            } else {
+                RecoveryStatus::Normal
+            },
+        });
+    }
+    let active_is_versioned = active_bytes
         .as_deref()
         .is_some_and(|bytes| bytes.starts_with(b"PIGWAL\r\n"));
-    let legacy_is_v1 = legacy_bytes
+    let legacy_is_versioned = legacy_bytes
         .as_deref()
         .is_some_and(|bytes| bytes.starts_with(b"PIGWAL\r\n"));
+    let active_version = active_bytes.as_deref().and_then(|bytes| {
+        bytes
+            .get(8..10)
+            .and_then(|version| version.try_into().ok())
+            .map(u16::from_le_bytes)
+    });
+    let legacy_version = legacy_bytes.as_deref().and_then(|bytes| {
+        bytes
+            .get(8..10)
+            .and_then(|version| version.try_into().ok())
+            .map(u16::from_le_bytes)
+    });
+    if !allow_v1_startup && active_version == Some(1) {
+        return match active_bytes.as_deref().map(replay_tail) {
+            Some(TailReplay::Complete(_) | TailReplay::RecoverableTail { .. }) => {
+                Err(RecoveryError::MigrationRequired {
+                    path: paths.active.clone(),
+                })
+            }
+            _ => Err(RecoveryError::InvalidArtifact {
+                path: paths.active.clone(),
+            }),
+        };
+    }
+    if !allow_v1_startup && legacy_version == Some(1) {
+        return match legacy_bytes.as_deref().map(replay_tail) {
+            Some(TailReplay::Complete(_) | TailReplay::RecoverableTail { .. }) => {
+                Err(RecoveryError::MigrationRequired {
+                    path: paths.legacy.clone(),
+                })
+            }
+            _ => Err(RecoveryError::InvalidArtifact {
+                path: paths.legacy.clone(),
+            }),
+        };
+    }
+    let active_is_v1 = matches!(active_version, Some(1 | 2));
+    let legacy_is_v1 = matches!(legacy_version, Some(1 | 2));
     let active_legacy_is_complete = active_bytes
         .as_deref()
-        .is_some_and(|bytes| !active_is_v1 && replay(bytes).is_ok());
+        .is_some_and(|bytes| !active_is_versioned && replay(bytes).is_ok());
     if active_legacy_is_complete {
         return Err(RecoveryError::MigrationRequired {
             path: paths.active.clone(),
@@ -1393,11 +1762,11 @@ pub(crate) fn initialize_snapshot_with_policy<S: Clone + Eq + Default>(
     }
     let active_cannot_be_authoritative = active_bytes
         .as_deref()
-        .is_none_or(|bytes| !active_is_v1 && replay(bytes).is_err());
+        .is_none_or(|bytes| !active_is_versioned && replay(bytes).is_err());
     if active_cannot_be_authoritative
         && legacy_bytes
             .as_deref()
-            .is_some_and(|bytes| !legacy_is_v1 && replay(bytes).is_ok())
+            .is_some_and(|bytes| !legacy_is_versioned && replay(bytes).is_ok())
     {
         return Err(RecoveryError::MigrationRequired {
             path: paths.legacy.clone(),
@@ -1409,7 +1778,7 @@ pub(crate) fn initialize_snapshot_with_policy<S: Clone + Eq + Default>(
         Active(ReplaySnapshot<S>),
         ActiveTail {
             replay: ReplaySnapshot<S>,
-            header: [u8; V1CodecProbe::HEADER_LEN],
+            header: Vec<u8>,
         },
         Legacy(ReplaySnapshot<S>),
     }
@@ -1546,8 +1915,14 @@ pub(crate) fn initialize_snapshot_with_policy<S: Clone + Eq + Default>(
                 Some(header) => {
                     let granularity = requested_granularity_nanos
                         .unwrap_or_else(|| V1CodecProbe::granularity(&header).unwrap());
-                    let header = header_with_granularity_and_base_bucket(header, granularity, 0);
-                    initialize_fresh_v1(paths, &header, durability_policy)?
+                    let header = V2CodecProbe::encode_header(V2HeaderProbeFields {
+                        kind: header[12],
+                        granularity_nanos: granularity,
+                        base_bucket: 0,
+                        segment_id: 0,
+                        segment_base: 0,
+                    });
+                    initialize_fresh_v2(paths, &header, durability_policy)?
                 }
                 None => WalStorage::try_new_file_based(&paths.active).map_err(|source| {
                     io_failure(RecoveryOperation::CreateStaging, &paths.active, source)
@@ -1563,6 +1938,56 @@ pub(crate) fn initialize_snapshot_with_policy<S: Clone + Eq + Default>(
             replay: accepted,
             header,
         } => {
+            if header.get(8..10) == Some(2_u16.to_le_bytes().as_slice()) {
+                let accepted_len = usize::try_from(accepted.byte_len).map_err(|_| {
+                    RecoveryError::InvalidArtifact {
+                        path: paths.active.clone(),
+                    }
+                })?;
+                let replacement = active_bytes
+                    .as_deref()
+                    .and_then(|bytes| bytes.get(..accepted_len))
+                    .ok_or_else(|| RecoveryError::InvalidArtifact {
+                        path: paths.active.clone(),
+                    })?
+                    .to_vec();
+                let expected_snapshot = accepted.snapshot.clone();
+                let completed = publish_validated_repair_with_policy(
+                    paths,
+                    RepairAuthority::Active {
+                        obsolete_recovery: legacy_bytes.as_deref(),
+                    },
+                    &replacement,
+                    |persisted| {
+                        replay(persisted)
+                            .is_ok_and(|validated| validated.snapshot == expected_snapshot)
+                    },
+                    durability_policy,
+                )?;
+                let offset = u64::try_from(replacement.len()).map_err(|_| {
+                    RecoveryError::InvalidArtifact {
+                        path: paths.active.clone(),
+                    }
+                })?;
+                let initialized = InitializedWal {
+                    snapshot: accepted.snapshot,
+                    wal: WalStorage::from_prepared_file_v2_with_timestamp_state(
+                        completed.handle,
+                        offset,
+                        accepted.granularity_nanos,
+                        accepted.last_bucket,
+                    ),
+                    status: completed.status,
+                };
+                initialized.wal.set_runtime_policy(durability_policy);
+                return Ok(initialized);
+            }
+            let header: [u8; V1CodecProbe::HEADER_LEN] =
+                header
+                    .try_into()
+                    .map_err(|_| RecoveryError::InvalidArtifact {
+                        path: paths.active.clone(),
+                    })?;
             let granularity = requested_granularity_nanos.unwrap_or(accepted.granularity_nanos);
             let repair_header =
                 header_with_granularity_and_base_bucket(header, granularity, accepted.last_bucket);
@@ -1604,7 +2029,7 @@ pub(crate) fn initialize_snapshot_with_policy<S: Clone + Eq + Default>(
             })
         }
         Selected::Active(active) => {
-            if active_is_v1
+            if active_version == Some(1)
                 && staging_clean
                 && requested_granularity_nanos
                     .is_some_and(|requested| requested != active.granularity_nanos)
@@ -1682,7 +2107,14 @@ pub(crate) fn initialize_snapshot_with_policy<S: Clone + Eq + Default>(
             } else {
                 active.byte_len
             };
-            let wal = if active_is_v1 {
+            let wal = if active_version == Some(2) {
+                WalStorage::try_open_file_based_v2_with_timestamp_state(
+                    &paths.active,
+                    validated_len,
+                    active.granularity_nanos,
+                    active.last_bucket,
+                )
+            } else if active_version == Some(1) {
                 WalStorage::try_open_file_based_v1_with_timestamp_state(
                     &paths.active,
                     validated_len,
@@ -1705,12 +2137,21 @@ pub(crate) fn initialize_snapshot_with_policy<S: Clone + Eq + Default>(
                     path: paths.legacy.clone(),
                 });
             }
-            let wal = WalStorage::try_open_file_based_v1_with_timestamp_state(
-                &paths.legacy,
-                legacy.byte_len,
-                legacy.granularity_nanos,
-                legacy.last_bucket,
-            )
+            let wal = if legacy_version == Some(2) {
+                WalStorage::try_open_file_based_v2_with_timestamp_state(
+                    &paths.legacy,
+                    legacy.byte_len,
+                    legacy.granularity_nanos,
+                    legacy.last_bucket,
+                )
+            } else {
+                WalStorage::try_open_file_based_v1_with_timestamp_state(
+                    &paths.legacy,
+                    legacy.byte_len,
+                    legacy.granularity_nanos,
+                    legacy.last_bucket,
+                )
+            }
             .map_err(|source| io_failure(RecoveryOperation::Open, &paths.legacy, source))?;
             Ok(InitializedWal {
                 snapshot: legacy.snapshot,
@@ -1738,16 +2179,31 @@ pub(crate) fn initialize_snapshot_with_policy<S: Clone + Eq + Default>(
                 |bytes| replay(bytes).is_ok_and(|result| result.snapshot == expected),
                 durability_policy,
             )?;
-            let offset =
-                u32::try_from(replacement.len()).map_err(|_| RecoveryError::InvalidArtifact {
-                    path: paths.active.clone(),
+            let wal = if legacy_version == Some(2) {
+                let offset = u64::try_from(replacement.len()).map_err(|_| {
+                    RecoveryError::InvalidArtifact {
+                        path: paths.active.clone(),
+                    }
                 })?;
-            let wal = WalStorage::from_prepared_file_with_timestamp_state(
-                completed.handle,
-                offset,
-                legacy.granularity_nanos,
-                legacy.last_bucket,
-            );
+                WalStorage::from_prepared_file_v2_with_timestamp_state(
+                    completed.handle,
+                    offset,
+                    legacy.granularity_nanos,
+                    legacy.last_bucket,
+                )
+            } else {
+                let offset = u32::try_from(replacement.len()).map_err(|_| {
+                    RecoveryError::InvalidArtifact {
+                        path: paths.active.clone(),
+                    }
+                })?;
+                WalStorage::from_prepared_file_with_timestamp_state(
+                    completed.handle,
+                    offset,
+                    legacy.granularity_nanos,
+                    legacy.last_bucket,
+                )
+            };
             Ok(InitializedWal {
                 snapshot: legacy.snapshot,
                 wal,
@@ -1906,7 +2362,9 @@ mod tests {
     fn append_action(bytes: &mut Vec<u8>, action: &StoredAction) {
         bytes.extend_from_slice(&action.act_type().to_ne_bytes());
         bytes.extend_from_slice(&action.crc().to_ne_bytes());
-        bytes.extend_from_slice(&action.data_size().to_ne_bytes());
+        let data_size =
+            u32::try_from(action.data_size()).expect("legacy test payload must fit u32");
+        bytes.extend_from_slice(&data_size.to_ne_bytes());
         bytes.extend_from_slice(action.data());
         bytes.extend_from_slice(&action.start_offset().to_ne_bytes());
     }

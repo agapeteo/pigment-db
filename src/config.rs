@@ -6,6 +6,7 @@ use std::num::NonZeroU64;
 use std::time::Duration;
 
 const DEFAULT_GRANULARITY_NANOS: u64 = 60_000_000_000;
+const DEFAULT_WAL_SEGMENT_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
@@ -76,17 +77,66 @@ impl fmt::Display for TimestampGranularityError {
 
 impl Error for TimestampGranularityError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A validated, nonzero target size for one active V2 WAL segment.
+///
+/// The limit is checked between complete logical mutations. A single mutation
+/// larger than the target remains intact in one oversized segment.
+pub struct WalSegmentSize(NonZeroU64);
+
+impl WalSegmentSize {
+    /// Returns the configured target size in bytes.
+    pub const fn as_bytes(self) -> u64 {
+        self.0.get()
+    }
+}
+
+impl Default for WalSegmentSize {
+    fn default() -> Self {
+        Self(NonZeroU64::new(DEFAULT_WAL_SEGMENT_BYTES).unwrap())
+    }
+}
+
+impl TryFrom<u64> for WalSegmentSize {
+    type Error = WalSegmentSizeError;
+
+    fn try_from(bytes: u64) -> Result<Self, Self::Error> {
+        NonZeroU64::new(bytes)
+            .map(Self)
+            .ok_or(WalSegmentSizeError::Zero)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Describes why a byte count cannot be used as a WAL segment target.
+pub enum WalSegmentSizeError {
+    /// A WAL segment target must contain at least one byte.
+    Zero,
+}
+
+impl fmt::Display for WalSegmentSizeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Zero => formatter.write_str("WAL segment size must be nonzero"),
+        }
+    }
+}
+
+impl Error for WalSegmentSizeError {}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 /// Additive options shared by all durable store families.
 ///
-/// Passing options when opening an existing V1 store may stage a compacted V1
-/// replacement to change its persisted granularity. The last accepted bucket
-/// and logical state are preserved. The durability policy is runtime-only: a
-/// later no-options reopen selects [`DurabilityPolicy::Buffered`] again. Options
-/// never authorize legacy migration.
+/// File-backed V2 stores apply an explicitly selected timestamp granularity by
+/// rotating before the next accepted mutation. Options that set only durability
+/// or segment size preserve the active segment's persisted granularity. The
+/// durability and segment-size policies are runtime-only; a later no-options
+/// reopen selects their defaults again. Options never authorize legacy or V1
+/// migration.
 pub struct DurableStoreOptions {
-    timestamp_granularity: TimestampGranularity,
+    timestamp_granularity: Option<TimestampGranularity>,
     durability_policy: DurabilityPolicy,
+    wal_segment_size: WalSegmentSize,
 }
 
 impl DurableStoreOptions {
@@ -95,12 +145,22 @@ impl DurableStoreOptions {
         mut self,
         timestamp_granularity: TimestampGranularity,
     ) -> Self {
-        self.timestamp_granularity = timestamp_granularity;
+        self.timestamp_granularity = Some(timestamp_granularity);
         self
     }
 
     pub(crate) const fn granularity_nanos(self) -> u64 {
-        self.timestamp_granularity.nanos()
+        match self.timestamp_granularity {
+            Some(granularity) => granularity.nanos(),
+            None => DEFAULT_GRANULARITY_NANOS,
+        }
+    }
+
+    pub(crate) const fn requested_granularity_nanos(self) -> Option<u64> {
+        match self.timestamp_granularity {
+            Some(granularity) => Some(granularity.nanos()),
+            None => None,
+        }
     }
 
     /// Selects the acknowledgement policy for this store opening.
@@ -114,6 +174,18 @@ impl DurableStoreOptions {
 
     pub(crate) const fn durability_policy(self) -> DurabilityPolicy {
         self.durability_policy
+    }
+
+    /// Selects the target size at which the active V2 WAL rotates before the
+    /// next complete logical mutation.
+    pub fn with_wal_segment_size(mut self, wal_segment_size: WalSegmentSize) -> Self {
+        self.wal_segment_size = wal_segment_size;
+        self
+    }
+
+    /// Returns the configured V2 WAL segment target.
+    pub const fn wal_segment_size(self) -> WalSegmentSize {
+        self.wal_segment_size
     }
 }
 

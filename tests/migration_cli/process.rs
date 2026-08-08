@@ -41,9 +41,9 @@ fn child_termination_leaves_only_diagnostic_destination_artifacts() {
             "destination-created" => assert!(!output_path.exists()),
             "partial-output-written" => {
                 let len = std::fs::metadata(output_path).unwrap().len();
-                assert!(len > 0 && len < 40, "partial length was {len}");
+                assert!(len > 0 && len < 64, "partial length was {len}");
             }
-            _ => assert!(std::fs::metadata(output_path).unwrap().len() >= 40),
+            _ => assert!(std::fs::metadata(output_path).unwrap().len() >= 64),
         }
     }
 }

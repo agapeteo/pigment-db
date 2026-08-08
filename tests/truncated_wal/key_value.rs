@@ -1,6 +1,6 @@
 //! Key/value truncation and recovery matrix.
 
-use super::support::assert_v1_timestamp_contract;
+use super::support::assert_v2_timestamp_contract;
 use pigment_db::key_value_store::DurableKeyValueStore;
 use pigment_db::{DurableStoreOptions, RecoveryStatus, TimestampGranularity};
 use std::time::Duration;
@@ -23,7 +23,7 @@ fn selected_active_tail_is_repaired_through_staging() {
     std::fs::write(&active, &interrupted).unwrap();
 
     let outcome = DurableKeyValueStore::try_init_new(directory.path())
-        .expect("a selected V1 terminal tail must be staged and repaired");
+        .expect("a selected V2 terminal tail must be staged and repaired");
 
     assert_eq!(outcome.status(), RecoveryStatus::Recovered);
     assert_eq!(outcome.store().get(b"stable"), Some(b"accepted".to_vec()));
@@ -99,7 +99,7 @@ fn key_value_timestamp_history_is_repeatable_across_reopens() {
     store.compute(b"a".to_vec(), |_| b"final".to_vec());
     drop(store);
 
-    assert_v1_timestamp_contract(
+    assert_v2_timestamp_contract(
         &std::fs::read(directory.path().join("kv.wal.dat")).unwrap(),
         granularity,
     );

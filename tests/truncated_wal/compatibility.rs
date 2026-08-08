@@ -132,8 +132,9 @@ fn frozen_all_family_and_no_mixed_grammar_regressions() {
     for name in ["kv.wal.dat", "set.wal.dat", "map.wal.dat"] {
         let bytes = fs::read(fresh.path().join(name)).unwrap();
         assert_eq!(&bytes[..8], b"PIGWAL\r\n");
-        assert_eq!(&bytes[40..42], &[0xa7, 0xd1]);
-        assert!(!matches!(bytes[40], 0..=5));
+        assert_eq!(u16::from_le_bytes(bytes[8..10].try_into().unwrap()), 2);
+        assert_eq!(&bytes[64..66], &[0xa7, 0xd1]);
+        assert!(!matches!(bytes[64], 0..=5));
     }
     let _ = DurableKeyValueStore::try_init_new(fresh.path()).unwrap();
     let _ = DurableKeySetStore::try_init_new(fresh.path()).unwrap();

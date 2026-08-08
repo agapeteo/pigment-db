@@ -1,0 +1,116 @@
+# Implementation Plan: V2 WAL Segments
+
+**Branch**: `codex/009-v2-wal-segments` | **Date**: 2026-08-07 | **Spec**: [spec.md](spec.md)
+
+**Input**: Feature specification from `specs/006-v2-wal-segments/spec.md`
+
+## Summary
+
+Replace fresh file-backed V1 histories with a V2 grammar using checked `u64` lengths and global offsets. Bound active growth with immutable numbered segments rotated between logical mutations, extend crash recovery across the segment chain, and make the offline CLI the only V1 upgrade and V2 compaction boundary. Preserve CRC32 and timestamp state; expose only additive configuration.
+
+## Technical Context
+
+**Language/Version**: Rust 2021 edition; package MSRV remains the repository's existing supported toolchain
+
+**Primary Dependencies**: Existing `dashmap`, `bincode`, `crc32fast`, `log`, and standard-library filesystem primitives; no new production dependency
+
+**Storage**: Append-only local WAL files: zero or more immutable numbered segments plus one active segment per store family
+
+**Testing**: Rust unit and integration tests with `cargo test`; sparse files for >4 GiB boundaries; existing fault probes for crash publication; matched baseline/candidate throughput runner
+
+**Target Platform**: Existing supported Rust targets; physical-durability mode remains limited by the established platform capability preflight
+
+**Project Type**: Rust library crate plus offline migration CLI
+
+**Performance Goals**: Non-rotating candidate median write throughput at least 90% of baseline with every matched pair at least 85%; no global mutation lock
+
+**Constraints**: RED-GREEN one behavior at a time; no partial logical group across segments; no automatic V1 startup conversion; no synchronous snapshot/global writer pause; source-preserving offline conversion; no new production dependency or unsafe code
+
+**Scale/Scope**: All three durable store families, cumulative histories beyond 4 GiB, configurable default 1 GiB active target, and arbitrarily many consecutive validated segments within filesystem limits
+
+## Constitution Check
+
+*GATE: Passed before design and rechecked after contracts.*
+
+- **I. RED-GREEN TDD**: Every production behavior has a focused public or boundary test with recorded RED then GREEN evidence; tasks preserve vertical slices.
+- **II. Durable/live integrity**: Contracts define active, sealed, staging, and recovery authority. Tail recovery removes only an unaccepted terminal mutation or whole group.
+- **III. Explicit compatibility**: V2 is versioned; V1 and legacy conversion is offline and source preserving; frozen fixtures remain inputs.
+- **IV. Bounded concurrency/performance**: Rotation uses the existing WAL critical section only; it adds no global operation mutex. A matched baseline/candidate gate is mandatory.
+- **V. Public evidence/scope**: Acceptance uses reopen state, CLI outcomes, source bytes, and public options; sparse/private seams only expose otherwise unreachable offset/failure boundaries.
+- **Project constraints**: No dependency, unsafe code, or cross-process coordination change. All three families are covered.
+
+## Architecture and Authority
+
+1. A V2 active segment is authoritative when its validated header and records extend the consecutive sealed chain.
+2. Rotation writes and validates a complete next header in `.NAME.next`, seals the active segment under its deterministic number, then publishes staging as the new active segment.
+3. A mutation is encoded completely before rotation is considered. Rotation happens before the mutation, never between group members.
+4. Recovery concatenates sealed bytes and active bytes for validation. A recoverable active tail is repaired through the existing staged publication path and revalidated against the whole accepted chain.
+5. An explicit granularity change sets `force_before_next_mutation`; open is read-only and the next mutation rotates with the new header.
+6. Offline migration captures every numbered segment plus active, validates the combined history, emits one V2 segment into a new directory, rereads the source capture, and preserves the source.
+
+## Performance Failure Remediation
+
+Protocol V1 is retained as a valid failed SC-005 capture: all six median ratios passed, but five individual eight-worker pairs violated the `0.85` floor. The threshold remained unchanged and the feature remained blocked at that point.
+
+Before changing production code, a separate diagnostic runs only the three eight-worker cells with four times as many operations per worker. It keeps same-process linked baseline/candidate binaries, fixed affinity, and counterbalanced order, while recording CPU and I/O pressure deltas around each measured sample. The diagnostic is evidence for choosing remediation; it is not a replacement acceptance result.
+
+Diagnostic V2 reproduced the wall-time lower tail and found a strong inverse relationship between throughput and global CPU pressure, but global PSI cannot distinguish outside scheduling from contention generated by the benchmark. Diagnostic V3 therefore retains the same longer matrix and adds aggregate worker CPU ticks plus voluntary and involuntary context-switch deltas from `/proc/thread-self`. Worker completion is signaled before post-sample accounting so the additional reads do not extend the measured operation interval.
+
+Diagnostic V3 found effectively equal median candidate/baseline worker CPU work (`1.006`) and symmetric slow-side reversals driven by CPU ticks and involuntary scheduling. The approved remediation changes only the measurement environment: the coordinator is pinned to CPU 11, worker `n` is pinned to CPU `12 + n`, and every effective affinity is verified before the timed barrier. CPUs 11-19 are distinct physical cores on the capture machine.
+
+- The full acceptance runner keeps linked baseline/candidate code, five warmup and eleven measured AB/BA pairs, 16,384 operations per worker, write-once evidence, and the original `0.90`/`0.85` thresholds.
+- Thread pinning uses the host `taskset` command outside each measured interval; it adds no dependency or unsafe code and is verified through `/proc/thread-self/status`.
+- Only a new complete six-cell acceptance capture can satisfy SC-005. All failed captures remain part of the record.
+
+Protocol V2 retained fixed affinity but still failed in key/value and key/set. Protocol V3 moved action preparation outside the exclusive WAL lock and Protocol V4 removed an intermediate read-lock acquisition; both remained valid failed evidence. The accepted Protocol V5 candidate additionally reuses a WAL-owned V2 frame buffer, sequentially initializes the envelope without unsafe code or a zero-fill pass, and defers payload-only CRC work to the legacy format that consumes it. V1/V2 continue to calculate their authoritative full-envelope CRC.
+
+Protocol V5 is the final SC-005 evidence. All six median ratios exceed `0.90`, all 66 pair ratios exceed `0.85`, the minimum pair ratio is `0.896`, and every affinity/runner validation passes. The raw capture, source and binary identities, failed predecessors, and decision are preserved under `benchmarks/`.
+
+## Project Structure
+
+### Documentation (this feature)
+
+```text
+specs/006-v2-wal-segments/
+├── spec.md
+├── plan.md
+├── research.md
+├── data-model.md
+├── quickstart.md
+├── contracts/
+│   ├── migration-cli.md
+│   ├── public-api.md
+│   └── wal-v2.md
+├── checklists/requirements.md
+└── tasks.md
+```
+
+### Source Code (repository root)
+
+```text
+src/
+├── config.rs
+├── key_value_store.rs
+├── key_set_store.rs
+├── key_map_store.rs
+├── migration.rs
+├── migration_cli.rs
+└── wal/
+    ├── format.rs
+    ├── mod.rs
+    ├── recovery.rs
+    └── replay.rs
+
+tests/
+├── v2_wal_segments.rs
+├── truncated_wal/
+├── migration_cli/
+├── recovery/
+└── compute_persistence/
+```
+
+**Structure Decision**: Extend the existing single-crate WAL, recovery, store, and migration modules. Keep persisted grammar in `wal/format.rs`, chain validation in `wal/replay.rs`, namespace authority in `wal/recovery.rs`, and runtime rotation in `wal/mod.rs`.
+
+## Complexity Tracking
+
+No constitution exception is permitted. The new segment state is the minimum structure needed to meet the approved bounded-history and crash-recovery requirements; a global lock or online snapshot coordinator is explicitly rejected. Protocol V5 supplies the fresh passing capture required by Principle IV without weakening the original thresholds.

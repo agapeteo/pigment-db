@@ -13,7 +13,7 @@ use std::fs;
 use std::time::Duration;
 
 #[test]
-fn fresh_store_uses_v1_header() {
+fn fresh_store_uses_v2_header() {
     let directory = tempfile::tempdir().unwrap();
 
     let outcome = DurableKeyValueStore::try_init_new(directory.path()).unwrap();
@@ -23,10 +23,10 @@ fn fresh_store_uses_v1_header() {
     let active = directory.path().join("kv.wal.dat");
     let staging = directory.path().join(".kv.wal.dat.next");
     let bytes = fs::read(active).unwrap();
-    assert_eq!(bytes.len(), 40);
+    assert_eq!(bytes.len(), 64);
     assert_eq!(&bytes[..8], b"PIGWAL\r\n");
-    assert_eq!(u16::from_le_bytes(bytes[8..10].try_into().unwrap()), 1);
-    assert_eq!(u16::from_le_bytes(bytes[10..12].try_into().unwrap()), 40);
+    assert_eq!(u16::from_le_bytes(bytes[8..10].try_into().unwrap()), 2);
+    assert_eq!(u16::from_le_bytes(bytes[10..12].try_into().unwrap()), 64);
     assert_eq!(bytes[12], 1);
     assert_eq!(bytes[13], 1);
     assert_eq!(u16::from_le_bytes(bytes[14..16].try_into().unwrap()), 0);
@@ -35,10 +35,12 @@ fn fresh_store_uses_v1_header() {
         60_000_000_000
     );
     assert_eq!(u64::from_le_bytes(bytes[24..32].try_into().unwrap()), 0);
-    assert_eq!(&bytes[32..36], &[0; 4]);
+    assert_eq!(u64::from_le_bytes(bytes[32..40].try_into().unwrap()), 0);
+    assert_eq!(u64::from_le_bytes(bytes[40..48].try_into().unwrap()), 0);
+    assert_eq!(&bytes[48..60], &[0; 12]);
     assert_eq!(
-        u32::from_le_bytes(bytes[36..40].try_into().unwrap()),
-        crc32fast::hash(&bytes[..36])
+        u32::from_le_bytes(bytes[60..64].try_into().unwrap()),
+        crc32fast::hash(&bytes[..60])
     );
     assert!(!staging.exists());
 }
@@ -81,8 +83,11 @@ fn public_timestamp_options_validate_and_adapt_all_store_families() {
     let changed =
         DurableKeyValueStore::try_init_new_with_options(value_directory.path(), changed_options)
             .unwrap();
-    assert_eq!(changed.status(), RecoveryStatus::Recovered);
+    assert_eq!(changed.status(), RecoveryStatus::Normal);
     assert_eq!(changed.store().get(b"key"), Some(b"value".to_vec()));
+    changed
+        .store()
+        .put(b"after-granularity-change".to_vec(), b"accepted".to_vec());
     drop(changed);
     assert_eq!(
         u64::from_le_bytes(
@@ -92,6 +97,10 @@ fn public_timestamp_options_validate_and_adapt_all_store_families() {
         ),
         500
     );
+    assert!(value_directory
+        .path()
+        .join("kv.wal.dat.segment-00000000000000000000")
+        .is_file());
 
     let set_directory = tempfile::tempdir().unwrap();
     let set = DurableKeySetStore::try_init_new_with_options(set_directory.path(), options)
@@ -253,8 +262,9 @@ fn earlier_complete_corruption_wins_over_later_terminal_fragment() {
     drop(store);
     let active = directory.path().join("kv.wal.dat");
     let mut bytes = fs::read(&active).unwrap();
-    let first_payload_len = u32::from_le_bytes(bytes[46..50].try_into().unwrap()) as usize;
-    let first_crc = 40 + 42 + first_payload_len;
+    let first_payload_len =
+        usize::try_from(u64::from_le_bytes(bytes[70..78].try_into().unwrap())).unwrap();
+    let first_crc = 64 + 62 + first_payload_len;
     bytes[first_crc] ^= 0xff;
     bytes.pop();
     fs::write(&active, &bytes).unwrap();
@@ -300,25 +310,26 @@ fn protected_field_manifest_preserves_every_corrupt_input() {
         drop(store);
         let active = directory.path().join("kv.wal.dat");
         let mut bytes = fs::read(&active).unwrap();
-        let frame_start = 40;
-        let payload_len =
-            u32::from_le_bytes(bytes[frame_start + 6..frame_start + 10].try_into().unwrap())
-                as usize;
+        let frame_start = 64;
+        let payload_len = usize::try_from(u64::from_le_bytes(
+            bytes[frame_start + 6..frame_start + 14].try_into().unwrap(),
+        ))
+        .unwrap();
         let relative = match field {
             "marker" => 0,
             "version" => 2,
             "action" => 3,
             "header-length" => 4,
             "payload-length" => 6,
-            "length-complement" => 10,
-            "physical-start" => 14,
-            "mutation-start" => 18,
-            "index" => 22,
-            "count" => 26,
-            "timestamp" => 30,
-            "payload" => 38,
-            "footer" => 38 + payload_len,
-            "crc" => 42 + payload_len,
+            "length-complement" => 14,
+            "physical-start" => 22,
+            "mutation-start" => 30,
+            "index" => 38,
+            "count" => 42,
+            "timestamp" => 46,
+            "payload" => 54,
+            "footer" => 54 + payload_len,
+            "crc" => 62 + payload_len,
             _ => unreachable!(),
         };
         bytes[frame_start + relative] ^= 0xff;
@@ -348,17 +359,18 @@ fn exact_record_boundary_and_zero_length_delete_are_complete() {
     drop(store);
 
     let bytes = fs::read(&active).unwrap();
-    let first_payload_len = u32::from_le_bytes(bytes[46..50].try_into().unwrap()) as usize;
-    let delete_start = 40 + 46 + first_payload_len;
+    let first_payload_len =
+        usize::try_from(u64::from_le_bytes(bytes[70..78].try_into().unwrap())).unwrap();
+    let delete_start = 64 + 66 + first_payload_len;
     assert_eq!(
-        u32::from_le_bytes(
-            bytes[delete_start + 6..delete_start + 10]
+        u64::from_le_bytes(
+            bytes[delete_start + 6..delete_start + 14]
                 .try_into()
                 .unwrap()
         ),
         0
     );
-    assert_eq!(bytes.len(), delete_start + 46);
+    assert_eq!(bytes.len(), delete_start + 66);
 
     let outcome = DurableKeyValueStore::try_init_new(directory.path()).unwrap();
     assert_eq!(outcome.status(), RecoveryStatus::Normal);

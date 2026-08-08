@@ -15,6 +15,7 @@ mod config;
 mod durability;
 pub use config::{
     DurabilityPolicy, DurableStoreOptions, TimestampGranularity, TimestampGranularityError,
+    WalSegmentSize, WalSegmentSizeError,
 };
 pub use durability::{DurabilityCapability, DurabilitySupportError};
 mod wal;

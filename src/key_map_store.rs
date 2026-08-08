@@ -51,9 +51,10 @@ impl DurableKeyMapStore<File> {
 
     /// Opens a file-backed key/sorted-map store with explicit timestamp and durability options.
     ///
-    /// A missing store is published as a complete V1 header. An existing V1
-    /// store changes configuration only through validated staged compaction;
-    /// complete legacy input remains an explicit CLI-only migration boundary.
+    /// A missing store is published as a complete V2 active segment. An
+    /// explicit granularity change rotates before the next accepted mutation;
+    /// unrelated options preserve the active segment's persisted granularity.
+    /// Complete legacy and V1 input require the standalone migration command.
     /// Physical mode preflights and durably publishes filesystem authority.
     pub fn try_init_new_with_options(
         store_dir: impl AsRef<Path>,
@@ -70,6 +71,7 @@ impl DurableKeyMapStore<File> {
         let durability_policy = options
             .map(DurableStoreOptions::durability_policy)
             .unwrap_or_default();
+        let wal_segment_size = options.unwrap_or_default().wal_segment_size().as_bytes();
         let initialized = initialize_snapshot_with_policy(
             &paths,
             replay_key_map,
@@ -79,9 +81,21 @@ impl DurableKeyMapStore<File> {
             encode_key_map_repair_snapshot,
             key_map_is_proper_snapshot_prefix,
             Some(V1CodecProbe::encode_header_with_kind(3)),
-            options.map(DurableStoreOptions::granularity_nanos),
+            options.and_then(DurableStoreOptions::requested_granularity_nanos),
             durability_policy,
         )?;
+        initialized
+            .wal
+            .enable_file_rotation(
+                paths.active.clone(),
+                wal_segment_size,
+                options.and_then(DurableStoreOptions::requested_granularity_nanos),
+            )
+            .map_err(|source| RecoveryError::Io {
+                operation: crate::RecoveryOperation::Open,
+                path: paths.active.clone(),
+                source,
+            })?;
         let store = DashMap::new();
         for (key, values) in initialized.snapshot {
             store.insert(key, values);

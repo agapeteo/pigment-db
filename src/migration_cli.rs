@@ -88,7 +88,7 @@ impl MigrationCliProbe {
             return MigrationCliRunResult {
                 exit_code: 0,
                 stdout: concat!(
-                    "Usage: pigment-db-migrate --source <LEGACY_DIR> --destination <V1_DIR>\n",
+                    "Usage: pigment-db-migrate --source <SOURCE_DIR> --destination <V2_DIR>\n",
                     "                           [--timestamp-granularity-nanos <NONZERO_U64>]\n",
                     "       pigment-db-migrate --help\n",
                     "       pigment-db-migrate --version\n",
@@ -112,7 +112,7 @@ impl MigrationCliProbe {
                     stdout: String::new(),
                     stderr: concat!(
                         "error: invalid arguments\n",
-                        "Usage: pigment-db-migrate --source <LEGACY_DIR> --destination <V1_DIR>\n",
+                        "Usage: pigment-db-migrate --source <SOURCE_DIR> --destination <V2_DIR>\n",
                     )
                     .to_owned(),
                 };
@@ -398,7 +398,7 @@ mod tests {
         assert_eq!(
             result.stdout,
             format!(
-                "migrated 1 family(s), 0 entries, 40 bytes to {}\n",
+                "migrated 1 family(s), 0 entries, 64 bytes to {}\n",
                 destination.display()
             )
         );
