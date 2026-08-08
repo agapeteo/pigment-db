@@ -1607,7 +1607,7 @@ fn initialize_snapshot_impl<S: Clone + Eq + Default>(
                     tail_offset,
                     accepted_header: Some(header),
                     ..
-                } = replay_tail(active_segment)
+                } = replay_tail(&chain)
                 else {
                     return Err(RecoveryError::InvalidArtifact {
                         path: paths.active.clone(),
@@ -1618,8 +1618,13 @@ fn initialize_snapshot_impl<S: Clone + Eq + Default>(
                         path: paths.active.clone(),
                     });
                 }
+                let active_tail_offset = tail_offset.checked_sub(sealed_len).ok_or_else(|| {
+                    RecoveryError::InvalidArtifact {
+                        path: paths.active.clone(),
+                    }
+                })?;
                 let replacement = active_segment
-                    .get(..tail_offset)
+                    .get(..active_tail_offset)
                     .ok_or_else(|| RecoveryError::InvalidArtifact {
                         path: paths.active.clone(),
                     })?

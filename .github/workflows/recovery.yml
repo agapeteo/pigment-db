@@ -15,6 +15,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Complete regression suite
+        if: runner.os == 'Linux'
+        run: cargo test --all-targets --all-features -- --test-threads=1
       - name: V1 codec, fresh publication, repair, and options
         run: cargo test wal::truncation_tests -- --test-threads=1
       - name: Public truncation and timestamp matrices
@@ -31,6 +34,15 @@ jobs:
         run: cargo test --test mutation_ordering -- --test-threads=1
       - name: Mutation WAL rejection checkpoints
         run: cargo test wal::ordering_tests -- --test-threads=1
+      - name: Dedicated issue regression targets
+        run: |
+          cargo test --test async_compute_conflicts -- --test-threads=1
+          cargo test --test ci_workflow -- --test-threads=1
+          cargo test --test i128_key -- --test-threads=1
+          cargo test --test map_pop_return_values -- --test-threads=1
+          cargo test --test numeric_increment_overflow -- --test-threads=1
+          cargo test --test ordered_map_append -- --test-threads=1
+          cargo test --test v2_wal_segments -- --test-threads=1
       - name: Physical durability capability and publication matrix
         if: runner.os != 'Windows'
         run: cargo test --test durable_write_policy public_ -- --test-threads=1

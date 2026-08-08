@@ -278,15 +278,23 @@ fn checked_replay_frames(
     }
 
     let mut group_start = 0;
+    let mut previous_timestamp_bucket =
+        V1CodecProbe::base_bucket(bytes).expect("validated V1 header has a base bucket");
     while group_start < frames.len() {
         let first = &bytes[frames[group_start].start_offset..frames[group_start].end_offset];
         let mutation_start = u32::from_le_bytes(first[18..22].try_into().unwrap());
         let count = u32::from_le_bytes(first[26..30].try_into().unwrap()) as usize;
+        let timestamp_bucket = frames[group_start].timestamp_bucket;
         if mutation_start as usize != frames[group_start].start_offset
             || u32::from_le_bytes(first[22..26].try_into().unwrap()) != 0
             || group_start + count > frames.len()
         {
             return Err(ValidationError::Truncated {
+                offset: frames[group_start].start_offset,
+            });
+        }
+        if timestamp_bucket < previous_timestamp_bucket {
+            return Err(ValidationError::InvalidPayload {
                 offset: frames[group_start].start_offset,
             });
         }
@@ -296,12 +304,14 @@ fn checked_replay_frames(
             if u32::from_le_bytes(frame_meta[18..22].try_into().unwrap()) != mutation_start
                 || u32::from_le_bytes(frame_meta[22..26].try_into().unwrap()) != group_index as u32
                 || u32::from_le_bytes(frame_meta[26..30].try_into().unwrap()) != count as u32
+                || frames[group_start + group_index].timestamp_bucket != timestamp_bucket
             {
                 return Err(ValidationError::InvalidPayload {
                     offset: frames[group_start + group_index].start_offset,
                 });
             }
         }
+        previous_timestamp_bucket = timestamp_bucket;
         group_start += count;
     }
 
@@ -314,6 +324,7 @@ fn checked_v2_replay_frames(
 ) -> Result<Vec<ReplayFrame<'_>>, ValidationError> {
     let mut frames = Vec::new();
     let mut v2_offsets = Vec::new();
+    let mut timestamp_segments = Vec::new();
     let mut cursor = 0_usize;
     let mut previous_segment = None::<(u64, u64, usize)>;
     while cursor < bytes.len() {
@@ -334,6 +345,12 @@ fn checked_v2_replay_frames(
         }
         let segment_id = V2CodecProbe::header_segment_id(header).unwrap();
         let segment_base = V2CodecProbe::header_segment_base(header).unwrap();
+        let base_bucket = V2CodecProbe::header_base_bucket(header).unwrap();
+        if previous_segment.is_none() && (segment_id != 0 || segment_base != 0) {
+            return Err(ValidationError::InvalidPayload {
+                offset: segment_start,
+            });
+        }
         if let Some((previous_id, previous_base, previous_start)) = previous_segment {
             let expected_id =
                 previous_id
@@ -358,6 +375,7 @@ fn checked_v2_replay_frames(
                 });
             }
         }
+        timestamp_segments.push((frames.len(), base_bucket, segment_start));
         previous_segment = Some((segment_id, segment_base, segment_start));
         cursor = header_end;
 
@@ -423,9 +441,24 @@ fn checked_v2_replay_frames(
     }
 
     let mut group_start = 0;
+    let mut previous_timestamp_bucket = timestamp_segments[0].1;
+    let mut timestamp_segment_index = 1;
     while group_start < frames.len() {
+        while timestamp_segments
+            .get(timestamp_segment_index)
+            .is_some_and(|(frame_index, _, _)| *frame_index == group_start)
+        {
+            let (_, base_bucket, segment_start) = timestamp_segments[timestamp_segment_index];
+            if base_bucket != previous_timestamp_bucket {
+                return Err(ValidationError::InvalidPayload {
+                    offset: segment_start,
+                });
+            }
+            timestamp_segment_index += 1;
+        }
         let mutation_start = v2_offsets[group_start].1;
         let count = frames[group_start].group_count as usize;
+        let timestamp_bucket = frames[group_start].timestamp_bucket;
         if mutation_start != v2_offsets[group_start].0
             || frames[group_start].group_index != 0
             || group_start + count > frames.len()
@@ -434,17 +467,41 @@ fn checked_v2_replay_frames(
                 offset: frames[group_start].start_offset,
             });
         }
+        if let Some((frame_index, _, segment_start)) =
+            timestamp_segments.get(timestamp_segment_index)
+        {
+            if *frame_index < group_start + count {
+                return Err(ValidationError::InvalidPayload {
+                    offset: *segment_start,
+                });
+            }
+        }
+        if timestamp_bucket < previous_timestamp_bucket {
+            return Err(ValidationError::InvalidPayload {
+                offset: frames[group_start].start_offset,
+            });
+        }
         for group_index in 0..count {
             if v2_offsets[group_start + group_index].1 != mutation_start
                 || frames[group_start + group_index].group_index != group_index as u32
                 || frames[group_start + group_index].group_count != count as u32
+                || frames[group_start + group_index].timestamp_bucket != timestamp_bucket
             {
                 return Err(ValidationError::InvalidPayload {
                     offset: frames[group_start + group_index].start_offset,
                 });
             }
         }
+        previous_timestamp_bucket = timestamp_bucket;
         group_start += count;
+    }
+    for (frame_index, base_bucket, segment_start) in &timestamp_segments[timestamp_segment_index..]
+    {
+        if *frame_index != frames.len() || *base_bucket != previous_timestamp_bucket {
+            return Err(ValidationError::InvalidPayload {
+                offset: *segment_start,
+            });
+        }
     }
 
     Ok(frames)

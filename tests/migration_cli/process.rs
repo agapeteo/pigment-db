@@ -1,5 +1,6 @@
 //! Child-process interruption regressions for migration publication.
 
+#[cfg(debug_assertions)]
 #[test]
 fn child_termination_leaves_only_diagnostic_destination_artifacts() {
     let fixture =

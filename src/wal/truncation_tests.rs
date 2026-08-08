@@ -18,8 +18,8 @@ use super::recovery::{
     FreshCleanupRegistry, FreshInspection, FreshOptionsProbe, RepairAuthority, StoreKind,
 };
 use super::replay::{
-    encode_key_value_snapshot, key_value_is_proper_snapshot_prefix, replay_key_value,
-    replay_key_value_against, replay_key_value_tail,
+    encode_key_value_snapshot, key_value_is_proper_snapshot_prefix, replay_key_set,
+    replay_key_value, replay_key_value_against, replay_key_value_tail,
 };
 use super::{ComputeAction, WalStorage};
 use crate::model::{SearchKey, SortedMapEntry, SortedMapKey};
@@ -1691,6 +1691,73 @@ fn record_timestamp_and_payload_reject_corruption_at_every_position() {
         rewrite_test_record_crc(frame);
         assert!(replay_key_value(&payload_bytes).is_err());
     }
+}
+
+#[test]
+fn v1_replay_rejects_mismatched_timestamps_inside_an_atomic_group() {
+    let header = V1CodecProbe::encode_header_with_kind(2);
+    let first_payload =
+        bincode::serialize(&KeyValueData::new(b"set".to_vec(), b"one".to_vec())).unwrap();
+    let second_payload =
+        bincode::serialize(&KeyValueData::new(b"set".to_vec(), b"two".to_vec())).unwrap();
+    let mutation_start = V1CodecProbe::HEADER_LEN as u32;
+    let first = V1CodecProbe::encode_complete_record(RecordProbeFields {
+        action: SET_APPEND_ACT,
+        payload: &first_payload,
+        physical_start: mutation_start,
+        mutation_start,
+        index: 0,
+        count: 2,
+        timestamp_bucket: 10,
+    });
+    let second = V1CodecProbe::encode_complete_record(RecordProbeFields {
+        action: SET_APPEND_ACT,
+        payload: &second_payload,
+        physical_start: mutation_start + first.len() as u32,
+        mutation_start,
+        index: 1,
+        count: 2,
+        timestamp_bucket: 11,
+    });
+    let mut bytes = header.to_vec();
+    bytes.extend_from_slice(&first);
+    bytes.extend_from_slice(&second);
+
+    assert!(replay_key_set(&bytes).is_err());
+}
+
+#[test]
+fn v1_replay_rejects_a_group_whose_timestamp_moves_backward() {
+    let header = V1CodecProbe::encode_header_with_base_bucket(10);
+    let first_payload =
+        bincode::serialize(&KeyValueData::new(b"first".to_vec(), b"value".to_vec())).unwrap();
+    let second_payload =
+        bincode::serialize(&KeyValueData::new(b"second".to_vec(), b"value".to_vec())).unwrap();
+    let first_offset = V1CodecProbe::HEADER_LEN as u32;
+    let first = V1CodecProbe::encode_complete_record(RecordProbeFields {
+        action: PUT_ACT,
+        payload: &first_payload,
+        physical_start: first_offset,
+        mutation_start: first_offset,
+        index: 0,
+        count: 1,
+        timestamp_bucket: 12,
+    });
+    let second_offset = first_offset + first.len() as u32;
+    let second = V1CodecProbe::encode_complete_record(RecordProbeFields {
+        action: PUT_ACT,
+        payload: &second_payload,
+        physical_start: second_offset,
+        mutation_start: second_offset,
+        index: 0,
+        count: 1,
+        timestamp_bucket: 11,
+    });
+    let mut bytes = header.to_vec();
+    bytes.extend_from_slice(&first);
+    bytes.extend_from_slice(&second);
+
+    assert!(replay_key_value(&bytes).is_err());
 }
 
 #[test]

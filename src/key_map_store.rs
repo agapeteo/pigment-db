@@ -748,6 +748,11 @@ impl<W: Write> DurableKeyMapStore<W> {
     }
 
     /// Persists and publishes an entry under the next numeric search key.
+    ///
+    /// Keys whose first component is [`Key::USIZE`] participate in the numeric
+    /// sequence, including composite keys. Empty and nonnumeric keys are
+    /// ignored. Exhausting the `usize` keyspace returns
+    /// [`std::io::ErrorKind::InvalidInput`] without writing or publishing.
     pub fn try_append_ordered_element(
         &self,
         key: Vec<u8>,
@@ -764,12 +769,19 @@ impl<W: Write> DurableKeyMapStore<W> {
         match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
                 let cur_num = {
-                    if let Some((last_search_key, _)) = entry.get().last_key_value() {
-                        let last_search_key = last_search_key.first().unwrap();
-                        if let Key::USIZE(count) = last_search_key {
-                            count + 1
-                        } else {
-                            0
+                    let numeric_start = SearchKey::from(vec![Key::USIZE(0)]);
+                    let numeric_end = SearchKey::from(vec![Key::I128(i128::MIN)]);
+                    if let Some((last_numeric_key, _)) =
+                        entry.get().range(numeric_start..numeric_end).next_back()
+                    {
+                        match last_numeric_key.first() {
+                            Some(Key::USIZE(count)) => count.checked_add(1).ok_or_else(|| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::InvalidInput,
+                                    "ordered map numeric search-key space is exhausted",
+                                )
+                            })?,
+                            _ => unreachable!("numeric search-key range must start with USIZE"),
                         }
                     } else {
                         0

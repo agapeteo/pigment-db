@@ -1,7 +1,22 @@
+use pigment_db::key_map_store::DurableKeyMapStore;
 use pigment_db::key_set_store::DurableKeySetStore;
 use pigment_db::key_value_store::DurableKeyValueStore;
+use pigment_db::model::SearchKey;
 use pigment_db::{DurableStoreOptions, TimestampGranularity, WalSegmentSize};
 use std::time::Duration;
+
+fn v2_record_len(bytes: &[u8], start: usize) -> usize {
+    let payload_len = u64::from_le_bytes(bytes[start + 6..start + 14].try_into().unwrap()) as usize;
+    66 + payload_len
+}
+
+fn rewrite_v2_record_timestamp(bytes: &mut [u8], start: usize, timestamp_bucket: u64) {
+    let record_len = v2_record_len(bytes, start);
+    bytes[start + 46..start + 54].copy_from_slice(&timestamp_bucket.to_le_bytes());
+    let crc_start = start + record_len - 4;
+    let crc = crc32fast::hash(&bytes[start..crc_start]);
+    bytes[crc_start..start + record_len].copy_from_slice(&crc.to_le_bytes());
+}
 
 #[test]
 fn wal_segment_size_is_validated_and_defaults_to_one_gibibyte() {
@@ -62,6 +77,109 @@ fn rotation_seals_a_numbered_segment_and_reopens_the_complete_chain() {
         .into_store();
     assert_eq!(reopened.get(b"first"), Some(b"one".to_vec()));
     assert_eq!(reopened.get(b"second"), Some(b"two".to_vec()));
+}
+
+#[test]
+fn startup_rejects_a_v2_history_missing_its_leading_segment() {
+    let directory = tempfile::tempdir().expect("create incomplete V2 directory");
+    let options = DurableStoreOptions::default().with_wal_segment_size(
+        WalSegmentSize::try_from(170_u64).expect("small nonzero segment target"),
+    );
+
+    let store = DurableKeyValueStore::try_init_new_with_options(directory.path(), options)
+        .expect("initialize segmented V2 store")
+        .into_store();
+    store.put(b"first".to_vec(), b"one".to_vec());
+    store.put(b"second".to_vec(), b"two".to_vec());
+    drop(store);
+
+    let missing = directory
+        .path()
+        .join("kv.wal.dat.segment-00000000000000000000");
+    std::fs::remove_file(&missing).expect("remove leading segment");
+    let active_path = directory.path().join("kv.wal.dat");
+    let active_before = std::fs::read(&active_path).expect("capture surviving active segment");
+
+    let result = DurableKeyValueStore::try_init_new_with_options(directory.path(), options);
+    assert!(result.is_err(), "an incomplete V2 history must not open");
+    assert_eq!(
+        std::fs::read(active_path).expect("read preserved active segment"),
+        active_before,
+        "rejection must preserve the surviving evidence"
+    );
+}
+
+#[test]
+fn set_and_map_startup_reject_v2_histories_missing_their_leading_segment() {
+    let options = DurableStoreOptions::default().with_wal_segment_size(
+        WalSegmentSize::try_from(170_u64).expect("small nonzero segment target"),
+    );
+
+    let set_directory = tempfile::tempdir().expect("create incomplete V2 set directory");
+    let set = DurableKeySetStore::try_init_new_with_options(set_directory.path(), options)
+        .expect("initialize segmented V2 set")
+        .into_store();
+    set.append(b"set".to_vec(), b"first".to_vec());
+    set.append(b"set".to_vec(), b"second".to_vec());
+    drop(set);
+    std::fs::remove_file(
+        set_directory
+            .path()
+            .join("set.wal.dat.segment-00000000000000000000"),
+    )
+    .expect("remove leading set segment");
+    assert!(
+        DurableKeySetStore::try_init_new_with_options(set_directory.path(), options).is_err(),
+        "an incomplete set history must not open"
+    );
+
+    let map_directory = tempfile::tempdir().expect("create incomplete V2 map directory");
+    let map = DurableKeyMapStore::try_init_new_with_options(map_directory.path(), options)
+        .expect("initialize segmented V2 map")
+        .into_store();
+    map.put(b"map".to_vec(), SearchKey::from(0_usize), b"first".to_vec());
+    map.put(
+        b"map".to_vec(),
+        SearchKey::from(1_usize),
+        b"second".to_vec(),
+    );
+    drop(map);
+    std::fs::remove_file(
+        map_directory
+            .path()
+            .join("map.wal.dat.segment-00000000000000000000"),
+    )
+    .expect("remove leading map segment");
+    assert!(
+        DurableKeyMapStore::try_init_new_with_options(map_directory.path(), options).is_err(),
+        "an incomplete map history must not open"
+    );
+}
+
+#[test]
+fn startup_rejects_a_gap_in_a_v2_segment_chain() {
+    let directory = tempfile::tempdir().expect("create gapped V2 directory");
+    let options = DurableStoreOptions::default().with_wal_segment_size(
+        WalSegmentSize::try_from(170_u64).expect("small nonzero segment target"),
+    );
+    let store = DurableKeyValueStore::try_init_new_with_options(directory.path(), options)
+        .expect("initialize segmented V2 store")
+        .into_store();
+    for index in 0..3 {
+        store.put(format!("key-{index}").into_bytes(), vec![index; 8]);
+    }
+    drop(store);
+
+    let missing = directory
+        .path()
+        .join("kv.wal.dat.segment-00000000000000000001");
+    assert!(missing.is_file(), "three writes must create segment one");
+    std::fs::remove_file(missing).expect("remove middle segment");
+
+    assert!(
+        DurableKeyValueStore::try_init_new_with_options(directory.path(), options).is_err(),
+        "a gapped V2 history must not open"
+    );
 }
 
 #[test]
@@ -134,6 +252,107 @@ fn rotation_never_splits_an_atomic_compute_group() {
     assert!(values.contains(b"existing".as_slice()));
     assert!(values.contains(b"first".as_slice()));
     assert!(values.contains(b"second".as_slice()));
+}
+
+#[test]
+fn startup_rejects_mismatched_timestamps_inside_an_atomic_v2_group() {
+    let directory = tempfile::tempdir().expect("create timestamp-corruption directory");
+    let store = DurableKeySetStore::try_init_new(directory.path())
+        .expect("initialize V2 set store")
+        .into_store();
+    store.compute(b"set".to_vec(), |values| {
+        values.insert(b"one".to_vec());
+        values.insert(b"two".to_vec());
+    });
+    drop(store);
+
+    let path = directory.path().join("set.wal.dat");
+    let mut bytes = std::fs::read(&path).expect("read V2 group");
+    let first_start = 64_usize;
+    let second_start = first_start + v2_record_len(&bytes, first_start);
+    rewrite_v2_record_timestamp(&mut bytes, second_start, 1);
+    std::fs::write(&path, &bytes).expect("write CRC-valid timestamp corruption");
+
+    assert!(
+        DurableKeySetStore::try_init_new(directory.path()).is_err(),
+        "one atomic group must carry one timestamp"
+    );
+    assert_eq!(
+        std::fs::read(path).expect("read preserved corrupt artifact"),
+        bytes,
+        "invalid timestamp evidence must remain byte-identical"
+    );
+}
+
+#[test]
+fn startup_rejects_a_v2_group_whose_timestamp_moves_backward() {
+    let directory = tempfile::tempdir().expect("create timestamp-regression directory");
+    let store = DurableKeyValueStore::try_init_new(directory.path())
+        .expect("initialize V2 key/value store")
+        .into_store();
+    store.put(b"first".to_vec(), b"one".to_vec());
+    store.put(b"second".to_vec(), b"two".to_vec());
+    drop(store);
+
+    let path = directory.path().join("kv.wal.dat");
+    let mut bytes = std::fs::read(&path).expect("read V2 groups");
+    let first_start = 64_usize;
+    let second_start = first_start + v2_record_len(&bytes, first_start);
+    let first_timestamp = u64::from_le_bytes(
+        bytes[first_start + 46..first_start + 54]
+            .try_into()
+            .unwrap(),
+    );
+    rewrite_v2_record_timestamp(
+        &mut bytes,
+        second_start,
+        first_timestamp
+            .checked_sub(1)
+            .expect("system timestamp bucket must be positive"),
+    );
+    std::fs::write(&path, &bytes).expect("write CRC-valid timestamp regression");
+
+    assert!(
+        DurableKeyValueStore::try_init_new(directory.path()).is_err(),
+        "accepted timestamp buckets must not move backward"
+    );
+    assert_eq!(
+        std::fs::read(path).expect("read preserved corrupt artifact"),
+        bytes,
+        "invalid timestamp evidence must remain byte-identical"
+    );
+}
+
+#[test]
+fn startup_rejects_a_segment_base_bucket_that_breaks_timestamp_continuity() {
+    let directory = tempfile::tempdir().expect("create base-bucket-corruption directory");
+    let options = DurableStoreOptions::default().with_wal_segment_size(
+        WalSegmentSize::try_from(170_u64).expect("small nonzero segment target"),
+    );
+    let store = DurableKeyValueStore::try_init_new_with_options(directory.path(), options)
+        .expect("initialize segmented V2 store")
+        .into_store();
+    store.put(b"first".to_vec(), b"one".to_vec());
+    store.put(b"second".to_vec(), b"two".to_vec());
+    drop(store);
+
+    let active_path = directory.path().join("kv.wal.dat");
+    let mut active = std::fs::read(&active_path).expect("read active V2 segment");
+    let base_bucket = u64::from_le_bytes(active[24..32].try_into().unwrap());
+    active[24..32].copy_from_slice(&(base_bucket ^ 1).to_le_bytes());
+    let header_crc = crc32fast::hash(&active[..60]);
+    active[60..64].copy_from_slice(&header_crc.to_le_bytes());
+    std::fs::write(&active_path, &active).expect("write CRC-valid base-bucket corruption");
+
+    assert!(
+        DurableKeyValueStore::try_init_new_with_options(directory.path(), options).is_err(),
+        "each segment base bucket must equal the preceding accepted bucket"
+    );
+    assert_eq!(
+        std::fs::read(active_path).expect("read preserved corrupt segment"),
+        active,
+        "invalid timestamp evidence must remain byte-identical"
+    );
 }
 
 #[test]
