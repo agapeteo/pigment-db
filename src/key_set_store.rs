@@ -24,13 +24,14 @@ use crate::test_support::mutation_schedule::{MutationObserver, MutationPhase};
 
 /// Mutations are ordered per logical outer key, while mutations of keys in different data-map shards remain concurrent except during shared WAL acceptance.
 ///
-/// Different keys in the same DashMap shard may wait for one another. Compute
-/// callbacks run while that shard is guarded; asynchronous callbacks keep the
-/// guard across `.await`, and recursive access to the same map or shard is
-/// unsupported and may deadlock. A callback panic or cancellation before
-/// acceptance discards its private candidate and releases the guard. These
-/// guarantees do not change any public method signature, callback shape, or
-/// compatibility panic behavior.
+/// Different keys in the same DashMap shard may wait for one another during
+/// synchronous mutations. Synchronous compute callbacks run while that shard
+/// is guarded, so recursive access to the same map or shard is unsupported and
+/// may deadlock. Asynchronous callbacks instead receive a private snapshot with
+/// no DashMap guard held across `.await`; a changed same-key snapshot rejects
+/// publication with [`std::io::ErrorKind::WouldBlock`]. A callback panic or
+/// cancellation before acceptance discards its private candidate. These
+/// guarantees do not change any public method signature or callback shape.
 pub struct DurableKeySetStore<W: Write> {
     store: DashMap<Vec<u8>, HashSet<Vec<u8>>>,
     wal: WalStorage<W>,
@@ -437,19 +438,32 @@ impl<W: Write> DurableKeySetStore<W> {
 
     /// Asynchronous counterpart to [`Self::try_compute`].
     ///
-    /// The callback runs exactly once and the per-key entry guard is intentionally held across
-    /// `.await`, matching the historical API boundary. Persistence occurs after the callback;
-    /// empty and no-op results follow the synchronous semantics and errors publish no live state.
+    /// The callback runs exactly once against a private snapshot, without a
+    /// DashMap guard held across `.await`. Persistence occurs after the callback
+    /// only when the same-key value still matches that snapshot. An intervening
+    /// same-key change returns [`std::io::ErrorKind::WouldBlock`] without WAL or
+    /// live publication. Empty and no-op results otherwise follow synchronous
+    /// semantics, and cancellation discards the private candidate.
     pub async fn try_compute_async(
         &self,
         key: Vec<u8>,
         func: impl AsyncFnOnce(&mut HashSet<Vec<u8>>),
     ) -> std::io::Result<()> {
-        match self.store.entry(key.clone()) {
-            Entry::Occupied(mut occupied_entry) => {
-                let original = occupied_entry.get().clone();
-                let mut working = original.clone();
-                func(&mut working).await;
+        let original = self.store.get(&key).map(|entry| entry.clone());
+        let mut working = original.clone().unwrap_or_default();
+        func(&mut working).await;
+
+        let conflict = || {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "key/set changed while async compute callback was pending",
+            )
+        };
+        match (self.store.entry(key.clone()), original) {
+            (Entry::Occupied(mut occupied_entry), Some(original)) => {
+                if occupied_entry.get() != &original {
+                    return Err(conflict());
+                }
                 if working.is_empty() {
                     self.wal
                         .commit_set_compute_batch(vec![ComputeAction::Delete {
@@ -478,9 +492,7 @@ impl<W: Write> DurableKeySetStore<W> {
                 *occupied_entry.get_mut() = working;
                 Ok(())
             }
-            Entry::Vacant(vacant_entry) => {
-                let mut working = HashSet::new();
-                func(&mut working).await;
+            (Entry::Vacant(vacant_entry), None) => {
                 if working.is_empty() {
                     return Ok(());
                 }
@@ -498,14 +510,16 @@ impl<W: Write> DurableKeySetStore<W> {
                 vacant_entry.insert(working);
                 Ok(())
             }
+            (Entry::Occupied(_), None) | (Entry::Vacant(_), Some(_)) => Err(conflict()),
         }
     }
 
-    /// Compatibility wrapper for [`Self::try_compute_async`] that panics when awaited on error.
+    /// Compatibility wrapper for [`Self::try_compute_async`] that panics on
+    /// persistence failure or optimistic conflict.
     pub async fn compute_async(&self, key: Vec<u8>, func: impl AsyncFnOnce(&mut HashSet<Vec<u8>>)) {
         self.try_compute_async(key, func)
             .await
-            .unwrap_or_else(|error| panic!("async set compute persistence failed: {error}"));
+            .unwrap_or_else(|error| panic!("async set compute failed: {error}"));
     }
     /// Computes only when `key` is present, otherwise returns `Ok(())` without invoking `func`.
     ///

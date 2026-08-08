@@ -146,9 +146,9 @@ fn grouped_compute_preserves_shard_progress_contract() {
     }
 }
 
-/// CMO-CROSS-1/4: async callback preparation does not become a global lock.
+/// CMO-CROSS-1/4: async callback preparation holds no DashMap shard lock.
 #[test]
-fn async_preparation_allows_different_shard_progress() {
+fn async_preparation_allows_same_and_different_shard_progress() {
     let store = DurableKeySetStore::new_vec_based();
     let keys = select_shard_keys(&store.store);
     store.append(keys.anchor.clone(), b"seed".to_vec());
@@ -185,15 +185,14 @@ fn async_preparation_allows_different_shard_progress() {
         same_store.append(same_key, b"same".to_vec());
         same_tx.send(()).unwrap();
     });
-    assert!(!cross_shard::completes_within(
+    assert!(cross_shard::completes_within(
         &same_rx,
-        std::time::Duration::from_millis(250)
+        std::time::Duration::from_millis(500)
     ));
 
     release_tx.send(()).unwrap();
     worker.join().unwrap();
     different.join().unwrap();
-    same_rx.recv_timeout(WATCHDOG).unwrap();
     same.join().unwrap();
 }
 

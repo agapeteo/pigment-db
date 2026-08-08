@@ -186,7 +186,10 @@ recovery, or physical power-loss durability.
 - Dropping an asynchronous compute future before acceptance drops its private working value and entry guard, leaving the accepted state unchanged.
 - Removal callbacks run only after the occupied entry is consumed and its shard guard is released.
 - Recursive callback access to the same map/shard remains unsupported and documented as a possible self-deadlock.
-- `compute_async` continues holding the shard guard across `.await`; moving it outside and adding conflict/retry semantics remains issue #7.
+- Historical issue #3 scope kept the `compute_async` shard guard across `.await`.
+  Follow-up issue #7 supersedes that boundary with one-shot optimistic snapshot
+  validation: no guard across `.await`, no callback retry, and `WouldBlock` on a
+  changed same-key value.
 
 ### Deterministic concurrency seam
 

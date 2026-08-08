@@ -125,7 +125,9 @@ current scope.
 - Catch and suppress callback panic: rejected because it changes public panic behavior.
 - Mutate live state and restore on unwind: rejected because partial state could be observed and async cancellation cleanup is unreliable.
 - Retry callbacks after conflict: rejected by at-most-once FR-012.
-- Release the async guard across `.await`: deferred to issue #7.
+- Release the async guard across `.await`: deferred by this feature and later
+  implemented by issue #7 with one-shot optimistic snapshot validation and a
+  `WouldBlock` conflict result.
 
 ## Decision 6: Use semantic test hooks only for scheduling
 

@@ -75,11 +75,15 @@ even while no live entry exists.
 - If a synchronous callback panics before acceptance, the panic propagates and no callback result is published or persisted.
 - If an asynchronous callback future is dropped before acceptance, its candidate is discarded and no callback result is published or persisted.
 - Post-removal callbacks run only after live deletion and shard-guard release, with their existing argument and invocation condition.
-- Recursive access to the same data map/shard from a callback remains unsupported and may deadlock.
+- Recursive access to the same data map/shard from a synchronous callback remains unsupported and may deadlock.
 
-The asynchronous set callback continues to hold its shard guard across
-`.await`. Conflict/retry semantics and release-around-await redesign remain
-review issue #7.
+The asynchronous set callback runs once against a private snapshot without a
+DashMap guard held across `.await`. Same-key and other-key mutations may proceed
+while it is pending. After the callback completes, publication reacquires the
+entry guard and compares the accepted value with the snapshot. A mismatch
+returns `io::ErrorKind::WouldBlock` without retrying the callback or writing or
+publishing its candidate; a match commits through the normal WAL-before-live
+path.
 
 ## Persistence Failure Contract
 

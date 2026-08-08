@@ -160,13 +160,30 @@ fn overlapping_reads_never_observe_sync_or_async_working_sets() {
         let read = std::thread::spawn(move || {
             read_tx.send(read_store.get_hashset(&read_key)).unwrap();
         });
-        assert!(matches!(
-            read_rx.recv_timeout(std::time::Duration::from_millis(250)),
-            Err(RecvTimeoutError::Timeout)
-        ));
+        let async_snapshot = if asynchronous {
+            let snapshot = read_rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .expect("async reads must observe the accepted snapshot without waiting");
+            assert!(snapshot.as_ref().is_some_and(|set| {
+                set.contains(b"before".as_slice())
+                    && !set.contains(b"new-a".as_slice())
+                    && !set.contains(b"new-b".as_slice())
+            }));
+            Some(snapshot)
+        } else {
+            assert!(matches!(
+                read_rx.recv_timeout(std::time::Duration::from_millis(250)),
+                Err(RecvTimeoutError::Timeout)
+            ));
+            None
+        };
         release_tx.send(()).unwrap();
         compute.join().unwrap();
-        let observed = read_rx.recv().unwrap();
+        let observed = if async_snapshot.is_some() {
+            store.get_hashset(&key)
+        } else {
+            read_rx.recv().unwrap()
+        };
         read.join().unwrap();
         assert!(observed.as_ref().is_some_and(|set| {
             set.contains(b"before".as_slice())
