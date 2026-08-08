@@ -5,10 +5,12 @@ use std::fmt;
 
 use super::format::{V1CodecProbe, V2CodecProbe};
 use super::model::{
-    crc, KeyValueData, StoredAction, DELETE_ACT, MAP_PUT_ACT, MAP_REMOVE_ACT, PUT_ACT,
-    SET_APPEND_ACT, SET_REMOVE_ACT,
+    crc, decode_current_sorted_map_entry, decode_current_sorted_map_key,
+    decode_historical_sorted_map_entry, decode_historical_sorted_map_key, KeyValueData,
+    StoredAction, DELETE_ACT, MAP_PUT_ACT, MAP_PUT_V2_ACT, MAP_REMOVE_ACT, MAP_REMOVE_V2_ACT,
+    PUT_ACT, SET_APPEND_ACT, SET_REMOVE_ACT,
 };
-use crate::model::{SearchKey, SortedMapEntry, SortedMapKey};
+use crate::model::{SearchKey, SortedMapEntry};
 
 const HEADER_LEN: usize = 1 + 4 + 4;
 const FOOTER_LEN: usize = 4;
@@ -667,7 +669,7 @@ fn incomplete_v2_record_matches(
         || !present_field_prefix_matches(fragment, 2, &[2])
         || fragment
             .get(3)
-            .is_some_and(|action| !action_matches_kind(expected_kind, *action))
+            .is_some_and(|action| !v2_action_matches_kind(expected_kind, *action))
         || !present_field_prefix_matches(fragment, 4, &header_len)
     {
         return false;
@@ -1016,6 +1018,11 @@ fn action_matches_kind(expected_kind: u8, action: u8) -> bool {
     }
 }
 
+fn v2_action_matches_kind(expected_kind: u8, action: u8) -> bool {
+    action_matches_kind(expected_kind, action)
+        || (expected_kind == 3 && matches!(action, MAP_PUT_V2_ACT | MAP_REMOVE_V2_ACT))
+}
+
 pub(crate) fn replay_key_value(
     bytes: &[u8],
 ) -> Result<ReplaySnapshot<KeyValueSnapshot>, ValidationError> {
@@ -1244,23 +1251,29 @@ fn replay_key_map_with_target(
     for frame in checked_replay_frames(bytes, 3)? {
         last_bucket = last_bucket.max(frame.timestamp_bucket());
         match frame.action() {
-            MAP_PUT_ACT => {
-                let action: SortedMapEntry = bincode::deserialize(frame.data()).map_err(|_| {
-                    ValidationError::InvalidPayload {
-                        offset: frame.start_offset(),
-                    }
+            MAP_PUT_ACT | MAP_PUT_V2_ACT => {
+                let action = if frame.action() == MAP_PUT_ACT {
+                    decode_historical_sorted_map_entry(frame.data())
+                } else {
+                    decode_current_sorted_map_entry(frame.data())
+                }
+                .map_err(|_| ValidationError::InvalidPayload {
+                    offset: frame.start_offset(),
                 })?;
                 let (key, search_key, value) = action.entry();
                 compacted_snapshot_prefix &=
                     snapshot_entries.insert((key.clone(), search_key.clone()));
                 snapshot.entry(key).or_default().insert(search_key, value);
             }
-            MAP_REMOVE_ACT => {
+            MAP_REMOVE_ACT | MAP_REMOVE_V2_ACT => {
                 compacted_snapshot_prefix = false;
-                let action: SortedMapKey = bincode::deserialize(frame.data()).map_err(|_| {
-                    ValidationError::InvalidPayload {
-                        offset: frame.start_offset(),
-                    }
+                let action = if frame.action() == MAP_REMOVE_ACT {
+                    decode_historical_sorted_map_key(frame.data())
+                } else {
+                    decode_current_sorted_map_key(frame.data())
+                }
+                .map_err(|_| ValidationError::InvalidPayload {
+                    offset: frame.start_offset(),
                 })?;
                 let (key, search_key) = action.owned();
                 if let Some(map) = snapshot.get_mut(&key) {

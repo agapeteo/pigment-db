@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::model::SortedMapEntry;
 use crate::wal::format::{V2CodecProbe, V2HeaderProbeFields, V2RecordProbeFields};
-use crate::wal::model::{KeyValueData, MAP_PUT_ACT, SET_APPEND_ACT};
+use crate::wal::model::{KeyValueData, MAP_PUT_V2_ACT, SET_APPEND_ACT};
 use crate::wal::replay::{
     replay_key_map, replay_key_map_tail, replay_key_set, replay_key_set_tail, replay_key_value,
     replay_key_value_tail, KeyMapSnapshot, KeySetSnapshot, KeyValueSnapshot, ReplaySnapshot,
@@ -1023,7 +1023,12 @@ impl MigrationProbe {
                     value.clone(),
                 ))
                 .expect("captured legacy key/map state must encode");
-                Self::append_v2_snapshot_record(&mut converted, MAP_PUT_ACT, &payload, last_bucket);
+                Self::append_v2_snapshot_record(
+                    &mut converted,
+                    MAP_PUT_V2_ACT,
+                    &payload,
+                    last_bucket,
+                );
             }
         }
         converted

@@ -743,7 +743,7 @@ impl<W: Write> WalStorage<W> {
             for (index, stored) in stored.iter().enumerate() {
                 let frame =
                     format::V2CodecProbe::encode_complete_record(format::V2RecordProbeFields {
-                        action: *stored.act_type(),
+                        action: stored.v2_act_type(),
                         payload: stored.data(),
                         physical_start: offset,
                         mutation_start: checkpoint,
@@ -1023,7 +1023,7 @@ impl<W: Write> WalStorage<W> {
             format::V2CodecProbe::encode_complete_record_into(
                 &mut frame,
                 format::V2RecordProbeFields {
-                    action: *action.act_type(),
+                    action: action.v2_act_type(),
                     payload: action.data(),
                     physical_start: checkpoint,
                     mutation_start: checkpoint,

@@ -25,7 +25,7 @@ All integer fields are little-endian. Header and record offsets below are byte o
 |---|---:|---|---|
 | `0..2` | 2 | Marker | `a7 d1` |
 | `2` | 1 | Record version | `2` |
-| `3` | 1 | Action | Existing action `0..=5`, valid for store family |
+| `3` | 1 | Action | Action `0..=7`, valid for store family and payload contract |
 | `4..6` | 2 | Fixed header length | `54` |
 | `6..14` | 8 | Payload length | Checked conversion/addition |
 | `14..22` | 8 | Length complement | Bitwise complement of payload length |
@@ -37,6 +37,16 @@ All integer fields are little-endian. Header and record offsets below are byte o
 | `54..54+L` | `L` | Payload | Valid for family/action |
 | `54+L..62+L` | 8 | Footer start | Duplicate physical start |
 | `62+L..66+L` | 4 | CRC32 | CRC32 of all preceding record bytes |
+
+### Action compatibility registry
+
+- Actions `0..=3` retain their existing delete, key/value, and key/set meanings.
+- Sorted-map actions `4` (put) and `5` (remove) retain the historical key payload in which enum discriminant `10` stores `u64`.
+- Sorted-map actions `6` (put) and `7` (remove) use the current key payload in which enum discriminant `10` stores `i128`.
+- New runtime V2 writes and offline V2 snapshots emit `6`/`7`. Earlier V2 `4`/`5` records remain valid and may coexist in the same segment chain.
+- Actions `6`/`7` are invalid for V1, key/value, and key/set records. Payload width/action mismatches fail validation.
+
+See [`specs/007-fix-i128-key/contracts/sorted-map-key-wire.md`](../../007-fix-i128-key/contracts/sorted-map-key-wire.md) for normalization and migration rules.
 
 ## Atomicity and recovery
 

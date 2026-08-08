@@ -2,6 +2,13 @@ use crate::model::{SortedMapEntry, SortedMapKey};
 use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 
+mod historical;
+
+pub(crate) use historical::{
+    decode_current_sorted_map_entry, decode_current_sorted_map_key,
+    decode_historical_sorted_map_entry, decode_historical_sorted_map_key,
+};
+
 pub const ACT_TYPE_FIELD_LEN: u8 = 1;
 pub const CRC32_FIELD_LEN: u8 = 4;
 pub const DATA_SIZE_FIELD_LEN: u8 = 4;
@@ -15,6 +22,10 @@ pub const SET_APPEND_ACT: u8 = 2;
 pub const SET_REMOVE_ACT: u8 = 3;
 pub const MAP_PUT_ACT: u8 = 4;
 pub const MAP_REMOVE_ACT: u8 = 5;
+/// V2 sorted-map put payload using the current signed key model.
+pub const MAP_PUT_V2_ACT: u8 = 6;
+/// V2 sorted-map remove payload using the current signed key model.
+pub const MAP_REMOVE_V2_ACT: u8 = 7;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct KeyValueData {
@@ -208,6 +219,14 @@ impl StoredAction {
 
     pub fn act_type(&self) -> &u8 {
         &self.act_type
+    }
+
+    pub fn v2_act_type(&self) -> u8 {
+        match self.act_type {
+            MAP_PUT_ACT => MAP_PUT_V2_ACT,
+            MAP_REMOVE_ACT => MAP_REMOVE_V2_ACT,
+            action => action,
+        }
     }
 
     pub fn crc(&self) -> &u32 {

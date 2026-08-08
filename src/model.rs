@@ -170,6 +170,7 @@ impl PartialOrd for SearchKey {
     }
 }
 
+/// One typed component of a [`SearchKey`].
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Debug, Serialize, Deserialize)]
 pub enum Key {
     Bool(bool),
@@ -182,7 +183,8 @@ pub enum Key {
     I64(i64),
     U64(u64),
     USIZE(usize),
-    I128(u64),
+    /// A full-range signed 128-bit component.
+    I128(i128),
     U128(u128),
     Char(char),
     Str(String),

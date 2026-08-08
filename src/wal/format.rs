@@ -5,8 +5,11 @@
 
 #![allow(dead_code)]
 
-use super::model::KeyValueData;
-use crate::model::{SortedMapEntry, SortedMapKey};
+use super::model::{
+    decode_current_sorted_map_entry, decode_current_sorted_map_key,
+    decode_historical_sorted_map_entry, decode_historical_sorted_map_key, KeyValueData,
+    MAP_PUT_V2_ACT, MAP_REMOVE_V2_ACT,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct V1CodecProbe;
@@ -401,8 +404,8 @@ impl V1CodecProbe {
         match (store_kind, action) {
             (1..=3, 0) => true,
             (1, 1) | (2, 2) | (2, 3) => bincode::deserialize::<KeyValueData>(payload).is_ok(),
-            (3, 4) => bincode::deserialize::<SortedMapEntry>(payload).is_ok(),
-            (3, 5) => bincode::deserialize::<SortedMapKey>(payload).is_ok(),
+            (3, 4) => decode_historical_sorted_map_entry(payload).is_ok(),
+            (3, 5) => decode_historical_sorted_map_key(payload).is_ok(),
             _ => false,
         }
     }
@@ -616,7 +619,7 @@ impl V2CodecProbe {
     }
 
     pub(crate) fn record_action_is_valid(bytes: &[u8]) -> bool {
-        bytes.get(3).is_some_and(|action| matches!(*action, 0..=5))
+        bytes.get(3).is_some_and(|action| matches!(*action, 0..=7))
     }
 
     pub(crate) fn record_header_length_is_valid(bytes: &[u8]) -> bool {
@@ -690,7 +693,11 @@ impl V2CodecProbe {
     }
 
     pub(crate) fn payload_is_valid(store_kind: u8, action: u8, payload: &[u8]) -> bool {
-        V1CodecProbe::payload_is_valid(store_kind, action, payload)
+        match (store_kind, action) {
+            (3, MAP_PUT_V2_ACT) => decode_current_sorted_map_entry(payload).is_ok(),
+            (3, MAP_REMOVE_V2_ACT) => decode_current_sorted_map_key(payload).is_ok(),
+            _ => V1CodecProbe::payload_is_valid(store_kind, action, payload),
+        }
     }
 
     pub(crate) fn record_crc_is_valid(bytes: &[u8]) -> bool {
