@@ -7,6 +7,9 @@ use pigment_db::model::SearchKey;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::hint::black_box;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -19,6 +22,10 @@ const MIN_OPERATIONS_PER_SAMPLE: usize = 1_024;
 const BENCHMARK_OUTPUT_ENV: &str = "PIGMENT_DB_BENCHMARK_OUTPUT";
 const BENCHMARK_BASELINE_ENV: &str = "PIGMENT_DB_BENCHMARK_BASELINE";
 const BENCHMARK_CANDIDATE_ENV: &str = "PIGMENT_DB_BENCHMARK_CANDIDATE";
+const BENCHMARK_CAPTURE_ID_ENV: &str = "PIGMENT_DB_COMPACTION_CAPTURE_ID";
+const BENCHMARK_DIRTY_SHA256_ENV: &str = "PIGMENT_DB_COMPACTION_DIRTY_SHA256";
+const BENCHMARK_HARNESS_SHA256_ENV: &str = "PIGMENT_DB_COMPACTION_HARNESS_SHA256";
+const BENCHMARK_SMOKE_ENV: &str = "PIGMENT_DB_COMPACTION_BENCHMARK_SMOKE";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum StoreKind {
@@ -85,11 +92,53 @@ struct CellKey {
     workers: usize,
 }
 
+#[derive(Clone, Debug)]
 struct CellResult {
     key: CellKey,
     operations_per_sample: usize,
     median_throughput: f64,
     p95_latency: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RunParameters {
+    warmups: usize,
+    samples: usize,
+    min_sample_duration: Duration,
+    min_operations_per_sample: usize,
+}
+
+impl RunParameters {
+    const ACCEPTANCE: Self = Self {
+        warmups: WARMUPS,
+        samples: SAMPLES,
+        min_sample_duration: MIN_SAMPLE_DURATION,
+        min_operations_per_sample: MIN_OPERATIONS_PER_SAMPLE,
+    };
+
+    const SMOKE: Self = Self {
+        warmups: 0,
+        samples: 1,
+        min_sample_duration: Duration::ZERO,
+        min_operations_per_sample: 1,
+    };
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct CaptureProvenance {
+    capture_id: String,
+    commit: String,
+    dirty_sha256: String,
+    harness_sha256: String,
+    rustc: String,
+    cargo: String,
+    target: String,
+    os: String,
+    cpu: String,
+    filesystem: String,
+    affinity: String,
+    working_directory: PathBuf,
+    temporary_directory: PathBuf,
 }
 
 #[derive(Clone, Copy)]
@@ -384,11 +433,17 @@ fn run_once<S: BenchStore>(
     })
 }
 
-fn run_sample<S: BenchStore>(store: &S, key: CellKey) -> (Duration, Vec<Duration>) {
+fn run_sample<S: BenchStore>(
+    store: &S,
+    key: CellKey,
+    parameters: RunParameters,
+) -> (Duration, Vec<Duration>) {
     let mut elapsed = Duration::ZERO;
     let mut latencies = Vec::new();
     let mut operation_base = 0;
-    while elapsed < MIN_SAMPLE_DURATION || latencies.len() < MIN_OPERATIONS_PER_SAMPLE {
+    while elapsed < parameters.min_sample_duration
+        || latencies.len() < parameters.min_operations_per_sample
+    {
         let (round_elapsed, mut round_latencies) =
             run_once(store, key.profile, key.workers, operation_base);
         operation_base += round_latencies.len() / key.workers;
@@ -398,78 +453,315 @@ fn run_sample<S: BenchStore>(store: &S, key: CellKey) -> (Duration, Vec<Duration
     (elapsed, latencies)
 }
 
-fn measure<S: BenchStore>(key: CellKey, mut build: impl FnMut() -> S) -> CellResult {
-    for _ in 0..WARMUPS {
+fn measure<S: BenchStore>(
+    key: CellKey,
+    parameters: RunParameters,
+    mut build: impl FnMut() -> S,
+) -> CellResult {
+    for _ in 0..parameters.warmups {
         let store = build();
-        black_box(run_sample(&store, key));
+        black_box(run_sample(&store, key, parameters));
     }
 
-    let mut throughputs = Vec::with_capacity(SAMPLES);
+    let mut throughputs = Vec::with_capacity(parameters.samples);
     let mut latencies = Vec::new();
     let mut operations_per_sample = usize::MAX;
-    for _ in 0..SAMPLES {
+    for _ in 0..parameters.samples {
         let store = build();
-        let (elapsed, sample_latencies) = run_sample(&store, key);
+        let (elapsed, sample_latencies) = run_sample(&store, key, parameters);
         operations_per_sample = operations_per_sample.min(sample_latencies.len());
         throughputs.push(sample_latencies.len() as f64 / elapsed.as_secs_f64());
         latencies.extend(sample_latencies);
     }
 
-    throughputs.sort_by(f64::total_cmp);
-    latencies.sort_unstable();
-    let p95_index = ((latencies.len() as f64 * 0.95).ceil() as usize)
-        .saturating_sub(1)
-        .min(latencies.len() - 1);
-
     CellResult {
         key,
         operations_per_sample,
-        median_throughput: throughputs[throughputs.len() / 2],
-        p95_latency: latencies[p95_index],
+        median_throughput: median(&mut throughputs),
+        p95_latency: aggregate_p95(&mut latencies),
     }
 }
 
-fn run_matrix(label: &str) -> Vec<CellResult> {
-    let mut rows = Vec::with_capacity(36);
+fn feature_cell_keys() -> Vec<CellKey> {
+    let mut keys = Vec::with_capacity(36);
     for store in [StoreKind::Value, StoreKind::Set, StoreKind::Map] {
         for mode in [Mode::Vector, Mode::File] {
             for profile in [Profile::Write, Profile::Remove, Profile::Callback] {
                 for workers in [1, 8] {
-                    let key = CellKey {
+                    keys.push(CellKey {
                         store,
                         mode,
                         profile,
                         workers,
-                    };
-                    let result = match store {
-                        StoreKind::Value => measure(key, || KeyValueBenchStore::new(mode)),
-                        StoreKind::Set => measure(key, || KeySetBenchStore::new(mode)),
-                        StoreKind::Map => measure(key, || KeyMapBenchStore::new(mode)),
-                    };
-                    println!(
-                        "BENCH,{label},{},{},{},{},{SAMPLES},{},{:.3},{}",
-                        store.name(),
-                        mode.name(),
-                        profile.name(),
-                        workers,
-                        result.operations_per_sample,
-                        result.median_throughput,
-                        result.p95_latency.as_nanos()
-                    );
-                    rows.push(result);
+                    });
                 }
             }
         }
     }
+    keys
+}
 
-    let keys: HashSet<_> = rows.iter().map(|row| row.key).collect();
-    assert_eq!(rows.len(), 36, "benchmark matrix must emit 36 cells");
-    assert_eq!(keys.len(), 36, "benchmark cell keys must be unique");
+fn run_matrix(label: &str) -> Vec<CellResult> {
+    let parameters = if std::env::var_os(BENCHMARK_SMOKE_ENV).is_some() {
+        RunParameters::SMOKE
+    } else {
+        RunParameters::ACCEPTANCE
+    };
+    let mut rows = Vec::with_capacity(36);
+    for key in feature_cell_keys() {
+        let result = match key.store {
+            StoreKind::Value => measure(key, parameters, || KeyValueBenchStore::new(key.mode)),
+            StoreKind::Set => measure(key, parameters, || KeySetBenchStore::new(key.mode)),
+            StoreKind::Map => measure(key, parameters, || KeyMapBenchStore::new(key.mode)),
+        };
+        println!(
+            "BENCH,{label},{},{},{},{},{},{},{:.3},{}",
+            key.store.name(),
+            key.mode.name(),
+            key.profile.name(),
+            key.workers,
+            parameters.samples,
+            result.operations_per_sample,
+            result.median_throughput,
+            result.p95_latency.as_nanos()
+        );
+        rows.push(result);
+    }
+
+    validate_capture_rows(&rows, parameters).expect("benchmark matrix must be complete and valid");
     if let Some(path) = std::env::var_os(BENCHMARK_OUTPUT_ENV) {
-        write_benchmark_csv(std::path::Path::new(&path), &rows)
-            .expect("write generated benchmark CSV");
+        let path = Path::new(&path);
+        write_benchmark_csv(path, &rows, parameters).expect("write generated benchmark CSV");
+        if std::env::var_os(BENCHMARK_CAPTURE_ID_ENV).is_some() {
+            let provenance = collect_capture_provenance()
+                .expect("collect feature benchmark environment provenance");
+            write_capture_metadata(path, label, parameters, &provenance)
+                .expect("write feature benchmark provenance");
+        }
     }
     rows
+}
+
+fn median(values: &mut [f64]) -> f64 {
+    assert!(!values.is_empty(), "median requires at least one value");
+    values.sort_by(f64::total_cmp);
+    values[values.len() / 2]
+}
+
+fn aggregate_p95(values: &mut [Duration]) -> Duration {
+    assert!(!values.is_empty(), "p95 requires at least one value");
+    values.sort_unstable();
+    let index = ((values.len() as f64 * 0.95).ceil() as usize)
+        .saturating_sub(1)
+        .min(values.len() - 1);
+    values[index]
+}
+
+fn validate_capture_rows(rows: &[CellResult], parameters: RunParameters) -> io::Result<()> {
+    let expected: HashSet<_> = feature_cell_keys().into_iter().collect();
+    let actual: HashSet<_> = rows.iter().map(|row| row.key).collect();
+    if rows.len() != expected.len() || actual != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "benchmark capture must contain every feature cell exactly once",
+        ));
+    }
+    for row in rows {
+        if row.operations_per_sample < parameters.min_operations_per_sample {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "benchmark sample does not meet the operation floor",
+            ));
+        }
+        if !row.median_throughput.is_finite() || row.median_throughput <= 0.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "benchmark throughput must be finite and positive",
+            ));
+        }
+        if row.p95_latency.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "benchmark p95 latency must be positive",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_sha256(value: &str) -> io::Result<()> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SHA-256 digest must contain exactly 64 lowercase hexadecimal characters",
+        ))
+    }
+}
+
+fn validate_source_digest(actual: &str, expected: &str) -> io::Result<()> {
+    validate_sha256(actual)?;
+    validate_sha256(expected)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "benchmark harness digest does not match the frozen source",
+        ))
+    }
+}
+
+fn threshold_passes(workers: usize, throughput_ratio: f64, latency_ratio: f64) -> bool {
+    let minimum_throughput = if workers == 1 { 0.90 } else { 0.85 };
+    throughput_ratio >= minimum_throughput && latency_ratio <= 1.25
+}
+
+fn collect_capture_provenance() -> io::Result<CaptureProvenance> {
+    let capture_id = required_environment(BENCHMARK_CAPTURE_ID_ENV)?;
+    let dirty_sha256 = required_environment(BENCHMARK_DIRTY_SHA256_ENV)?;
+    let harness_sha256 = required_environment(BENCHMARK_HARNESS_SHA256_ENV)?;
+    validate_sha256(&dirty_sha256)?;
+    validate_sha256(&harness_sha256)?;
+    let actual_harness_sha256 = command_output("sha256sum", &[file!()])?
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    validate_source_digest(&actual_harness_sha256, &harness_sha256)?;
+
+    let rustc_verbose = command_output("rustc", &["--version", "--verbose"])?;
+    let target = rustc_verbose
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .unwrap_or("unknown")
+        .to_owned();
+    let rustc = rustc_verbose.lines().next().unwrap_or("unknown").to_owned();
+    let temporary_directory = std::env::temp_dir().canonicalize()?;
+    let filesystem = command_output(
+        "findmnt",
+        &[
+            "-T",
+            temporary_directory.to_str().unwrap_or_default(),
+            "-n",
+            "-o",
+            "SOURCE,FSTYPE,OPTIONS",
+        ],
+    )?
+    .trim()
+    .to_owned();
+    if filesystem.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "benchmark filesystem provenance is empty",
+        ));
+    }
+
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let affinity = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Cpus_allowed_list:\t"))
+        .unwrap_or("unknown")
+        .to_owned();
+    let cpu = std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|contents| {
+            contents
+                .lines()
+                .find_map(|line| line.strip_prefix("model name\t: "))
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "unknown".to_owned());
+
+    Ok(CaptureProvenance {
+        capture_id,
+        commit: command_output("git", &["rev-parse", "HEAD"])?
+            .trim()
+            .to_owned(),
+        dirty_sha256,
+        harness_sha256,
+        rustc,
+        cargo: command_output("cargo", &["--version"])?.trim().to_owned(),
+        target,
+        os: command_output("uname", &["-srm"])?.trim().to_owned(),
+        cpu,
+        filesystem,
+        affinity,
+        working_directory: std::env::current_dir()?.canonicalize()?,
+        temporary_directory,
+    })
+}
+
+fn required_environment(name: &str) -> io::Result<String> {
+    std::env::var(name).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{name} is required for an immutable feature capture"),
+        )
+    })
+}
+
+fn command_output(program: &str, arguments: &[&str]) -> io::Result<String> {
+    let output = Command::new(program).args(arguments).output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!("{program} failed")));
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn write_capture_metadata(
+    csv_path: &Path,
+    label: &str,
+    parameters: RunParameters,
+    provenance: &CaptureProvenance,
+) -> io::Result<()> {
+    use std::fmt::Write as _;
+
+    let metadata_path = PathBuf::from(format!("{}.metadata", csv_path.display()));
+    let mut metadata = String::new();
+    for (name, value) in [
+        ("capture_id", provenance.capture_id.clone()),
+        ("label", label.to_owned()),
+        ("commit", provenance.commit.clone()),
+        ("dirty_sha256", provenance.dirty_sha256.clone()),
+        ("harness_sha256", provenance.harness_sha256.clone()),
+        ("rustc", provenance.rustc.clone()),
+        ("cargo", provenance.cargo.clone()),
+        ("target", provenance.target.clone()),
+        ("os", provenance.os.clone()),
+        ("cpu", provenance.cpu.clone()),
+        ("filesystem", provenance.filesystem.clone()),
+        ("affinity", provenance.affinity.clone()),
+        (
+            "working_directory",
+            provenance.working_directory.display().to_string(),
+        ),
+        (
+            "temporary_directory",
+            provenance.temporary_directory.display().to_string(),
+        ),
+        ("payload_bytes", VALUE_BYTES.to_string()),
+        ("warmups", parameters.warmups.to_string()),
+        ("samples", parameters.samples.to_string()),
+        (
+            "min_sample_duration_ms",
+            parameters.min_sample_duration.as_millis().to_string(),
+        ),
+        (
+            "min_operations_per_sample",
+            parameters.min_operations_per_sample.to_string(),
+        ),
+    ] {
+        writeln!(metadata, "{name}={}", value.replace(['\r', '\n'], " "))
+            .expect("write benchmark metadata field");
+    }
+    std::fs::write(metadata_path, metadata)
 }
 
 fn resident_bytes() -> Option<u64> {
@@ -636,7 +928,11 @@ fn invalid_benchmark_field(name: &str, value: &str) -> std::io::Error {
     )
 }
 
-fn write_benchmark_csv(path: &std::path::Path, rows: &[CellResult]) -> std::io::Result<()> {
+fn write_benchmark_csv(
+    path: &Path,
+    rows: &[CellResult],
+    parameters: RunParameters,
+) -> io::Result<()> {
     use std::fmt::Write as _;
 
     let mut csv = String::from(
@@ -645,11 +941,12 @@ fn write_benchmark_csv(path: &std::path::Path, rows: &[CellResult]) -> std::io::
     for row in rows {
         writeln!(
             csv,
-            "{},{},{},{},{SAMPLES},{},{:.3},{}",
+            "{},{},{},{},{},{},{:.3},{}",
             row.key.store.name(),
             row.key.mode.name(),
             row.key.profile.name(),
             row.key.workers,
+            parameters.samples,
             row.operations_per_sample,
             row.median_throughput,
             row.p95_latency.as_nanos(),
@@ -740,7 +1037,9 @@ fn benchmark_samples_use_stable_operation_volume() {
         profile: Profile::Write,
         workers: 1,
     };
-    let result = measure(key, || KeyValueBenchStore::new(Mode::Vector));
+    let result = measure(key, RunParameters::ACCEPTANCE, || {
+        KeyValueBenchStore::new(Mode::Vector)
+    });
     assert!(
         result.operations_per_sample >= 1_024,
         "each sample must amortize timer and scheduler noise"
@@ -763,7 +1062,8 @@ fn generated_benchmark_csv_can_drive_candidate_pairing() {
         median_throughput: 12_345.0,
         p95_latency: Duration::from_nanos(678),
     };
-    write_benchmark_csv(&path, &[row]).expect("write generated benchmark CSV");
+    write_benchmark_csv(&path, &[row], RunParameters::ACCEPTANCE)
+        .expect("write generated benchmark CSV");
     let parsed = read_baseline_cells(&path).expect("read generated benchmark CSV");
     assert_eq!(parsed.len(), 1);
     assert_eq!(parsed[&key], (12_345.0, 678));
@@ -777,7 +1077,9 @@ fn generated_benchmark_csv_can_drive_candidate_pairing() {
 #[ignore = "release-only immutable pre-feature benchmark"]
 fn paired_baseline() {
     black_box(run_matrix("baseline"));
-    black_box(run_memory_profile("baseline"));
+    if std::env::var_os(BENCHMARK_SMOKE_ENV).is_none() {
+        black_box(run_memory_profile("baseline"));
+    }
 }
 
 #[test]
@@ -789,9 +1091,77 @@ fn paired_candidate() {
         None => run_matrix("candidate"),
     };
     assert_candidate_cells(&rows);
-    let memory = run_memory_profile("candidate");
-    assert_retained_memory(&memory);
-    black_box((rows, memory));
+    if std::env::var_os(BENCHMARK_SMOKE_ENV).is_none() {
+        let memory = run_memory_profile("candidate");
+        assert_retained_memory(&memory);
+        black_box((rows, memory));
+    } else {
+        black_box(rows);
+    }
+}
+
+#[test]
+fn feature_matrix_contains_every_cell_exactly_once() {
+    let keys = feature_cell_keys();
+    let unique: HashSet<_> = keys.iter().copied().collect();
+    assert_eq!(keys.len(), 36);
+    assert_eq!(unique.len(), 36);
+    assert!(keys.iter().all(|key| matches!(key.workers, 1 | 8)));
+}
+
+#[test]
+fn benchmark_median_selects_the_middle_of_eleven_samples() {
+    let mut values = [11.0, 1.0, 8.0, 3.0, 7.0, 2.0, 10.0, 4.0, 9.0, 5.0, 6.0];
+    assert_eq!(median(&mut values), 6.0);
+}
+
+#[test]
+fn benchmark_p95_aggregates_all_public_call_latencies() {
+    let mut values: Vec<_> = (1..=20).map(Duration::from_nanos).collect();
+    assert_eq!(aggregate_p95(&mut values), Duration::from_nanos(19));
+}
+
+#[test]
+fn benchmark_source_digest_requires_an_exact_sha256_match() {
+    let frozen = "a".repeat(64);
+    assert!(validate_source_digest(&frozen, &frozen).is_ok());
+    assert!(validate_source_digest(&"b".repeat(64), &frozen).is_err());
+    assert!(validate_source_digest("not-a-sha256", &frozen).is_err());
+}
+
+#[test]
+fn benchmark_capture_validation_rejects_missing_duplicate_and_invalid_cells() {
+    let valid: Vec<_> = feature_cell_keys()
+        .into_iter()
+        .map(|key| CellResult {
+            key,
+            operations_per_sample: MIN_OPERATIONS_PER_SAMPLE,
+            median_throughput: 1.0,
+            p95_latency: Duration::from_nanos(1),
+        })
+        .collect();
+    assert!(validate_capture_rows(&valid, RunParameters::ACCEPTANCE).is_ok());
+
+    let mut missing = valid.clone();
+    missing.pop();
+    assert!(validate_capture_rows(&missing, RunParameters::ACCEPTANCE).is_err());
+
+    let mut duplicate = valid.clone();
+    duplicate[1] = duplicate[0].clone();
+    assert!(validate_capture_rows(&duplicate, RunParameters::ACCEPTANCE).is_err());
+
+    let mut invalid = valid;
+    invalid[0].median_throughput = f64::NAN;
+    assert!(validate_capture_rows(&invalid, RunParameters::ACCEPTANCE).is_err());
+}
+
+#[test]
+fn benchmark_thresholds_are_inclusive() {
+    assert!(threshold_passes(1, 0.90, 1.25));
+    assert!(threshold_passes(8, 0.85, 1.25));
+    assert!(!threshold_passes(1, 0.899_999, 1.0));
+    assert!(!threshold_passes(8, 0.849_999, 1.0));
+    assert!(!threshold_passes(8, 1.0, 1.250_001));
 }
 
 pub(super) fn assert_key_map_vector_eight_worker_write_threshold() {
@@ -801,7 +1171,9 @@ pub(super) fn assert_key_map_vector_eight_worker_write_threshold() {
         profile: Profile::Write,
         workers: 8,
     };
-    let result = measure(key, || KeyMapBenchStore::new(Mode::Vector));
+    let result = measure(key, RunParameters::ACCEPTANCE, || {
+        KeyMapBenchStore::new(Mode::Vector)
+    });
     println!(
         "BENCH,candidate,{},{},{},{},{SAMPLES},{},{:.3},{}",
         result.key.store.name(),

@@ -1,0 +1,1 @@
+//! Online-compaction contract tests.

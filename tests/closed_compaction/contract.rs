@@ -1,0 +1,1 @@
+//! Closed-compaction contract tests.

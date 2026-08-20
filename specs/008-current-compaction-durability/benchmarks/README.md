@@ -1,0 +1,84 @@
+# Compaction Performance Evidence
+
+This directory holds the immutable inactive-compaction performance evidence for
+feature 008. The benchmark measures ordinary mutations only; it does not measure
+compaction speed.
+
+## Protocol
+
+Each complete matrix contains every combination of three store families, vector
+and buffered file backing, ordinary write/successful remove/minimal successful
+compute, and one/eight distinct-key workers. Every cell uses 32-byte inputs, five
+warmups, eleven measured samples, and a minimum of both 100 ms and 1,024 public
+operations per sample.
+
+The final gate uses three complete pre-feature matrices and three complete
+candidate matrices, captured as sequential counterbalanced pairs on the same
+quiet pinned host. No observed cell may be dropped or selectively recaptured.
+
+## Capture procedure
+
+The harness was frozen before any production edit with this identity:
+
+| Field | Frozen value |
+|---|---|
+| Pre-feature implementation commit | `a7c8281f72e25c177a142be99285faead7335e01` |
+| Branch used to add test infrastructure | `codex/008-current-compaction-durability` |
+| Harness source | `tests/mutation_ordering/performance.rs` |
+| Harness SHA-256 | `c8ca6c94e6f38d54e456462bce2e8fad0d3cffa2b2457f4c2818129b1c62006c` |
+| Pre-capture dirty-state listing SHA-256 | `cb72a95fc5d3cf49d1d6c1af6cd9c1181d6581ba3535001fb4dfe77107f7979c` |
+| Rust/Cargo | `rustc 1.97.1 (8bab26f4f 2026-07-14)` / `cargo 1.97.1 (c980f4866 2026-06-30)` |
+| Target | `x86_64-unknown-linux-gnu` |
+| Data filesystem | `/dev/nvme0n1p4`, Btrfs project subvolume |
+| Allowed CPUs / capture affinity | `0-21` / `12-19` |
+| Temporary data root | `/work/@projects/penpack-projects/pigment-db/target/compaction-benchmark-tmp` |
+
+The dirty-state digest is the SHA-256 of
+`git status --porcelain=v1 --untracked-files=all`; it identifies the complete
+pre-production dirty path set. The harness digest is content-addressed
+separately and is the normative benchmark-source identity.
+
+The successful result-free smoke command was:
+
+```text
+TMPDIR=/work/@projects/penpack-projects/pigment-db/target/compaction-benchmark-tmp PIGMENT_DB_COMPACTION_BENCHMARK_SMOKE=1 taskset -c 12-19 cargo test --release --test mutation_ordering performance::paired_baseline -- --exact --ignored --nocapture --test-threads=1
+```
+
+Smoke mode traverses all 36 feature cells once, writes no acceptance artifact,
+and skips the unrelated retained-memory report. It is never valid acceptance
+evidence.
+
+Each immutable baseline matrix uses the following command, replacing `<N>` with
+`1`, `2`, or `3` and setting the two frozen digests exactly as shown above:
+
+```text
+TMPDIR=/work/@projects/penpack-projects/pigment-db/target/compaction-benchmark-tmp PIGMENT_DB_COMPACTION_CAPTURE_ID=baseline-<N> PIGMENT_DB_COMPACTION_DIRTY_SHA256=cb72a95fc5d3cf49d1d6c1af6cd9c1181d6581ba3535001fb4dfe77107f7979c PIGMENT_DB_COMPACTION_HARNESS_SHA256=c8ca6c94e6f38d54e456462bce2e8fad0d3cffa2b2457f4c2818129b1c62006c PIGMENT_DB_BENCHMARK_OUTPUT=/work/@projects/penpack-projects/pigment-db/specs/008-current-compaction-durability/benchmarks/baseline/baseline-<N>.csv taskset -c 12-19 cargo test --release --test mutation_ordering performance::paired_baseline -- --exact --ignored --nocapture --test-threads=1
+```
+
+To reconstruct an isolated baseline after production code changes:
+
+1. Create a detached worktree at
+   `/work/@projects/penpack-projects/pigment-db-008-baseline` from
+   `a7c8281f72e25c177a142be99285faead7335e01`.
+2. Copy only the frozen `tests/mutation_ordering/performance.rs` from this
+   feature worktree into the same path in the detached worktree.
+3. Verify its SHA-256 is
+   `c8ca6c94e6f38d54e456462bce2e8fad0d3cffa2b2457f4c2818129b1c62006c`.
+4. Create that worktree's ignored `target/compaction-benchmark-tmp` directory
+   and run the exact release command from its root, changing only absolute root
+   and output paths while retaining CPUs `12-19` and every protocol parameter.
+
+This reconstruction keeps production code at the pre-feature commit while
+using byte-identical test infrastructure. No specification, integration-test,
+or candidate production file is copied.
+
+## Artifact policy
+
+- `baseline/` contains immutable raw pre-feature CSV and metadata.
+- `candidate/` contains immutable raw candidate CSV and metadata.
+- `baseline.md` and `candidate.md` summarize provenance and capture validity.
+- `final.md` pairs every cell, reports absolute values and ratios, and records
+  the inclusive threshold verdict.
+
+An incomplete matrix, invalid sample, harness mismatch, environment mismatch, or
+missing checksum invalidates a complete capture; it never counts as a pass.

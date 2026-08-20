@@ -1,0 +1,19 @@
+capture_id=baseline-2
+label=baseline
+commit=a7c8281f72e25c177a142be99285faead7335e01
+dirty_sha256=cb72a95fc5d3cf49d1d6c1af6cd9c1181d6581ba3535001fb4dfe77107f7979c
+harness_sha256=c8ca6c94e6f38d54e456462bce2e8fad0d3cffa2b2457f4c2818129b1c62006c
+rustc=rustc 1.97.1 (8bab26f4f 2026-07-14)
+cargo=cargo 1.97.1 (c980f4866 2026-06-30)
+target=x86_64-unknown-linux-gnu
+os=Linux 7.0.11-76070011-generic x86_64
+cpu=Intel(R) Core(TM) Ultra 7 155H
+filesystem=/dev/nvme0n1p4[/@projects/penpack-projects/pigment-db] btrfs  rw,nosuid,nodev,noatime,compress=zstd:3,ssd,discard=async,space_cache=v2,subvolid=258,subvol=/@projects
+affinity=12-19
+working_directory=/work/@projects/penpack-projects/pigment-db
+temporary_directory=/work/@projects/penpack-projects/pigment-db/target/compaction-benchmark-tmp
+payload_bytes=32
+warmups=5
+samples=11
+min_sample_duration_ms=100
+min_operations_per_sample=1024

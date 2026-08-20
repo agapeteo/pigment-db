@@ -16,3 +16,6 @@ member removals, multiple outer keys, and an empty value.
 Issue #5 pre-production durability baseline verification on 2026-08-07 confirmed
 the three SHA-256 values above before any durability production edit. These files
 remain immutable comparator inputs and were not regenerated.
+
+Feature 008 reverified the same three file-byte SHA-256 values on 2026-08-20
+before adding compaction or Windows durability production behavior.
