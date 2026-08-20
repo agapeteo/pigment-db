@@ -345,6 +345,76 @@ fn manifest_maps_every_public_mutation_family_exactly_once() {
     assert_unique_test_names(FAMILY_CASES.iter().map(|case| case.test));
 }
 
+#[test]
+fn every_public_mutation_family_reaches_a_shared_maintenance_core() {
+    for case in FAMILY_CASES {
+        let (source, core) = maintenance_core(case.store, case.family);
+        let region = method_region(source, core);
+        assert!(
+            region.contains("self.maintenance.shared()"),
+            "{} {} reaches {core}, but that acceptance core does not acquire shared maintenance",
+            case.store,
+            case.family,
+        );
+    }
+}
+
+fn maintenance_core(store: &str, family: &str) -> (&'static str, &'static str) {
+    let value = include_str!("../../src/key_value_store.rs");
+    let set = include_str!("../../src/key_set_store.rs");
+    let map = include_str!("../../src/key_map_store.rs");
+    match (store, family) {
+        ("key/value", "put") | ("key/value", "set_number") => (value, "try_put_core"),
+        ("key/value", "compute") => (value, "try_compute_core"),
+        ("key/value", "increment_or_init") => (value, "try_increment_or_init_core"),
+        ("key/value", "decrement") => (value, "try_decrement_core"),
+        ("key/value", "remove") => (value, "try_remove_core"),
+        ("key/set", "append") => (set, "try_append_core"),
+        ("key/set", "remove_from_set") => (set, "try_remove_from_set_core"),
+        ("key/set", "remove_from_set_callback") => (set, "try_remove_from_set_callback_core"),
+        ("key/set", "remove_key") => (set, "try_remove_key_core"),
+        ("key/set", "try_compute") | ("key/set", "compute") => (set, "try_compute"),
+        ("key/set", "try_compute_async") | ("key/set", "compute_async") => {
+            (set, "try_compute_async")
+        }
+        ("key/set", "try_compute_if_present") | ("key/set", "compute_if_present") => {
+            (set, "try_compute_if_present")
+        }
+        ("key/set", "try_compute_if_absent") | ("key/set", "compute_if_absent") => {
+            (set, "try_compute_if_absent")
+        }
+        ("key/sorted-map", "put") => (map, "try_put_core"),
+        ("key/sorted-map", "remove_from_sorted_map") => (map, "try_remove_from_sorted_map_core"),
+        ("key/sorted-map", "remove_from_sorted_map_callback") => {
+            (map, "try_remove_from_sorted_map_callback_core")
+        }
+        ("key/sorted-map", "remove_key") => (map, "try_remove_key_core"),
+        ("key/sorted-map", "pop_first") => (map, "try_pop_first_core"),
+        ("key/sorted-map", "pop_last") => (map, "try_pop_last_core"),
+        ("key/sorted-map", "append_ordered_element") => (map, "try_append_ordered_element_core"),
+        ("key/sorted-map", "try_compute") | ("key/sorted-map", "compute") => (map, "try_compute"),
+        ("key/sorted-map", "try_compute_if_present") | ("key/sorted-map", "compute_if_present") => {
+            (map, "try_compute_if_present")
+        }
+        ("key/sorted-map", "try_compute_if_absent") | ("key/sorted-map", "compute_if_absent") => {
+            (map, "try_compute_if_absent")
+        }
+        _ => panic!("missing maintenance traceability for {store} {family}"),
+    }
+}
+
+fn method_region<'a>(source: &'a str, method: &str) -> &'a str {
+    let needle = format!("fn {method}(");
+    let start = source
+        .find(&needle)
+        .unwrap_or_else(|| panic!("missing mutation core {method}"));
+    let tail = &source[start..];
+    let end = tail[1..]
+        .find("\n    pub ")
+        .map_or(tail.len(), |offset| offset + 1);
+    &tail[..end]
+}
+
 fn assert_unique_test_names<'a>(names: impl Iterator<Item = &'a str>) {
     let mut unique = HashSet::new();
     for name in names {

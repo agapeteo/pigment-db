@@ -7,6 +7,7 @@ use crate::key_map_store::DurableKeyMapStore;
 use crate::key_set_store::DurableKeySetStore;
 use crate::key_value_store::DurableKeyValueStore;
 use crate::maintenance_coordination::MaintenanceCoordinator;
+use crate::model::SearchKey;
 
 #[test]
 fn coordinator_is_constant_per_instance_exclusive_and_immediately_single_attempt() {
@@ -60,4 +61,142 @@ fn coordinator_is_constant_per_instance_exclusive_and_immediately_single_attempt
     assert!(key_map.maintenance_probe().try_begin_online().is_ok());
     drop(key_value_attempt);
     assert!(key_value.maintenance_probe().try_begin_online().is_ok());
+}
+
+#[test]
+fn reads_bypass_maintenance_and_post_publication_callbacks_hold_no_store_guard() {
+    let key_value = Arc::new(DurableKeyValueStore::new_vec_based());
+    key_value.put(b"value".to_vec(), 7_u64.to_ne_bytes().to_vec());
+    let key_set = Arc::new(DurableKeySetStore::new_vec_based());
+    key_set.append(b"set".to_vec(), b"member".to_vec());
+    let key_map = Arc::new(DurableKeyMapStore::new_vec_based());
+    key_map.put(b"map".to_vec(), SearchKey::from(1), b"element".to_vec());
+
+    let value_exclusive = key_value.maintenance_probe().exclusive();
+    let set_exclusive = key_set.maintenance_probe().exclusive();
+    let map_exclusive = key_map.maintenance_probe().exclusive();
+    let (read_tx, read_rx) = mpsc::channel();
+    let value_reader = Arc::clone(&key_value);
+    let value_tx = read_tx.clone();
+    let value_read = std::thread::spawn(move || {
+        assert_eq!(
+            value_reader.get(b"value"),
+            Some(7_u64.to_ne_bytes().to_vec())
+        );
+        assert_eq!(value_reader.read_number(b"value"), Some(Ok(7)));
+        assert!(value_reader.contains(b"value"));
+        assert_eq!(value_reader.size(), 1);
+        value_tx.send(()).unwrap();
+    });
+    let set_reader = Arc::clone(&key_set);
+    let set_tx = read_tx.clone();
+    let set_read = std::thread::spawn(move || {
+        assert!(set_reader.contains_key(b"set"));
+        assert!(set_reader.contains_in_set(b"set", b"member"));
+        assert!(set_reader.get_hashset(b"set").is_some());
+        assert_eq!(set_reader.size(), 1);
+        set_tx.send(()).unwrap();
+    });
+    let map_reader = Arc::clone(&key_map);
+    let map_read = std::thread::spawn(move || {
+        assert!(map_reader.contains_key(b"map"));
+        assert!(map_reader.contains_search_key(b"map", &SearchKey::from(1)));
+        assert!(map_reader.contains_in_map(b"map", &SearchKey::from(1)));
+        assert_eq!(
+            map_reader.get_element(b"map", &SearchKey::from(1)),
+            Some(b"element".to_vec())
+        );
+        assert!(map_reader.get_sorted_map(b"map").is_some());
+        assert_eq!(map_reader.first(b"map").unwrap().0, SearchKey::from(1));
+        assert_eq!(map_reader.last(b"map").unwrap().0, SearchKey::from(1));
+        assert_eq!(map_reader.sorted_map_size(b"map"), Some(1));
+        assert_eq!(map_reader.size(), 1);
+        read_tx.send(()).unwrap();
+    });
+    for _ in 0..3 {
+        read_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+    value_read.join().unwrap();
+    set_read.join().unwrap();
+    map_read.join().unwrap();
+    drop(map_exclusive);
+    drop(set_exclusive);
+    drop(value_exclusive);
+
+    assert_callback_releases_set_guards();
+    assert_callback_releases_map_guards();
+}
+
+fn assert_callback_releases_set_guards() {
+    let store = Arc::new(DurableKeySetStore::new_vec_based());
+    store.append(b"callback-set".to_vec(), b"member".to_vec());
+    let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+    let (release_tx, release_rx) = mpsc::sync_channel(0);
+    let callback_store = Arc::clone(&store);
+    let worker_store = Arc::clone(&store);
+    let worker = std::thread::spawn(move || {
+        worker_store.remove_from_set_callback(
+            b"callback-set".to_vec(),
+            b"member".to_vec(),
+            move |_| {
+                assert!(!callback_store.contains_key(b"callback-set"));
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            },
+        );
+    });
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let (exclusive_tx, exclusive_rx) = mpsc::sync_channel(0);
+    let exclusive_store = Arc::clone(&store);
+    let waiter = std::thread::spawn(move || {
+        let _exclusive = exclusive_store.maintenance_probe().exclusive();
+        exclusive_tx.send(()).unwrap();
+    });
+    let acquired_while_callback_paused = exclusive_rx.recv_timeout(Duration::from_millis(100));
+    release_tx.send(()).unwrap();
+    worker.join().unwrap();
+    if acquired_while_callback_paused.is_err() {
+        exclusive_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+    waiter.join().unwrap();
+    assert!(acquired_while_callback_paused.is_ok());
+}
+
+fn assert_callback_releases_map_guards() {
+    let store = Arc::new(DurableKeyMapStore::new_vec_based());
+    store.put(
+        b"callback-map".to_vec(),
+        SearchKey::from(1),
+        b"element".to_vec(),
+    );
+    let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+    let (release_tx, release_rx) = mpsc::sync_channel(0);
+    let callback_store = Arc::clone(&store);
+    let worker_store = Arc::clone(&store);
+    let worker = std::thread::spawn(move || {
+        worker_store.remove_from_sorted_map_callback(
+            b"callback-map".to_vec(),
+            SearchKey::from(1),
+            move |_| {
+                assert!(!callback_store.contains_key(b"callback-map"));
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            },
+        );
+    });
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let (exclusive_tx, exclusive_rx) = mpsc::sync_channel(0);
+    let exclusive_store = Arc::clone(&store);
+    let waiter = std::thread::spawn(move || {
+        let _exclusive = exclusive_store.maintenance_probe().exclusive();
+        exclusive_tx.send(()).unwrap();
+    });
+    let acquired_while_callback_paused = exclusive_rx.recv_timeout(Duration::from_millis(100));
+    release_tx.send(()).unwrap();
+    worker.join().unwrap();
+    if acquired_while_callback_paused.is_err() {
+        exclusive_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+    waiter.join().unwrap();
+    assert!(acquired_while_callback_paused.is_ok());
 }
