@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
-use super::format::{V1CodecProbe, V2CodecProbe};
+use super::format::{V1CodecProbe, V2CodecProbe, V2HeaderProbeFields, V2RecordProbeFields};
 use super::model::{
     crc, decode_current_sorted_map_entry, decode_current_sorted_map_key,
     decode_historical_sorted_map_entry, decode_historical_sorted_map_key, KeyValueData,
@@ -1198,6 +1198,38 @@ pub(crate) fn encode_key_value_snapshot(snapshot: &HashMap<Vec<u8>, Vec<u8>>) ->
         append_action(&mut bytes, &action);
     }
     bytes
+}
+
+pub(crate) fn encode_current_key_value_snapshot(
+    snapshot: &KeyValueSnapshot,
+) -> Result<Vec<u8>, ValidationError> {
+    let mut encoded = V2CodecProbe::encode_header(V2HeaderProbeFields {
+        kind: 1,
+        granularity_nanos: 60_000_000_000,
+        base_bucket: 0,
+        segment_id: 0,
+        segment_base: 0,
+    })
+    .to_vec();
+    let mut entries = snapshot.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(key, _)| *key);
+    for (key, value) in entries {
+        let offset = encoded.len();
+        let start =
+            u64::try_from(offset).map_err(|_| ValidationError::InvalidPayload { offset })?;
+        let payload = bincode::serialize(&KeyValueData::new(key.clone(), value.clone()))
+            .map_err(|_| ValidationError::InvalidPayload { offset })?;
+        encoded.extend_from_slice(&V2CodecProbe::encode_complete_record(V2RecordProbeFields {
+            action: PUT_ACT,
+            payload: &payload,
+            physical_start: start,
+            mutation_start: start,
+            index: 0,
+            count: 1,
+            timestamp_bucket: 0,
+        }));
+    }
+    Ok(encoded)
 }
 
 pub(crate) fn key_value_is_proper_snapshot_prefix(
