@@ -13,9 +13,104 @@ use crate::test_support::mutation_schedule::{MutationObserver, MutationPhase, WA
 use crate::test_support::shard_keys::select_shard_keys;
 use crate::wal::WalStorage;
 use dashmap::DashMap;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
+
+#[test]
+fn every_map_mutation_waits_for_maintenance_through_publication_and_result_delivery() {
+    let store = Arc::new(DurableKeyMapStore::new_vec_based());
+    for key in [
+        b"remove-entry".as_slice(),
+        b"callback-remove",
+        b"remove-key",
+        b"pop-first",
+        b"pop-last",
+        b"compute",
+        b"if-present",
+    ] {
+        store.put(key.to_vec(), SearchKey::from(1), b"seed".to_vec());
+    }
+    let exclusive = store.maintenance_probe().exclusive();
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let mut workers = Vec::new();
+
+    for (label, mutation) in [
+        ("put", 0_u8),
+        ("remove-entry", 1),
+        ("callback-remove", 2),
+        ("remove-key", 3),
+        ("pop-first", 4),
+        ("pop-last", 5),
+        ("append-ordered", 6),
+        ("compute", 7),
+        ("if-present", 8),
+        ("if-absent", 9),
+    ] {
+        let worker_store = Arc::clone(&store);
+        let worker_tx = completed_tx.clone();
+        workers.push(std::thread::spawn(move || {
+            match mutation {
+                0 => worker_store.put(b"put".to_vec(), SearchKey::from(1), b"value".to_vec()),
+                1 => {
+                    worker_store
+                        .remove_from_sorted_map(b"remove-entry".to_vec(), SearchKey::from(1));
+                }
+                2 => worker_store.remove_from_sorted_map_callback(
+                    b"callback-remove".to_vec(),
+                    SearchKey::from(1),
+                    |_| {},
+                ),
+                3 => worker_store.remove_key(b"remove-key"),
+                4 => {
+                    worker_store.pop_first(b"pop-first".to_vec());
+                }
+                5 => {
+                    worker_store.pop_last(b"pop-last".to_vec());
+                }
+                6 => worker_store
+                    .append_ordered_element(b"append-ordered".to_vec(), b"value".to_vec()),
+                7 => worker_store.compute(b"compute".to_vec(), |map| {
+                    map.insert(SearchKey::from(2), b"value".to_vec());
+                }),
+                8 => worker_store.compute_if_present(b"if-present".to_vec(), |map| {
+                    map.insert(SearchKey::from(2), b"value".to_vec());
+                }),
+                9 => worker_store.compute_if_absent(b"if-absent".to_vec(), |map| {
+                    map.insert(SearchKey::from(1), b"value".to_vec());
+                }),
+                _ => unreachable!(),
+            }
+            worker_tx.send(label).unwrap();
+        }));
+    }
+    drop(completed_tx);
+
+    assert!(completed_rx
+        .recv_timeout(std::time::Duration::from_millis(100))
+        .is_err());
+    drop(exclusive);
+    let completed = completed_rx.iter().collect::<HashSet<_>>();
+    assert_eq!(
+        completed,
+        HashSet::from([
+            "put",
+            "remove-entry",
+            "callback-remove",
+            "remove-key",
+            "pop-first",
+            "pop-last",
+            "append-ordered",
+            "compute",
+            "if-present",
+            "if-absent",
+        ])
+    );
+    for worker in workers {
+        worker.join().unwrap();
+    }
+}
 
 /// CMO-CROSS-1/3/4: map mutations retain only their selected data-map shard.
 #[test]

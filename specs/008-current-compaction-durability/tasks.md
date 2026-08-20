@@ -186,8 +186,8 @@
 - [X] T093 [US3] Prefix all key/value fallible mutation cores with the shared gate and release it before callbacks in `src/key_value_store.rs`, then run T092 GREEN and key/value compatibility tests
 - [X] T094 [US3] Write and run a runtime RED proving key/set ordinary and compute acceptance follows the lock order while async user work/cancellation occurs outside maintenance coordination in `src/mutation_ordering_tests/key_set.rs`
 - [X] T095 [US3] Integrate shared maintenance across key/set mutation cores and post-await conflict acceptance without holding it across user futures in `src/key_set_store.rs`, then run T094 GREEN and async conflict tests
-- [ ] T096 [US3] Write and run a runtime RED proving key/map ordinary, ordered, pop, removal, callback, and compute paths follow the lock order through publication in `src/mutation_ordering_tests/key_map.rs`
-- [ ] T097 [US3] Integrate shared maintenance across every key/map mutation core and release before callback/result delivery in `src/key_map_store.rs`, then run T096 GREEN
+- [X] T096 [US3] Write and run a runtime RED proving key/map ordinary, ordered, pop, removal, callback, and compute paths follow the lock order through publication in `src/mutation_ordering_tests/key_map.rs`
+- [X] T097 [US3] Integrate shared maintenance across every key/map mutation core and release before callback/result delivery in `src/key_map_store.rs`, then run T096 GREEN
 - [ ] T098 [US3] Write and run a runtime RED proving all normal reads bypass maintenance and reentrant callbacks execute after maintenance/shard guards drop in `src/compaction/online_tests.rs`
 - [ ] T099 [US3] Narrow guard scopes and preserve direct DashMap reads/callback reentrancy in `src/key_value_store.rs`, `src/key_set_store.rs`, and `src/key_map_store.rs`, then run T098 GREEN
 - [ ] T100 [US3] Extend the executable mutator traceability test to RED on every missing maintenance-participation path in `tests/mutation_ordering/traceability.rs`

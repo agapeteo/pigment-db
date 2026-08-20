@@ -330,6 +330,7 @@ impl<W: Write> DurableKeyMapStore<W> {
         search_key: SearchKey,
         val: Vec<u8>,
     ) -> std::io::Result<()> {
+        let _maintenance = self.maintenance.shared();
         if let Some(mut entry) = self.store.get_mut(&key) {
             #[cfg(test)]
             self.mutation_observer
@@ -416,6 +417,7 @@ impl<W: Write> DurableKeyMapStore<W> {
         key: Vec<u8>,
         search_key: SearchKey,
     ) -> std::io::Result<Option<Vec<u8>>> {
+        let _maintenance = self.maintenance.shared();
         if let Some(mut entry) = self.store.get_mut(&key) {
             let removes_final_entry = entry.len() == 1 && entry.contains_key(&search_key);
             if !removes_final_entry {
@@ -513,48 +515,52 @@ impl<W: Write> DurableKeyMapStore<W> {
     ) -> std::io::Result<()> {
         #[cfg(test)]
         let observed_key = key.clone();
-        let removed_outer_key = match self.store.entry(key) {
-            Entry::Occupied(mut entry) => {
-                #[cfg(test)]
-                self.mutation_observer
-                    .notify(entry.key(), MutationPhase::AcceptanceEntered);
-                let removes_final_entry =
-                    entry.get().len() == 1 && entry.get().contains_key(&search_key);
-                if removes_final_entry {
-                    self.wal.try_store_delete_event(entry.key())?;
-                } else {
+        let removed_outer_key = {
+            let _maintenance = self.maintenance.shared();
+            let removed_outer_key = match self.store.entry(key) {
+                Entry::Occupied(mut entry) => {
+                    #[cfg(test)]
+                    self.mutation_observer
+                        .notify(entry.key(), MutationPhase::AcceptanceEntered);
+                    let removes_final_entry =
+                        entry.get().len() == 1 && entry.get().contains_key(&search_key);
+                    if removes_final_entry {
+                        self.wal.try_store_delete_event(entry.key())?;
+                    } else {
+                        self.wal.try_store_remove_from_sorted_map_event(
+                            entry.key().clone(),
+                            search_key.clone(),
+                        )?;
+                    }
+                    #[cfg(test)]
+                    self.mutation_observer
+                        .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
+                    if removes_final_entry {
+                        entry.remove();
+                    } else {
+                        entry.get_mut().remove(&search_key);
+                    }
+                    removes_final_entry
+                }
+                Entry::Vacant(entry) => {
+                    #[cfg(test)]
+                    self.mutation_observer
+                        .notify(entry.key(), MutationPhase::AcceptanceEntered);
                     self.wal.try_store_remove_from_sorted_map_event(
                         entry.key().clone(),
                         search_key.clone(),
                     )?;
+                    #[cfg(test)]
+                    self.mutation_observer
+                        .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
+                    false
                 }
-                #[cfg(test)]
-                self.mutation_observer
-                    .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
-                if removes_final_entry {
-                    entry.remove();
-                } else {
-                    entry.get_mut().remove(&search_key);
-                }
-                removes_final_entry
-            }
-            Entry::Vacant(entry) => {
-                #[cfg(test)]
-                self.mutation_observer
-                    .notify(entry.key(), MutationPhase::AcceptanceEntered);
-                self.wal.try_store_remove_from_sorted_map_event(
-                    entry.key().clone(),
-                    search_key.clone(),
-                )?;
-                #[cfg(test)]
-                self.mutation_observer
-                    .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
-                false
-            }
+            };
+            #[cfg(test)]
+            self.mutation_observer
+                .notify(&observed_key, MutationPhase::Published);
+            removed_outer_key
         };
-        #[cfg(test)]
-        self.mutation_observer
-            .notify(&observed_key, MutationPhase::Published);
         if removed_outer_key {
             key_removed_callback(&search_key);
         }
@@ -572,6 +578,7 @@ impl<W: Write> DurableKeyMapStore<W> {
     }
 
     pub(crate) fn try_remove_key_core(&self, key: &[u8]) -> std::io::Result<()> {
+        let _maintenance = self.maintenance.shared();
         match self.store.entry(key.to_vec()) {
             Entry::Occupied(entry) => {
                 #[cfg(test)]
@@ -712,6 +719,7 @@ impl<W: Write> DurableKeyMapStore<W> {
         &self,
         key: Vec<u8>,
     ) -> std::io::Result<Option<(SearchKey, Vec<u8>)>> {
+        let _maintenance = self.maintenance.shared();
         match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
                 let Some(search_key) = entry.get().first_key_value().map(|(key, _)| key.clone())
@@ -774,6 +782,7 @@ impl<W: Write> DurableKeyMapStore<W> {
         &self,
         key: Vec<u8>,
     ) -> std::io::Result<Option<(SearchKey, Vec<u8>)>> {
+        let _maintenance = self.maintenance.shared();
         match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
                 let Some(search_key) = entry.get().last_key_value().map(|(key, _)| key.clone())
@@ -846,6 +855,7 @@ impl<W: Write> DurableKeyMapStore<W> {
         key: Vec<u8>,
         element: Vec<u8>,
     ) -> std::io::Result<()> {
+        let _maintenance = self.maintenance.shared();
         match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
                 let cur_num = {
@@ -919,6 +929,7 @@ impl<W: Write> DurableKeyMapStore<W> {
         key: Vec<u8>,
         func: impl FnOnce(&mut BTreeMap<SearchKey, Vec<u8>>),
     ) -> std::io::Result<()> {
+        let _maintenance = self.maintenance.shared();
         match self.store.entry(key.clone()) {
             Entry::Occupied(mut occupied_entry) => {
                 let original = occupied_entry.get().clone();
@@ -1023,6 +1034,7 @@ impl<W: Write> DurableKeyMapStore<W> {
         key: Vec<u8>,
         func: impl FnOnce(&mut BTreeMap<SearchKey, Vec<u8>>),
     ) -> std::io::Result<()> {
+        let _maintenance = self.maintenance.shared();
         match self.store.entry(key.clone()) {
             Entry::Occupied(mut occupied_entry) => {
                 let original = occupied_entry.get().clone();
@@ -1086,6 +1098,7 @@ impl<W: Write> DurableKeyMapStore<W> {
         key: Vec<u8>,
         func: impl FnOnce(&mut BTreeMap<SearchKey, Vec<u8>>),
     ) -> std::io::Result<()> {
+        let _maintenance = self.maintenance.shared();
         match self.store.entry(key.clone()) {
             Entry::Occupied(_) => Ok(()),
             Entry::Vacant(vacant_entry) => {
