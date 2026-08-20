@@ -118,8 +118,8 @@
 
 ### Manifest codec and atomic phase publication
 
-- [ ] T053 [US2] Write and run a runtime RED for manifest roundtrip, magic/version/body bounds, CRC32 corruption, every scope/phase/policy, and proof no application payload is encoded in `src/compaction/manifest.rs`
-- [ ] T054 [US2] Implement the bounded custom-binary manifest envelope and private entities in `src/compaction/manifest.rs`, then run T053 GREEN
+- [X] T053 [US2] Write and run a runtime RED for manifest roundtrip, magic/version/body bounds, CRC32 corruption, every scope/phase/policy, and proof no application payload is encoded in `src/compaction/manifest.rs`
+- [X] T054 [US2] Implement the bounded custom-binary manifest envelope and private entities in `src/compaction/manifest.rs`, then run T053 GREEN
 - [ ] T055 [US2] Write and run a runtime RED rejecting absolute/parent/alias/duplicate paths, excessive counts/lengths, unknown enum values, and descriptor escape in `src/compaction/manifest.rs`
 - [ ] T056 [US2] Implement native relative-path validation, allocation limits, descriptor uniqueness, and exact checksum verification in `src/compaction/manifest.rs`, then run T055 GREEN and T053
 - [ ] T057 [US2] Write and run a runtime RED for buffered atomic `.manifest.next` write/flush/rename, main-manifest precedence, failed temp publication, and no phase advance in `src/compaction/manifest.rs`
