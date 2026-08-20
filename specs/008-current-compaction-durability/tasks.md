@@ -165,7 +165,7 @@
 ### Public US2 promotion and checkpoint
 
 - [X] T087 [US2] Promote `compact_directory_in_place`, buffered-default/physical-builder closed options, directory/family outcomes, operation-specific I/O paths, and cleanup status over GREEN private behavior in `src/maintenance.rs` and `src/lib.rs`, with first public executions GREEN in `tests/closed_compaction/contract.rs`
-- [ ] T088 [US2] Add public all-family, active-only, segmented, safe-tail, mixed-directory, repeated-compaction, cleanup-retry, exact timestamp, and three-reopen acceptance coverage under buffered and supported physical policies in `tests/closed_compaction/{key_value,key_set,key_map,contract}.rs`
+- [X] T088 [US2] Add public all-family, active-only, segmented, safe-tail, mixed-directory, repeated-compaction, cleanup-retry, exact timestamp, and three-reopen acceptance coverage under buffered and supported physical policies in `tests/closed_compaction/{key_value,key_set,key_map,contract}.rs`
 - [ ] T089 [US2] Run the complete US2, crash/reopen, existing recovery, migration, buffered/physical model, and same-process ownership suites and record SC-002/SC-003 GREEN evidence in `specs/008-current-compaction-durability/quickstart.md`
 
 **Checkpoint**: Closed compaction and interruption recovery are independently production-ready.

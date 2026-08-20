@@ -22,51 +22,49 @@ use crate::wal::replay::{
 use crate::{CompactionError, CompactionOperation, RecoveryError, RecoveryOperation, StoreFamily};
 
 pub(crate) fn resolve_directory_maintenance(store_dir: &Path) -> Result<bool, RecoveryError> {
-    let paths = directory_artifact_paths(store_dir).map_err(|source| RecoveryError::Io {
-        operation: RecoveryOperation::Inspect,
+    resolve_directory_maintenance_for_compaction(store_dir)
+        .map_err(|error| map_compaction_recovery_error(store_dir, error))
+}
+
+pub(crate) fn resolve_directory_maintenance_for_compaction(
+    store_dir: &Path,
+) -> Result<bool, CompactionError> {
+    let paths = directory_artifact_paths(store_dir).map_err(|source| CompactionError::Io {
+        operation: CompactionOperation::Inspect,
         path: store_dir.to_path_buf(),
         source,
     })?;
     let mut manifest = match read_published_manifest(&paths) {
         Ok(Some(manifest)) => manifest,
         Ok(None) => {
-            return classify_untrusted_closed_authority(store_dir, &paths)
-                .map(|()| false)
-                .map_err(|error| map_compaction_recovery_error(store_dir, error));
+            return classify_untrusted_closed_authority(store_dir, &paths).map(|()| false);
         }
         Err(_) => {
-            return classify_untrusted_closed_authority(store_dir, &paths)
-                .map(|()| false)
-                .map_err(|error| map_compaction_recovery_error(store_dir, error));
+            return classify_untrusted_closed_authority(store_dir, &paths).map(|()| false);
         }
     };
-    remove_unpublished_manifest_temp(&paths)
-        .map_err(|error| map_compaction_recovery_error(store_dir, error))?;
-    validate_directory_manifest_binding(store_dir, &paths, &manifest)
-        .map_err(|error| map_compaction_recovery_error(store_dir, error))?;
+    remove_unpublished_manifest_temp(&paths)?;
+    validate_directory_manifest_binding(store_dir, &paths, &manifest)?;
 
     loop {
         match manifest.phase {
             ManifestPhase::Prepared => {
                 recover_prepared_closed(store_dir, &paths, &manifest)
-                    .and_then(|()| finish_prepared_abort(store_dir, &paths, &manifest))
-                    .map_err(|error| map_compaction_recovery_error(store_dir, error))?;
+                    .and_then(|()| finish_prepared_abort(store_dir, &paths, &manifest))?;
                 return Ok(true);
             }
             ManifestPhase::PreviousPublished => {
-                let authority = recover_previous_published_closed(store_dir, &paths, &mut manifest)
-                    .map_err(|error| map_compaction_recovery_error(store_dir, error))?;
+                let authority =
+                    recover_previous_published_closed(store_dir, &paths, &mut manifest)?;
                 if authority == RecoveredAuthority::Previous {
                     return Ok(true);
                 }
             }
             ManifestPhase::ReplacementPublished => {
-                recover_replacement_published_closed(store_dir, &paths, &mut manifest)
-                    .map_err(|error| map_compaction_recovery_error(store_dir, error))?;
+                recover_replacement_published_closed(store_dir, &paths, &mut manifest)?;
             }
             ManifestPhase::CleanupPending => {
-                let _ = recover_cleanup_pending_closed(store_dir, &paths, &manifest)
-                    .map_err(|error| map_compaction_recovery_error(store_dir, error))?;
+                let _ = recover_cleanup_pending_closed(store_dir, &paths, &manifest)?;
                 return Ok(true);
             }
         }

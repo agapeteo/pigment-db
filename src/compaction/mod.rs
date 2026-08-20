@@ -664,6 +664,7 @@ pub(crate) fn compact_closed_directory(
                 }
             }
         })?;
+    let _ = recovery::resolve_directory_maintenance_for_compaction(store_dir)?;
     let inspection = crate::inspect_storage(store_dir)?;
     if inspection.families().is_empty() {
         return Ok(DirectoryCompactionOutcome::empty());

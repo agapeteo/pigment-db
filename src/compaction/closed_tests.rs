@@ -336,3 +336,64 @@ fn final_source_inventory_rejects_same_length_byte_replacement_without_mutation(
     assert!(!prepared.paths.manifest.exists());
     assert!(!prepared.paths.previous.exists());
 }
+
+#[test]
+fn next_closed_compaction_retries_cleanup_pending_before_new_capture() {
+    let root = tempfile::tempdir().unwrap();
+    let store_dir = root.path().join("store");
+    std::fs::create_dir(&store_dir).unwrap();
+    create_segmented_v2(&store_dir, FixtureFamily::KeyValue);
+    let prepared =
+        super::prepare_closed_staging(&store_dir, crate::ClosedCompactionOptions::default())
+            .unwrap();
+    let mut manifest = crate::compaction::publication::publish_closed_prepared(
+        &prepared,
+        crate::DurabilityPolicy::Buffered,
+    )
+    .unwrap();
+    crate::compaction::publication::publish_closed_previous_with_checkpoint(
+        &prepared,
+        &mut manifest,
+        |_| Ok(()),
+    )
+    .unwrap();
+    crate::compaction::publication::publish_closed_replacement_with_checkpoint(
+        &prepared,
+        &mut manifest,
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        crate::compaction::publication::cleanup_closed_with_checkpoint(
+            &prepared,
+            &mut manifest,
+            |stage| {
+                if stage
+                    == crate::compaction::publication::ClosedCleanupStage::CleanupPendingPublished
+                {
+                    Err(std::io::Error::other("injected cleanup deferral"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap(),
+        crate::CleanupStatus::Pending
+    );
+    assert!(prepared.paths.previous.exists());
+    assert!(prepared.paths.manifest.exists());
+
+    let outcome = crate::maintenance::compact_directory_in_place_internal(
+        &store_dir,
+        crate::ClosedCompactionOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome.families()[0].cleanup(),
+        crate::CleanupStatus::Complete
+    );
+    assert!(!prepared.paths.previous.exists());
+    assert!(!prepared.paths.manifest.exists());
+    assert_three_reopens(&store_dir, FixtureFamily::KeyValue);
+}
