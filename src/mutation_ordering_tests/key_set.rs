@@ -205,6 +205,7 @@ fn different_shard_prepares_but_waits_for_busy_wal() {
         wal: WalStorage::new_with_rollback(writer, rollback_blocking),
         file_backing: None,
         _open_lease: None,
+        maintenance: crate::maintenance_coordination::MaintenanceCoordinator::default(),
         mutation_observer: MutationObserver::default(),
     };
     let keys = select_shard_keys(&store.store);
@@ -309,6 +310,7 @@ fn rejected_final_member_removal_preserves_state_and_allows_progress() {
             wal: WalStorage::new_with_rollback(writer, rollback_scripted),
             file_backing: None,
             _open_lease: None,
+            maintenance: crate::maintenance_coordination::MaintenanceCoordinator::default(),
             mutation_observer: MutationObserver::default(),
         };
         let key = b"key".to_vec();

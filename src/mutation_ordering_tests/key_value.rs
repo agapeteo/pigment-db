@@ -12,8 +12,100 @@ use crate::test_support::mutation_schedule::{MutationObserver, MutationPhase, WA
 use crate::test_support::shard_keys::select_shard_keys;
 use crate::wal::WalStorage;
 use dashmap::DashMap;
+use std::collections::HashSet;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
+
+#[test]
+fn every_mutation_waits_for_maintenance_and_holds_it_through_publication() {
+    let store = Arc::new(DurableKeyValueStore::new_vec_based());
+    store.put(b"number".to_vec(), 10_u64.to_ne_bytes().to_vec());
+    store.put(b"removed".to_vec(), b"before".to_vec());
+    let exclusive = store.maintenance_probe().exclusive();
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let mut workers = Vec::new();
+
+    for (label, mutation) in [
+        ("put", 0_u8),
+        ("compute", 1),
+        ("increment", 2),
+        ("decrement", 3),
+        ("set-number", 4),
+        ("remove", 5),
+    ] {
+        let worker_store = Arc::clone(&store);
+        let worker_tx = completed_tx.clone();
+        workers.push(std::thread::spawn(move || {
+            match mutation {
+                0 => worker_store.put(b"put".to_vec(), b"value".to_vec()),
+                1 => worker_store.compute(b"compute".to_vec(), |_| b"value".to_vec()),
+                2 => {
+                    worker_store
+                        .increment_or_init(b"increment".to_vec(), 1)
+                        .unwrap();
+                }
+                3 => {
+                    worker_store
+                        .decrement(b"number".to_vec(), 1)
+                        .unwrap()
+                        .unwrap();
+                }
+                4 => worker_store.set_number(b"set-number".to_vec(), 42),
+                5 => worker_store.remove(b"removed"),
+                _ => unreachable!(),
+            }
+            worker_tx.send(label).unwrap();
+        }));
+    }
+    drop(completed_tx);
+
+    assert!(completed_rx
+        .recv_timeout(std::time::Duration::from_millis(100))
+        .is_err());
+    drop(exclusive);
+    let completed = completed_rx.iter().collect::<HashSet<_>>();
+    assert_eq!(
+        completed,
+        HashSet::from([
+            "put",
+            "compute",
+            "increment",
+            "decrement",
+            "set-number",
+            "remove",
+        ])
+    );
+    for worker in workers {
+        worker.join().unwrap();
+    }
+
+    let mut publication_store = DurableKeyValueStore::new_vec_based();
+    let key = b"publication".to_vec();
+    let (observer, publication_gate) =
+        MutationObserver::one_shot(key.clone(), MutationPhase::Published);
+    publication_store.mutation_observer = observer;
+    let publication_store = Arc::new(publication_store);
+    let mutating_store = Arc::clone(&publication_store);
+    let mutating_key = key.clone();
+    let mutation =
+        std::thread::spawn(move || mutating_store.put(mutating_key, b"published".to_vec()));
+    publication_gate.wait_until_reached();
+
+    let (exclusive_tx, exclusive_rx) = mpsc::sync_channel(0);
+    let exclusive_store = Arc::clone(&publication_store);
+    let waiter = std::thread::spawn(move || {
+        let _exclusive = exclusive_store.maintenance_probe().exclusive();
+        exclusive_tx.send(()).unwrap();
+    });
+    assert!(exclusive_rx
+        .recv_timeout(std::time::Duration::from_millis(100))
+        .is_err());
+    publication_gate.release();
+    mutation.join().unwrap();
+    exclusive_rx.recv_timeout(WATCHDOG).unwrap();
+    waiter.join().unwrap();
+    assert_eq!(publication_store.get(&key), Some(b"published".to_vec()));
+}
 
 /// CMO-CROSS-1/3/4: only the occupied DashMap shard is held across a mutation.
 #[test]
@@ -96,6 +188,7 @@ fn different_shard_prepares_but_waits_for_busy_wal() {
         wal: WalStorage::new_with_rollback(writer, rollback_blocking),
         file_backing: None,
         _open_lease: None,
+        maintenance: crate::maintenance_coordination::MaintenanceCoordinator::default(),
         mutation_observer: MutationObserver::default(),
     };
     let keys = select_shard_keys(&store.store);
@@ -198,6 +291,7 @@ fn rejected_put_and_remove_preserve_state_and_allow_progress() {
             wal: WalStorage::new_with_rollback(writer, rollback_scripted),
             file_backing: None,
             _open_lease: None,
+            maintenance: crate::maintenance_coordination::MaintenanceCoordinator::default(),
             mutation_observer: MutationObserver::default(),
         };
         let key = b"key".to_vec();

@@ -180,10 +180,10 @@
 
 ### Per-store coordination and mutation participation
 
-- [ ] T090 [US3] Write and run a runtime RED for one constant-size per-store gate, one attempt flag, immediate same-instance exclusion, and unrelated-instance/family independence in `src/compaction/online_tests.rs`
-- [ ] T091 [US3] Implement `MaintenanceCoordinator`, attempt token, poison recovery, and generic store runtime fields without a directory/global mutation gate in `src/maintenance_coordination.rs`, `src/key_value_store.rs`, `src/key_set_store.rs`, and `src/key_map_store.rs`, then run T090 GREEN
-- [ ] T092 [US3] Write and run a runtime RED proving every key/value mutation acquires `Maintenance -> Shard -> WAL` and retains shared maintenance through live publication in `src/mutation_ordering_tests/key_value.rs`
-- [ ] T093 [US3] Prefix all key/value fallible mutation cores with the shared gate and release it before callbacks in `src/key_value_store.rs`, then run T092 GREEN and key/value compatibility tests
+- [X] T090 [US3] Write and run a runtime RED for one constant-size per-store gate, one attempt flag, immediate same-instance exclusion, and unrelated-instance/family independence in `src/compaction/online_tests.rs`
+- [X] T091 [US3] Implement `MaintenanceCoordinator`, attempt token, poison recovery, and generic store runtime fields without a directory/global mutation gate in `src/maintenance_coordination.rs`, `src/key_value_store.rs`, `src/key_set_store.rs`, and `src/key_map_store.rs`, then run T090 GREEN
+- [X] T092 [US3] Write and run a runtime RED proving every key/value mutation acquires `Maintenance -> Shard -> WAL` and retains shared maintenance through live publication in `src/mutation_ordering_tests/key_value.rs`
+- [X] T093 [US3] Prefix all key/value fallible mutation cores with the shared gate and release it before callbacks in `src/key_value_store.rs`, then run T092 GREEN and key/value compatibility tests
 - [ ] T094 [US3] Write and run a runtime RED proving key/set ordinary and compute acceptance follows the lock order while async user work/cancellation occurs outside maintenance coordination in `src/mutation_ordering_tests/key_set.rs`
 - [ ] T095 [US3] Integrate shared maintenance across key/set mutation cores and post-await conflict acceptance without holding it across user futures in `src/key_set_store.rs`, then run T094 GREEN and async conflict tests
 - [ ] T096 [US3] Write and run a runtime RED proving key/map ordinary, ordered, pop, removal, callback, and compute paths follow the lock order through publication in `src/mutation_ordering_tests/key_map.rs`

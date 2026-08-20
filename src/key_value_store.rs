@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::maintenance_coordination::OpenDirectoryLease;
+use crate::maintenance_coordination::{MaintenanceCoordinator, OpenDirectoryLease};
 use crate::wal::format::V1CodecProbe;
 use crate::wal::recovery::{
     encode_key_value_repair_snapshot, initialize_snapshot_with_policy, ArtifactPaths, StoreKind,
@@ -33,6 +33,7 @@ pub struct DurableKeyValueStore<W: Write> {
     wal: WalStorage<W>,
     file_backing: Option<PathBuf>,
     _open_lease: Option<OpenDirectoryLease>,
+    maintenance: MaintenanceCoordinator,
     #[cfg(test)]
     mutation_observer: MutationObserver,
 }
@@ -167,6 +168,7 @@ impl DurableKeyValueStore<File> {
                 wal: initialized.wal,
                 file_backing: Some(file_backing),
                 _open_lease: Some(open_lease),
+                maintenance: MaintenanceCoordinator::default(),
                 #[cfg(test)]
                 mutation_observer: MutationObserver::default(),
             },
@@ -204,6 +206,7 @@ impl DurableKeyValueStore<Vec<u8>> {
             wal: WalStorage::new_vec_based(),
             file_backing: None,
             _open_lease: None,
+            maintenance: MaintenanceCoordinator::default(),
             #[cfg(test)]
             mutation_observer: MutationObserver::default(),
         }
@@ -229,6 +232,7 @@ impl DurableKeyValueStore<Vec<u8>> {
             wal: WalStorage::new_vec_based_v1(&header),
             file_backing: None,
             _open_lease: None,
+            maintenance: MaintenanceCoordinator::default(),
             #[cfg(test)]
             mutation_observer: MutationObserver::default(),
         })
@@ -244,6 +248,11 @@ impl<W: Write> DurableKeyValueStore<W> {
 
 impl<W: Write> DurableKeyValueStore<W> {
     #[cfg(test)]
+    pub(crate) fn maintenance_probe(&self) -> &MaintenanceCoordinator {
+        &self.maintenance
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_probe_parts(
         initial: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
         wal: WalStorage<W>,
@@ -254,6 +263,7 @@ impl<W: Write> DurableKeyValueStore<W> {
             wal,
             file_backing: None,
             _open_lease: None,
+            maintenance: MaintenanceCoordinator::default(),
             mutation_observer,
         }
     }
@@ -293,6 +303,7 @@ impl<W: Write> DurableKeyValueStore<W> {
     }
 
     pub(crate) fn try_put_core(&self, key: Vec<u8>, val: Vec<u8>) -> std::io::Result<()> {
+        let _maintenance = self.maintenance.shared();
         if let Some(mut entry) = self.store.get_mut(&key) {
             #[cfg(test)]
             self.mutation_observer
@@ -359,6 +370,7 @@ impl<W: Write> DurableKeyValueStore<W> {
         key: Vec<u8>,
         func: impl FnOnce(Option<&[u8]>) -> Vec<u8>,
     ) -> std::io::Result<()> {
+        let _maintenance = self.maintenance.shared();
         match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
                 let new_val = func(Some(entry.get().as_slice()));
@@ -400,6 +412,7 @@ impl<W: Write> DurableKeyValueStore<W> {
         key: Vec<u8>,
         increment_by: u64,
     ) -> std::io::Result<Result<u64, ()>> {
+        let _maintenance = self.maintenance.shared();
         match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
                 let entry_bytes = entry.get().as_slice();
@@ -452,6 +465,7 @@ impl<W: Write> DurableKeyValueStore<W> {
         key: Vec<u8>,
         decrement_by: u64,
     ) -> std::io::Result<Option<Result<u64, ()>>> {
+        let _maintenance = self.maintenance.shared();
         match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
                 let entry_bytes = entry.get().as_slice();
@@ -518,6 +532,7 @@ impl<W: Write> DurableKeyValueStore<W> {
     }
 
     pub(crate) fn try_remove_core(&self, key: &[u8]) -> std::io::Result<()> {
+        let _maintenance = self.maintenance.shared();
         let entry = self.store.entry(key.to_vec());
         #[cfg(test)]
         self.mutation_observer

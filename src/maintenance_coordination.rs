@@ -4,7 +4,73 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+#[derive(Debug)]
+pub(crate) struct MaintenanceCoordinator {
+    gate: RwLock<()>,
+    active_attempt: AtomicU64,
+    next_attempt: AtomicU64,
+}
+
+impl Default for MaintenanceCoordinator {
+    fn default() -> Self {
+        Self {
+            gate: RwLock::new(()),
+            active_attempt: AtomicU64::new(0),
+            next_attempt: AtomicU64::new(1),
+        }
+    }
+}
+
+impl MaintenanceCoordinator {
+    pub(crate) fn shared(&self) -> RwLockReadGuard<'_, ()> {
+        self.gate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn exclusive(&self) -> RwLockWriteGuard<'_, ()> {
+        self.gate
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn try_begin_online(&self) -> Result<OnlineAttemptToken<'_>, ()> {
+        let token = self.next_attempt.fetch_add(1, Ordering::Relaxed).max(1);
+        self.active_attempt
+            .compare_exchange(0, token, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| ())?;
+        Ok(OnlineAttemptToken {
+            coordinator: self,
+            token,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct OnlineAttemptToken<'a> {
+    coordinator: &'a MaintenanceCoordinator,
+    token: u64,
+}
+
+impl OnlineAttemptToken<'_> {
+    pub(crate) const fn id(&self) -> u64 {
+        self.token
+    }
+}
+
+impl Drop for OnlineAttemptToken<'_> {
+    fn drop(&mut self) {
+        let _ = self.coordinator.active_attempt.compare_exchange(
+            self.token,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+}
 
 #[derive(Default)]
 struct OwnershipState {

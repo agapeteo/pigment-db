@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use std::fs::File;
 
-use crate::maintenance_coordination::OpenDirectoryLease;
+use crate::maintenance_coordination::{MaintenanceCoordinator, OpenDirectoryLease};
 use crate::wal::format::V1CodecProbe;
 use crate::wal::recovery::{
     encode_key_set_repair_snapshot, initialize_snapshot_with_policy, ArtifactPaths, StoreKind,
@@ -38,6 +38,7 @@ pub struct DurableKeySetStore<W: Write> {
     wal: WalStorage<W>,
     file_backing: Option<PathBuf>,
     _open_lease: Option<OpenDirectoryLease>,
+    maintenance: MaintenanceCoordinator,
     #[cfg(test)]
     mutation_observer: MutationObserver,
 }
@@ -167,6 +168,7 @@ impl DurableKeySetStore<File> {
                 wal: initialized.wal,
                 file_backing: Some(file_backing),
                 _open_lease: Some(open_lease),
+                maintenance: MaintenanceCoordinator::default(),
                 #[cfg(test)]
                 mutation_observer: MutationObserver::default(),
             },
@@ -196,6 +198,7 @@ impl DurableKeySetStore<Vec<u8>> {
             wal: WalStorage::new_vec_based(),
             file_backing: None,
             _open_lease: None,
+            maintenance: crate::maintenance_coordination::MaintenanceCoordinator::default(),
             #[cfg(test)]
             mutation_observer: MutationObserver::default(),
         }
@@ -222,6 +225,7 @@ impl DurableKeySetStore<Vec<u8>> {
             wal: WalStorage::new_vec_based_v1(&header),
             file_backing: None,
             _open_lease: None,
+            maintenance: MaintenanceCoordinator::default(),
             #[cfg(test)]
             mutation_observer: MutationObserver::default(),
         })
@@ -237,6 +241,11 @@ impl DurableKeySetStore<Vec<u8>> {
 
 impl<W: Write> DurableKeySetStore<W> {
     #[cfg(test)]
+    pub(crate) fn maintenance_probe(&self) -> &MaintenanceCoordinator {
+        &self.maintenance
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_probe_parts(
         initial: impl IntoIterator<Item = (Vec<u8>, HashSet<Vec<u8>>)>,
         wal: WalStorage<W>,
@@ -247,6 +256,7 @@ impl<W: Write> DurableKeySetStore<W> {
             wal,
             file_backing: None,
             _open_lease: None,
+            maintenance: MaintenanceCoordinator::default(),
             mutation_observer,
         }
     }
@@ -889,6 +899,7 @@ mod tests {
             wal: WalStorage::new_with_rollback(writer, rollback),
             file_backing: None,
             _open_lease: None,
+            maintenance: crate::maintenance_coordination::MaintenanceCoordinator::default(),
             mutation_observer: MutationObserver::default(),
         };
         (store, state)
