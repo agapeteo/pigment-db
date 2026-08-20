@@ -736,3 +736,90 @@ fn untrusted_manifest_evidence_distinguishes_ambiguity_from_invalid_debris_witho
     ));
     assert_eq!(snapshot_directory(_root.path()).unwrap(), evidence);
 }
+
+#[test]
+fn every_file_initializer_resolves_maintenance_before_ordinary_wal_recovery() {
+    for family in [
+        FixtureFamily::KeyValue,
+        FixtureFamily::KeySet,
+        FixtureFamily::KeyMap,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let store_dir = root.path().join("store");
+        std::fs::create_dir(&store_dir).unwrap();
+        create_segmented_v2(&store_dir, family);
+        let prepared =
+            super::prepare_closed_staging(&store_dir, crate::ClosedCompactionOptions::default())
+                .unwrap();
+        let mut manifest =
+            publish_closed_prepared(&prepared, crate::DurabilityPolicy::Buffered).unwrap();
+        assert!(
+            publish_closed_previous_with_checkpoint(&prepared, &mut manifest, |stage| {
+                if stage == ClosedPreviousStage::SourceMoved {
+                    Err(std::io::Error::other("injected split Prepared"))
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err()
+        );
+
+        let status = match family {
+            FixtureFamily::KeyValue => {
+                let outcome =
+                    crate::key_value_store::DurableKeyValueStore::try_init_new(&store_dir).unwrap();
+                assert_eq!(outcome.store().get(b"alpha"), Some(b"one".to_vec()));
+                outcome.status()
+            }
+            FixtureFamily::KeySet => {
+                let outcome =
+                    crate::key_set_store::DurableKeySetStore::try_init_new(&store_dir).unwrap();
+                assert!(outcome
+                    .store()
+                    .get_hashset(b"group")
+                    .unwrap()
+                    .contains(b"red".as_slice()));
+                outcome.status()
+            }
+            FixtureFamily::KeyMap => {
+                let outcome =
+                    crate::key_map_store::DurableKeyMapStore::try_init_new(&store_dir).unwrap();
+                assert_eq!(
+                    outcome
+                        .store()
+                        .get_element(b"book", &crate::model::SearchKey::from(1)),
+                    Some(b"one".to_vec())
+                );
+                outcome.status()
+            }
+        };
+        assert_eq!(status, crate::RecoveryStatus::Recovered);
+        assert!(!prepared.paths.staging.exists());
+        assert!(!prepared.paths.previous.exists());
+        assert!(!prepared.paths.manifest.exists());
+    }
+
+    let (_root, store_dir, prepared) = prepared_fixture();
+    let mut manifest =
+        publish_closed_prepared(&prepared, crate::DurabilityPolicy::Buffered).unwrap();
+    assert!(
+        publish_closed_previous_with_checkpoint(&prepared, &mut manifest, |stage| {
+            if stage == ClosedPreviousStage::SourceMoved {
+                Err(std::io::Error::other("injected split Prepared"))
+            } else {
+                Ok(())
+            }
+        })
+        .is_err()
+    );
+    let previous_file = std::fs::read_dir(&prepared.paths.previous)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::write(previous_file, b"invalid old authority").unwrap();
+    let evidence = snapshot_directory(_root.path()).unwrap();
+    assert!(crate::key_value_store::DurableKeyValueStore::try_init_new(&store_dir).is_err());
+    assert_eq!(snapshot_directory(_root.path()).unwrap(), evidence);
+}

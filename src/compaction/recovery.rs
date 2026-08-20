@@ -13,12 +13,181 @@ use super::manifest::{
     ManifestScope,
 };
 use super::publication::{
-    publish_manifest_for_policy, read_published_manifest, MaintenanceArtifactPaths,
+    directory_artifact_paths, publish_manifest_for_policy, read_published_manifest,
+    MaintenanceArtifactPaths,
 };
 use crate::wal::replay::{
     classify_key_map_read_only, classify_key_set_read_only, classify_key_value_read_only,
 };
-use crate::{CompactionError, CompactionOperation, StoreFamily};
+use crate::{CompactionError, CompactionOperation, RecoveryError, RecoveryOperation, StoreFamily};
+
+pub(crate) fn resolve_directory_maintenance(store_dir: &Path) -> Result<bool, RecoveryError> {
+    let paths = directory_artifact_paths(store_dir).map_err(|source| RecoveryError::Io {
+        operation: RecoveryOperation::Inspect,
+        path: store_dir.to_path_buf(),
+        source,
+    })?;
+    let mut manifest = match read_published_manifest(&paths) {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => {
+            return classify_untrusted_closed_authority(store_dir, &paths)
+                .map(|()| false)
+                .map_err(|error| map_compaction_recovery_error(store_dir, error));
+        }
+        Err(_) => {
+            return classify_untrusted_closed_authority(store_dir, &paths)
+                .map(|()| false)
+                .map_err(|error| map_compaction_recovery_error(store_dir, error));
+        }
+    };
+    remove_unpublished_manifest_temp(&paths)
+        .map_err(|error| map_compaction_recovery_error(store_dir, error))?;
+    validate_directory_manifest_binding(store_dir, &paths, &manifest)
+        .map_err(|error| map_compaction_recovery_error(store_dir, error))?;
+
+    loop {
+        match manifest.phase {
+            ManifestPhase::Prepared => {
+                recover_prepared_closed(store_dir, &paths, &manifest)
+                    .and_then(|()| finish_prepared_abort(store_dir, &paths, &manifest))
+                    .map_err(|error| map_compaction_recovery_error(store_dir, error))?;
+                return Ok(true);
+            }
+            ManifestPhase::PreviousPublished => {
+                let authority = recover_previous_published_closed(store_dir, &paths, &mut manifest)
+                    .map_err(|error| map_compaction_recovery_error(store_dir, error))?;
+                if authority == RecoveredAuthority::Previous {
+                    return Ok(true);
+                }
+            }
+            ManifestPhase::ReplacementPublished => {
+                recover_replacement_published_closed(store_dir, &paths, &mut manifest)
+                    .map_err(|error| map_compaction_recovery_error(store_dir, error))?;
+            }
+            ManifestPhase::CleanupPending => {
+                let _ = recover_cleanup_pending_closed(store_dir, &paths, &manifest)
+                    .map_err(|error| map_compaction_recovery_error(store_dir, error))?;
+                return Ok(true);
+            }
+        }
+    }
+}
+
+fn remove_unpublished_manifest_temp(
+    paths: &MaintenanceArtifactPaths,
+) -> Result<(), CompactionError> {
+    let metadata = match fs::symlink_metadata(&paths.manifest_next) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(CompactionError::Io {
+                operation: CompactionOperation::Cleanup,
+                path: paths.manifest_next.clone(),
+                source,
+            });
+        }
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(CompactionError::InvalidArtifact {
+            path: paths.manifest_next.clone(),
+        });
+    }
+    fs::remove_file(&paths.manifest_next).map_err(|source| CompactionError::Io {
+        operation: CompactionOperation::Cleanup,
+        path: paths.manifest_next.clone(),
+        source,
+    })
+}
+
+fn validate_directory_manifest_binding(
+    store_dir: &Path,
+    paths: &MaintenanceArtifactPaths,
+    manifest: &CompactionManifest,
+) -> Result<(), CompactionError> {
+    let expected_staging = paths.staging.file_name().map(PathBuf::from);
+    let expected_previous = paths.previous.file_name().map(PathBuf::from);
+    let source_name = store_dir.file_name();
+    let paths_bound = expected_staging.as_ref() == Some(&manifest.staging_location)
+        && expected_previous.as_ref() == Some(&manifest.previous_location)
+        && manifest.source_inventory.iter().all(|descriptor| {
+            descriptor.relative_path.components().next().is_some_and(|component| {
+                matches!(component, std::path::Component::Normal(name) if Some(name) == source_name)
+            })
+        })
+        && manifest.replacement_inventory.iter().all(|descriptor| {
+            descriptor.relative_path.components().next().is_some_and(|component| {
+                matches!(component, std::path::Component::Normal(name) if Some(name) == paths.staging.file_name())
+            })
+        });
+    if manifest.mode != ManifestMode::ClosedDirectory
+        || manifest.scope != ManifestScope::Directory
+        || !manifest.source_finalized
+        || !paths_bound
+    {
+        return Err(CompactionError::InvalidArtifact {
+            path: paths.manifest.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn finish_prepared_abort(
+    store_dir: &Path,
+    paths: &MaintenanceArtifactPaths,
+    manifest: &CompactionManifest,
+) -> Result<(), CompactionError> {
+    if path_exists(&paths.staging)? {
+        if !generation_matches(&paths.staging, &manifest.replacement_inventory) {
+            return Err(authority_undetermined(store_dir, paths));
+        }
+        fs::remove_dir_all(&paths.staging).map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::Cleanup,
+            path: paths.staging.clone(),
+            source,
+        })?;
+    }
+    match fs::remove_file(&paths.manifest) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(CompactionError::Io {
+            operation: CompactionOperation::Cleanup,
+            path: paths.manifest.clone(),
+            source,
+        }),
+    }
+}
+
+fn map_compaction_recovery_error(store_dir: &Path, error: CompactionError) -> RecoveryError {
+    match error {
+        CompactionError::MigrationRequired { path } => RecoveryError::MigrationRequired { path },
+        CompactionError::InvalidArtifact { path } => RecoveryError::InvalidArtifact { path },
+        CompactionError::AuthorityUndetermined { paths } => RecoveryError::AuthorityUndetermined {
+            active_path: paths
+                .iter()
+                .find(|path| path.as_path() == store_dir)
+                .cloned(),
+            recovery_path: paths.into_iter().find(|path| path.as_path() != store_dir),
+        },
+        CompactionError::UnsupportedDurability { source } => {
+            RecoveryError::UnsupportedDurability { source }
+        }
+        CompactionError::Io { path, source, .. } => RecoveryError::Io {
+            operation: RecoveryOperation::Inspect,
+            path,
+            source,
+        },
+        CompactionError::FailedClosed { detail } => RecoveryError::Io {
+            operation: RecoveryOperation::Inspect,
+            path: store_dir.to_path_buf(),
+            source: io::Error::other(detail),
+        },
+        CompactionError::ConcurrentDeltaLimitExceeded { limit } => RecoveryError::Io {
+            operation: RecoveryOperation::Inspect,
+            path: store_dir.to_path_buf(),
+            source: io::Error::other(format!("unexpected recovery delta limit {limit}")),
+        },
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RecoveredAuthority {
@@ -50,6 +219,14 @@ pub(crate) fn classify_untrusted_closed_authority(
     } else {
         EvidenceState::Missing
     };
+
+    if staging == EvidenceState::Missing
+        && previous == EvidenceState::Missing
+        && manifest_state == EvidenceState::Missing
+        && manifest_next == EvidenceState::Missing
+    {
+        return Ok(());
+    }
 
     let complete_siblings = [(&paths.staging, staging), (&paths.previous, previous)]
         .into_iter()

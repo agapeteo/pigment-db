@@ -157,8 +157,8 @@
 - [X] T080 [US2] Implement exact/prefix cleanup recovery and manifest-last convergence in `src/compaction/recovery.rs`, then run T079 GREEN
 - [X] T081 [US2] Write and run a runtime RED classifying missing/corrupt/contradictory manifests as `AuthorityUndetermined` only when competing authority cannot be resolved and otherwise `InvalidArtifact` in `src/compaction/recovery_tests.rs`
 - [X] T082 [US2] Implement fail-closed manifestless evidence classification without mutation in `src/compaction/recovery.rs`, then run T081 GREEN
-- [ ] T083 [US2] Write and run a runtime RED proving all three file-store initializers resolve maintenance before ordinary WAL recovery and preserve evidence on failure in `tests/compaction_recovery/contract.rs`
-- [ ] T084 [US2] Invoke maintenance recovery before normal WAL recovery in `src/key_value_store.rs`, `src/key_set_store.rs`, `src/key_map_store.rs`, and `src/wal/recovery.rs`, then run T083 GREEN and existing recovery suites
+- [X] T083 [US2] Write and run a runtime RED proving all three file-store initializers resolve maintenance before ordinary WAL recovery and preserve evidence on failure in `tests/compaction_recovery/contract.rs`
+- [X] T084 [US2] Invoke maintenance recovery before normal WAL recovery in `src/key_value_store.rs`, `src/key_set_store.rs`, `src/key_map_store.rs`, and `src/wal/recovery.rs`, then run T083 GREEN and existing recovery suites
 - [ ] T085 [US2] Run the expected-GREEN private fault-model matrix for every staging create/write/sync/validate, manifest write/sync, previous/replacement move, reopen, phase rewrite, and cleanup cut across all families and modeled buffered/physical policies in `src/compaction/recovery_tests.rs`
 - [ ] T086 [US2] Run the expected-GREEN subprocess termination/reopen matrix at every T085 cut, asserting only public reopen state/errors and artifact snapshots in `tests/compaction_recovery/{phases,faults}.rs` via `src/test_support/fault_checkpoint.rs`; any newly exposed behavior gap must receive its own RED–GREEN pair before continuing
 

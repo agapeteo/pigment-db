@@ -115,6 +115,8 @@ impl DurableKeyValueStore<File> {
                     source,
                 }
             })?;
+        let maintenance_recovered =
+            crate::compaction::recovery::resolve_directory_maintenance(store_dir)?;
         let paths = ArtifactPaths::new(store_dir, StoreKind::Value);
         let durability_policy = options
             .map(DurableStoreOptions::durability_policy)
@@ -154,6 +156,11 @@ impl DurableKeyValueStore<File> {
                 path: paths.active.clone(),
                 source,
             })?;
+        let recovery_status = if maintenance_recovered {
+            RecoveryStatus::Recovered
+        } else {
+            initialized.status
+        };
         Ok(RecoveryOutcome::new(
             DurableKeyValueStore {
                 store,
@@ -163,7 +170,7 @@ impl DurableKeyValueStore<File> {
                 #[cfg(test)]
                 mutation_observer: MutationObserver::default(),
             },
-            initialized.status,
+            recovery_status,
         ))
     }
 
