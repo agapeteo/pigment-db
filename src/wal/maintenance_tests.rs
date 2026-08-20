@@ -24,7 +24,8 @@ use super::{
 };
 use crate::model::{Key, SearchKey};
 use crate::test_support::fault_writer::{
-    rollback_scripted, sync_data_scripted, BarrierKind, ScriptedWriter,
+    rollback_scripted, sync_all_scripted, sync_data_scripted, BarrierKind, ScriptedWriter,
+    ScriptedWriterHandle, WriterFault,
 };
 
 #[test]
@@ -282,6 +283,100 @@ fn accepted_compute_batches_are_atomic_delta_groups_with_one_timestamp() {
     )
     .unwrap();
     assert_eq!(recorder.used_bytes, exact_used);
+}
+
+#[test]
+fn rejected_and_noop_work_stays_out_of_delta_and_failed_closed_health_propagates() {
+    for fault in [
+        WriterFault::WriteCall(1),
+        WriterFault::FlushCall(1),
+        WriterFault::DataBarrierCall(1),
+    ] {
+        let (wal, _handle) = faulting_v2_wal(Some(fault), false);
+        wal.wal_state
+            .write()
+            .unwrap()
+            .activate_delta(301, u64::MAX)
+            .unwrap();
+        assert!(wal
+            .try_store_put_event(b"rejected".to_vec(), b"value".to_vec())
+            .is_err());
+        let rejected = wal.wal_state.write().unwrap().detach_delta(301).unwrap();
+        assert!(rejected.groups.is_empty());
+        assert!(rejected.wal_healthy);
+
+        wal.wal_state
+            .write()
+            .unwrap()
+            .activate_delta(302, u64::MAX)
+            .unwrap();
+        wal.try_store_put_event(b"accepted".to_vec(), b"value".to_vec())
+            .unwrap();
+        let accepted = wal.wal_state.write().unwrap().detach_delta(302).unwrap();
+        assert_eq!(accepted.groups.len(), 1);
+        assert!(accepted.wal_healthy);
+    }
+
+    let (failed_closed, handle) = faulting_v2_wal(Some(WriterFault::WriteCall(1)), true);
+    failed_closed
+        .wal_state
+        .write()
+        .unwrap()
+        .activate_delta(401, u64::MAX)
+        .unwrap();
+    assert!(failed_closed
+        .try_store_put_event(b"indeterminate".to_vec(), b"value".to_vec())
+        .is_err());
+    let events_after_failure = handle.events();
+    let recorder = failed_closed
+        .wal_state
+        .write()
+        .unwrap()
+        .detach_delta(401)
+        .unwrap();
+    assert!(recorder.groups.is_empty());
+    assert!(!recorder.wal_healthy);
+    assert!(failed_closed
+        .try_store_put_event(b"later".to_vec(), b"value".to_vec())
+        .is_err());
+    assert_eq!(handle.events(), events_after_failure);
+    assert!(failed_closed
+        .wal_state
+        .write()
+        .unwrap()
+        .activate_delta(402, u64::MAX)
+        .is_err());
+
+    let (noop, _handle) = faulting_v2_wal(None, false);
+    noop.wal_state
+        .write()
+        .unwrap()
+        .activate_delta(501, u64::MAX)
+        .unwrap();
+    noop.commit_set_compute_batch(Vec::new()).unwrap();
+    noop.commit_map_compute_batch(Vec::new()).unwrap();
+    let recorder = noop.wal_state.write().unwrap().detach_delta(501).unwrap();
+    assert!(recorder.groups.is_empty());
+    assert_eq!(recorder.used_bytes, 0);
+    assert!(recorder.wal_healthy);
+}
+
+fn faulting_v2_wal(
+    fault: Option<WriterFault>,
+    rollback_fails: bool,
+) -> (WalStorage<ScriptedWriter>, ScriptedWriterHandle) {
+    let header = V2CodecProbe::encode_header(super::format::V2HeaderProbeFields {
+        kind: 1,
+        granularity_nanos: 60_000_000_000,
+        base_bucket: 0,
+        segment_id: 0,
+        segment_base: 0,
+    });
+    let (writer, handle) =
+        ScriptedWriter::scripted_with_bytes(fault, rollback_fails, None, header.to_vec());
+    let wal = WalStorage::new_v2_with_physical_probe(writer, rollback_scripted, sync_data_scripted);
+    wal.install_rollback_barrier_probe(sync_all_scripted);
+    (wal, handle)
 }
 
 fn group_encoded_len(payload_lengths: &[usize]) -> u64 {

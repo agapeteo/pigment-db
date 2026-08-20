@@ -88,6 +88,7 @@ struct DeltaRecorder {
     used_bytes: u64,
     groups: Vec<RecordedMutation>,
     overflowed: bool,
+    wal_healthy: bool,
 }
 
 impl DeltaRecorder {
@@ -98,6 +99,7 @@ impl DeltaRecorder {
             used_bytes: 0,
             groups: Vec::new(),
             overflowed: false,
+            wal_healthy: true,
         }
     }
 
@@ -143,7 +145,7 @@ impl DeltaRecorder {
 
 impl<W: Write> WalState<W> {
     fn activate_delta(&mut self, token: u64, limit: u64) -> Result<(), ()> {
-        if self.delta_recorder.is_some() {
+        if self.delta_recorder.is_some() || !matches!(&self.health, WalHealth::Ready) {
             return Err(());
         }
         self.delta_recorder = Some(DeltaRecorder::new(token, limit));
@@ -158,7 +160,11 @@ impl<W: Write> WalState<W> {
         {
             return None;
         }
-        self.delta_recorder.take()
+        let wal_healthy = matches!(&self.health, WalHealth::Ready);
+        self.delta_recorder.take().map(|mut recorder| {
+            recorder.wal_healthy &= wal_healthy;
+            recorder
+        })
     }
 }
 
