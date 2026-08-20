@@ -6,8 +6,15 @@ use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::manifest::{decode_manifest, encode_manifest, CompactionManifest};
+use super::manifest::{
+    decode_manifest, encode_manifest, CompactionManifest, ManifestMode, ManifestPhase,
+    ManifestScope,
+};
+use super::{revalidate_closed_source_inventory, validate_closed_staging, PreparedClosedStaging};
+use crate::{CompactionError, CompactionOperation, DurabilityPolicy};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MaintenanceArtifactPaths {
@@ -23,6 +30,134 @@ pub(crate) enum ManifestPublishStage {
     Written,
     Flushed,
     Renamed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClosedPreviousStage {
+    SourceMoved,
+    PhasePublished,
+}
+
+pub(crate) fn publish_closed_prepared(
+    prepared: &PreparedClosedStaging,
+    durability: DurabilityPolicy,
+) -> Result<CompactionManifest, CompactionError> {
+    validate_closed_staging(prepared)?;
+    revalidate_closed_source_inventory(prepared)?;
+    let manifest = CompactionManifest {
+        operation_id: next_operation_id(),
+        mode: ManifestMode::ClosedDirectory,
+        scope: ManifestScope::Directory,
+        phase: ManifestPhase::Prepared,
+        source_finalized: true,
+        durability,
+        source_inventory: prepared.capture.inventory.clone(),
+        staging_location: native_leaf(&prepared.paths.staging)?,
+        previous_location: native_leaf(&prepared.paths.previous)?,
+        replacement_inventory: prepared.replacement_inventory.clone(),
+    };
+    publish_manifest_for_policy(&prepared.paths, &manifest, durability)?;
+    Ok(manifest)
+}
+
+pub(crate) fn publish_closed_previous_with_checkpoint(
+    prepared: &PreparedClosedStaging,
+    manifest: &mut CompactionManifest,
+    mut checkpoint: impl FnMut(ClosedPreviousStage) -> io::Result<()>,
+) -> Result<(), CompactionError> {
+    if manifest.phase != ManifestPhase::Prepared || !manifest.source_finalized {
+        return Err(CompactionError::FailedClosed {
+            detail: "old-to-previous publication requires finalized Prepared authority".to_owned(),
+        });
+    }
+    revalidate_closed_source_inventory(prepared)?;
+    match fs::symlink_metadata(&prepared.paths.previous) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(CompactionError::Io {
+                operation: CompactionOperation::PublishPrevious,
+                path: prepared.paths.previous.clone(),
+                source,
+            });
+        }
+        Ok(_) => {
+            return Err(CompactionError::Io {
+                operation: CompactionOperation::PublishPrevious,
+                path: prepared.paths.previous.clone(),
+                source: io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "previous generation path already exists",
+                ),
+            });
+        }
+    }
+    fs::rename(&prepared.capture.source_dir, &prepared.paths.previous).map_err(|source| {
+        CompactionError::Io {
+            operation: CompactionOperation::PublishPrevious,
+            path: prepared.paths.previous.clone(),
+            source,
+        }
+    })?;
+    checkpoint(ClosedPreviousStage::SourceMoved).map_err(|source| CompactionError::Io {
+        operation: CompactionOperation::PublishPrevious,
+        path: prepared.paths.previous.clone(),
+        source,
+    })?;
+    let mut next = manifest.clone();
+    next.phase = ManifestPhase::PreviousPublished;
+    publish_manifest_for_policy(&prepared.paths, &next, manifest.durability)?;
+    *manifest = next;
+    checkpoint(ClosedPreviousStage::PhasePublished).map_err(|source| CompactionError::Io {
+        operation: CompactionOperation::WriteManifest,
+        path: prepared.paths.manifest.clone(),
+        source,
+    })?;
+    Ok(())
+}
+
+static NEXT_OPERATION_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_operation_id() -> [u8; 16] {
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+        .unwrap_or_default();
+    let sequence = NEXT_OPERATION_ID.fetch_add(1, Ordering::Relaxed);
+    let mut id = [0_u8; 16];
+    id[..8].copy_from_slice(&time.to_le_bytes());
+    id[8..].copy_from_slice(&sequence.to_le_bytes());
+    id
+}
+
+fn native_leaf(path: &Path) -> Result<PathBuf, CompactionError> {
+    path.file_name()
+        .map(PathBuf::from)
+        .ok_or_else(|| CompactionError::Io {
+            operation: CompactionOperation::WriteManifest,
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "maintenance artifact has no native file name",
+            ),
+        })
+}
+
+fn publish_manifest_for_policy(
+    paths: &MaintenanceArtifactPaths,
+    manifest: &CompactionManifest,
+    durability: DurabilityPolicy,
+) -> Result<(), CompactionError> {
+    if durability == DurabilityPolicy::Physical {
+        return Err(CompactionError::FailedClosed {
+            detail: "physical manifest publication is not implemented".to_owned(),
+        });
+    }
+    publish_manifest_buffered(paths, manifest).map_err(|source| CompactionError::Io {
+        operation: CompactionOperation::WriteManifest,
+        path: paths.manifest.clone(),
+        source,
+    })
 }
 
 pub(crate) fn directory_artifact_paths(store_dir: &Path) -> io::Result<MaintenanceArtifactPaths> {
