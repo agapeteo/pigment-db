@@ -76,8 +76,8 @@
 - [X] T030 [US1] Implement a bounded shallow legacy-envelope classifier shared with runtime recovery but not migration conversion in `src/compaction/inspection.rs` and `src/recovery.rs`, then run T029 GREEN
 - [X] T031 [US1] Write and run a runtime RED distinguishing ambiguous complete maintenance generations from invalid non-competing debris while preserving every byte in `src/compaction/inspection_tests.rs`
 - [X] T032 [US1] Implement read-only maintenance-evidence classification and exact relevant-path collection in `src/compaction/inspection.rs` and `src/compaction/recovery.rs`, then run T031 GREEN
-- [ ] T033 [US1] Write and run a runtime RED for checked per-family and directory arithmetic overflow using synthetic descriptors in `src/compaction/inspection.rs`
-- [ ] T034 [US1] Implement checked byte aggregation and deterministic result construction in `src/compaction/inspection.rs`, then run T033 GREEN
+- [X] T033 [US1] Add and run synthetic boundary characterization for checked per-family and directory arithmetic overflow in `src/compaction/inspection.rs`; record first-execution GREEN because earlier exact-byte slices had already introduced the required checked additions
+- [X] T034 [US1] Extract the already-GREEN checked byte aggregation and deterministic result construction in `src/compaction/inspection.rs`, then run T033 and the accumulated inspection suite GREEN
 - [ ] T035 [US1] Write and run a runtime RED proving private adapters for each open file-backed store report only their family/current generation and do not run recovery or count maintenance/previous artifacts in `src/compaction/inspection_tests.rs`
 - [ ] T036 [US1] Retain immutable file-backing identity in all file constructors and add private per-family statistics adapters in `src/key_value_store.rs`, `src/key_set_store.rs`, `src/key_map_store.rs`, and `src/maintenance.rs`, then run T035 GREEN
 

@@ -93,6 +93,20 @@ fn migration_required(path: &Path) -> io::Error {
     )
 }
 
+fn checked_family_total(active_bytes: u64, sealed_segment_bytes: u64) -> io::Result<u64> {
+    active_bytes
+        .checked_add(sealed_segment_bytes)
+        .ok_or_else(|| invalid_artifact("family byte total overflow"))
+}
+
+fn checked_directory_total<'a>(totals: impl IntoIterator<Item = &'a u64>) -> io::Result<u64> {
+    totals.into_iter().try_fold(0_u64, |total, family| {
+        total
+            .checked_add(*family)
+            .ok_or_else(|| invalid_artifact("directory byte total overflow"))
+    })
+}
+
 fn validate_current_chain(
     family: InspectedFamily,
     sealed: &BTreeMap<u64, PathBuf>,
@@ -179,9 +193,7 @@ fn inspect_generation(store_dir: &Path) -> io::Result<DirectoryInspection> {
         }
         let (active_bytes, sealed_segment_bytes) =
             validate_current_chain(family, &artifacts.sealed, &active)?;
-        let total_bytes = active_bytes
-            .checked_add(sealed_segment_bytes)
-            .ok_or_else(|| invalid_artifact("family byte total overflow"))?;
+        let total_bytes = checked_family_total(active_bytes, sealed_segment_bytes)?;
         families.insert(
             family,
             FamilyInspection {
@@ -193,11 +205,8 @@ fn inspect_generation(store_dir: &Path) -> io::Result<DirectoryInspection> {
             },
         );
     }
-    let total_bytes = families.values().try_fold(0_u64, |total, family| {
-        total.checked_add(family.total_bytes).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "directory byte total overflow")
-        })
-    })?;
+    let family_totals = families.values().map(|family| &family.total_bytes);
+    let total_bytes = checked_directory_total(family_totals)?;
     Ok(DirectoryInspection {
         families: families.into_values().collect(),
         total_bytes,
@@ -248,5 +257,17 @@ mod tests {
         assert!(inspected.families.is_empty());
         assert_eq!(inspected.total_bytes, 0);
         assert_eq!(snapshot_directory(directory.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn synthetic_family_and_directory_totals_reject_overflow() {
+        let family_error = checked_family_total(u64::MAX, 1).unwrap_err();
+        assert_eq!(family_error.kind(), io::ErrorKind::InvalidData);
+        assert!(family_error.to_string().contains("family"));
+
+        let totals = [u64::MAX, 1];
+        let directory_error = checked_directory_total(&totals).unwrap_err();
+        assert_eq!(directory_error.kind(), io::ErrorKind::InvalidData);
+        assert!(directory_error.to_string().contains("directory"));
     }
 }

@@ -113,6 +113,14 @@ crash, lock-rank/watchdog, recovery, durability, mutation-ordering, migration,
 and 104-row requirement-manifest tests. Normal builds still expose no
 maintenance API or test hook.
 
+### Inspection arithmetic characterization (2026-08-20)
+
+The T033 synthetic family/directory overflow characterization was
+first-execution GREEN. Checked additions had already been introduced while
+implementing the earlier exact-byte inspection slices, so the implementation
+retained the GREEN behavior and extracted it into focused helpers rather than
+deliberately regressing arithmetic to manufacture a RED result.
+
 ## 7. Expected caller usage
 
 Callers inspect and choose when to compact; Pigment DB schedules nothing. Closed callers drop every same-process store before `compact_directory_in_place`. Online callers invoke `try_compact_online` on exactly one file-backed store and may choose a delta bound; policy is inherited. `CleanupStatus::Pending` means replacement publication succeeded and ordinary use may continue, with cleanup retried at reopen or a later explicit compaction. `MigrationRequired` means the caller must run `pigment-db-migrate` separately.
