@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -10,8 +11,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::manifest::{
-    decode_manifest, encode_manifest, CompactionManifest, ManifestMode, ManifestPhase,
-    ManifestScope,
+    decode_manifest, encode_manifest, verify_descriptor, ArtifactRole, CompactionManifest,
+    ManifestMode, ManifestPhase, ManifestScope,
 };
 use super::{
     revalidate_closed_source_inventory, validate_closed_staging,
@@ -46,6 +47,101 @@ pub(crate) enum ClosedReplacementStage {
     ReplacementMoved,
     ReplacementReopened,
     PhasePublished,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClosedCleanupStage {
+    CleanupPendingPublished,
+    BeforePreviousArtifact(usize),
+    BeforePreviousDirectory,
+    BeforeManifest,
+}
+
+pub(crate) fn cleanup_closed_with_checkpoint(
+    prepared: &PreparedClosedStaging,
+    manifest: &mut CompactionManifest,
+    mut checkpoint: impl FnMut(ClosedCleanupStage) -> io::Result<()>,
+) -> Result<crate::CleanupStatus, CompactionError> {
+    if manifest.phase != ManifestPhase::ReplacementPublished {
+        return Err(CompactionError::FailedClosed {
+            detail: "cleanup requires ReplacementPublished authority".to_owned(),
+        });
+    }
+    validate_published_closed_replacement(prepared)?;
+    let mut next = manifest.clone();
+    next.phase = ManifestPhase::CleanupPending;
+    publish_manifest_for_policy(&prepared.paths, &next, manifest.durability)?;
+    *manifest = next;
+    if checkpoint(ClosedCleanupStage::CleanupPendingPublished).is_err() {
+        return Ok(crate::CleanupStatus::Pending);
+    }
+
+    let anchor = match prepared.paths.previous.parent() {
+        Some(anchor) => anchor,
+        None => return Ok(crate::CleanupStatus::Pending),
+    };
+    let previous_name = match prepared.paths.previous.file_name() {
+        Some(name) => name,
+        None => return Ok(crate::CleanupStatus::Pending),
+    };
+    let mut owned = Vec::with_capacity(prepared.capture.inventory.len());
+    for source in &prepared.capture.inventory {
+        let Some(file_name) = source.relative_path.file_name() else {
+            return Ok(crate::CleanupStatus::Pending);
+        };
+        let mut previous = source.clone();
+        previous.relative_path = PathBuf::from(previous_name).join(file_name);
+        previous.role = ArtifactRole::PreviousGeneration;
+        if verify_descriptor(anchor, &previous).is_err() {
+            return Ok(crate::CleanupStatus::Pending);
+        }
+        owned.push((previous, prepared.paths.previous.join(file_name)));
+    }
+    let expected_names = owned
+        .iter()
+        .filter_map(|(_, path)| path.file_name().map(OsString::from))
+        .collect::<BTreeSet<_>>();
+    let actual_names = match fs::read_dir(&prepared.paths.previous) {
+        Ok(entries) => {
+            let mut names = BTreeSet::new();
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    return Ok(crate::CleanupStatus::Pending);
+                };
+                let Ok(file_type) = entry.file_type() else {
+                    return Ok(crate::CleanupStatus::Pending);
+                };
+                if !file_type.is_file() {
+                    return Ok(crate::CleanupStatus::Pending);
+                }
+                names.insert(entry.file_name());
+            }
+            names
+        }
+        Err(_) => return Ok(crate::CleanupStatus::Pending),
+    };
+    if actual_names != expected_names {
+        return Ok(crate::CleanupStatus::Pending);
+    }
+
+    for (index, (_, path)) in owned.iter().enumerate() {
+        if checkpoint(ClosedCleanupStage::BeforePreviousArtifact(index)).is_err()
+            || fs::remove_file(path).is_err()
+        {
+            return Ok(crate::CleanupStatus::Pending);
+        }
+    }
+    if checkpoint(ClosedCleanupStage::BeforePreviousDirectory).is_err()
+        || fs::remove_dir(&prepared.paths.previous).is_err()
+    {
+        return Ok(crate::CleanupStatus::Pending);
+    }
+    if checkpoint(ClosedCleanupStage::BeforeManifest).is_err()
+        || fs::remove_file(&prepared.paths.manifest).is_err()
+    {
+        return Ok(crate::CleanupStatus::Pending);
+    }
+    Ok(crate::CleanupStatus::Complete)
 }
 
 pub(crate) fn publish_closed_replacement_with_checkpoint(

@@ -2,9 +2,9 @@
 
 use crate::compaction::manifest::ManifestPhase;
 use crate::compaction::publication::{
-    publish_closed_prepared, publish_closed_previous_with_checkpoint,
-    publish_closed_replacement_with_checkpoint, read_published_manifest, ClosedPreviousStage,
-    ClosedReplacementStage,
+    cleanup_closed_with_checkpoint, publish_closed_prepared,
+    publish_closed_previous_with_checkpoint, publish_closed_replacement_with_checkpoint,
+    read_published_manifest, ClosedCleanupStage, ClosedPreviousStage, ClosedReplacementStage,
 };
 use crate::test_support::maintenance_fixtures::{
     create_segmented_v2, snapshot_directory, FixtureFamily,
@@ -25,6 +25,20 @@ fn prepared_fixture() -> (
     super::validate_closed_staging(&prepared).unwrap();
     super::revalidate_closed_source_inventory(&prepared).unwrap();
     (root, store_dir, prepared)
+}
+
+fn replacement_fixture() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    super::PreparedClosedStaging,
+    crate::compaction::manifest::CompactionManifest,
+) {
+    let (root, store_dir, prepared) = prepared_fixture();
+    let mut manifest =
+        publish_closed_prepared(&prepared, crate::DurabilityPolicy::Buffered).unwrap();
+    publish_closed_previous_with_checkpoint(&prepared, &mut manifest, |_| Ok(())).unwrap();
+    publish_closed_replacement_with_checkpoint(&prepared, &mut manifest, |_| Ok(())).unwrap();
+    (root, store_dir, prepared, manifest)
 }
 
 #[test]
@@ -176,4 +190,96 @@ fn only_validated_replacement_becomes_canonical_before_replacement_phase() {
             .phase,
         ManifestPhase::ReplacementPublished
     );
+}
+
+#[test]
+fn cleanup_is_phase_ordered_exact_manifest_last_and_faults_are_pending() {
+    let (root, store_dir, prepared, mut manifest) = replacement_fixture();
+    let canonical = snapshot_directory(&store_dir).unwrap();
+    let previous = snapshot_directory(&prepared.paths.previous).unwrap();
+    let status = cleanup_closed_with_checkpoint(&prepared, &mut manifest, |stage| {
+        if stage == ClosedCleanupStage::CleanupPendingPublished {
+            Err(std::io::Error::other("pause before cleanup"))
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap();
+    assert_eq!(status, crate::CleanupStatus::Pending);
+    assert_eq!(manifest.phase, ManifestPhase::CleanupPending);
+    assert_eq!(snapshot_directory(&store_dir).unwrap(), canonical);
+    assert_eq!(
+        snapshot_directory(&prepared.paths.previous).unwrap(),
+        previous
+    );
+    assert_eq!(
+        read_published_manifest(&prepared.paths)
+            .unwrap()
+            .unwrap()
+            .phase,
+        ManifestPhase::CleanupPending
+    );
+    drop(root);
+
+    let (_root, store_dir, prepared, mut manifest) = replacement_fixture();
+    let previous_file = std::fs::read_dir(&prepared.paths.previous)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut changed = std::fs::read(&previous_file).unwrap();
+    *changed.last_mut().unwrap() ^= 0xff;
+    std::fs::write(&previous_file, changed).unwrap();
+    let previous = snapshot_directory(&prepared.paths.previous).unwrap();
+    assert_eq!(
+        cleanup_closed_with_checkpoint(&prepared, &mut manifest, |_| Ok(())).unwrap(),
+        crate::CleanupStatus::Pending
+    );
+    assert_eq!(
+        snapshot_directory(&prepared.paths.previous).unwrap(),
+        previous
+    );
+    assert!(store_dir.is_dir());
+    assert!(prepared.paths.manifest.is_file());
+
+    for fault in [
+        ClosedCleanupStage::BeforePreviousArtifact(0),
+        ClosedCleanupStage::BeforePreviousDirectory,
+        ClosedCleanupStage::BeforeManifest,
+    ] {
+        let (_root, store_dir, prepared, mut manifest) = replacement_fixture();
+        let canonical = snapshot_directory(&store_dir).unwrap();
+        let status = cleanup_closed_with_checkpoint(&prepared, &mut manifest, |stage| {
+            if stage == fault {
+                Err(std::io::Error::other("injected cleanup fault"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(status, crate::CleanupStatus::Pending);
+        assert_eq!(snapshot_directory(&store_dir).unwrap(), canonical);
+        assert_eq!(manifest.phase, ManifestPhase::CleanupPending);
+        assert!(prepared.paths.manifest.is_file());
+    }
+
+    let (_root, store_dir, prepared, mut manifest) = replacement_fixture();
+    let canonical = snapshot_directory(&store_dir).unwrap();
+    let artifact_count = prepared.capture.inventory.len();
+    let mut stages = Vec::new();
+    let status = cleanup_closed_with_checkpoint(&prepared, &mut manifest, |stage| {
+        stages.push(stage);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(status, crate::CleanupStatus::Complete);
+    let mut expected = vec![ClosedCleanupStage::CleanupPendingPublished];
+    expected.extend((0..artifact_count).map(ClosedCleanupStage::BeforePreviousArtifact));
+    expected.push(ClosedCleanupStage::BeforePreviousDirectory);
+    expected.push(ClosedCleanupStage::BeforeManifest);
+    assert_eq!(stages, expected);
+    assert_eq!(snapshot_directory(&store_dir).unwrap(), canonical);
+    assert!(!prepared.paths.previous.exists());
+    assert!(!prepared.paths.manifest.exists());
 }
