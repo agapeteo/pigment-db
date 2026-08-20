@@ -71,10 +71,28 @@ fn invalid_artifact(detail: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, detail)
 }
 
-fn validate_active(family: InspectedFamily, path: &Path) -> io::Result<u64> {
-    let bytes = std::fs::read(path)?;
-    let is_current_v2 = bytes.starts_with(b"PIGWAL\r\n")
-        && bytes
+fn validate_current_chain(
+    family: InspectedFamily,
+    sealed: &BTreeMap<u64, PathBuf>,
+    active: &Path,
+) -> io::Result<(u64, u64)> {
+    let mut chain = Vec::new();
+    let mut sealed_segment_bytes = 0_u64;
+    for path in sealed.values() {
+        let bytes = std::fs::read(path)?;
+        let byte_len = u64::try_from(bytes.len())
+            .map_err(|_| invalid_artifact("sealed segment length exceeds u64"))?;
+        sealed_segment_bytes = sealed_segment_bytes
+            .checked_add(byte_len)
+            .ok_or_else(|| invalid_artifact("sealed segment byte total overflow"))?;
+        chain.extend_from_slice(&bytes);
+    }
+    let active_bytes = std::fs::read(active)?;
+    let active_byte_len = u64::try_from(active_bytes.len())
+        .map_err(|_| invalid_artifact("active length exceeds u64"))?;
+    chain.extend_from_slice(&active_bytes);
+    let is_current_v2 = chain.starts_with(b"PIGWAL\r\n")
+        && chain
             .get(8..10)
             .and_then(|version| version.try_into().ok())
             .map(u16::from_le_bytes)
@@ -85,12 +103,12 @@ fn validate_active(family: InspectedFamily, path: &Path) -> io::Result<u64> {
         ));
     }
     let replayed = match family {
-        InspectedFamily::KeyValue => replay_key_value(&bytes).map(|_| ()),
-        InspectedFamily::KeySet => replay_key_set(&bytes).map(|_| ()),
-        InspectedFamily::KeyMap => replay_key_map(&bytes).map(|_| ()),
+        InspectedFamily::KeyValue => replay_key_value(&chain).map(|_| ()),
+        InspectedFamily::KeySet => replay_key_set(&chain).map(|_| ()),
+        InspectedFamily::KeyMap => replay_key_map(&chain).map(|_| ()),
     };
     replayed.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-    u64::try_from(bytes.len()).map_err(|_| invalid_artifact("active length exceeds u64"))
+    Ok((active_byte_len, sealed_segment_bytes))
 }
 
 pub(crate) fn inspect_directory(store_dir: &Path) -> io::Result<DirectoryInspection> {
@@ -127,16 +145,8 @@ pub(crate) fn inspect_directory(store_dir: &Path) -> io::Result<DirectoryInspect
                 return Err(invalid_artifact("sealed segment chain is not contiguous"));
             }
         }
-        let active_bytes = if artifacts.sealed.is_empty() {
-            validate_active(family, &active)?
-        } else {
-            std::fs::metadata(&active)?.len()
-        };
-        let sealed_segment_bytes = artifacts.sealed.values().try_fold(0_u64, |total, path| {
-            total
-                .checked_add(std::fs::metadata(path)?.len())
-                .ok_or_else(|| invalid_artifact("sealed segment byte total overflow"))
-        })?;
+        let (active_bytes, sealed_segment_bytes) =
+            validate_current_chain(family, &artifacts.sealed, &active)?;
         let total_bytes = active_bytes
             .checked_add(sealed_segment_bytes)
             .ok_or_else(|| invalid_artifact("family byte total overflow"))?;
