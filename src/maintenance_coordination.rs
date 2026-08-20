@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -69,6 +69,35 @@ impl Drop for OnlineAttemptToken<'_> {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
+    }
+}
+
+pub(crate) struct OnlineAttemptGuard<'a, W: Write> {
+    attempt: OnlineAttemptToken<'a>,
+    #[allow(dead_code)]
+    wal: &'a crate::wal::WalStorage<W>,
+}
+
+impl<'a, W: Write> OnlineAttemptGuard<'a, W> {
+    pub(crate) fn begin(
+        coordinator: &'a MaintenanceCoordinator,
+        wal: &'a crate::wal::WalStorage<W>,
+        max_delta_bytes: u64,
+    ) -> Result<Self, ()> {
+        let attempt = coordinator.try_begin_online()?;
+        wal.activate_delta_recorder(attempt.id(), max_delta_bytes)?;
+        Ok(Self { attempt, wal })
+    }
+
+    pub(crate) const fn token(&self) -> u64 {
+        self.attempt.id()
+    }
+}
+
+impl<W: Write> Drop for OnlineAttemptGuard<'_, W> {
+    fn drop(&mut self) {
+        let _exclusive = self.attempt.coordinator.exclusive();
+        self.wal.clear_delta_recorder(self.attempt.id());
     }
 }
 

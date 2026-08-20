@@ -722,6 +722,40 @@ impl WalStorage<Vec<u8>> {
 }
 
 impl<W: Write> WalStorage<W> {
+    pub(crate) fn activate_delta_recorder(&self, token: u64, limit: u64) -> Result<(), ()> {
+        self.wal_state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .activate_delta(token, limit)
+    }
+
+    pub(crate) fn clear_delta_recorder(&self, token: u64) {
+        let _ = self
+            .wal_state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .detach_delta(token);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delta_group_count_probe(&self) -> usize {
+        self.wal_state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .delta_recorder
+            .as_ref()
+            .map_or(0, |recorder| recorder.groups.len())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_delta_recorder_probe(&self) -> bool {
+        self.wal_state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .delta_recorder
+            .is_some()
+    }
+
     pub(crate) fn set_runtime_policy(&self, policy: crate::config::DurabilityPolicy) {
         self.wal_state.write().unwrap().durability_policy = policy;
     }

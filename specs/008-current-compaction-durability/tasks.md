@@ -203,8 +203,8 @@
 - [X] T107 [US3] Record complete compute batches only after durable acceptance in `src/wal/mod.rs`, then run T106 GREEN and compute persistence suites
 - [X] T108 [US3] Write and run a runtime RED proving rejected writes, failed flush/sync, successful rollback, failed rollback, conflicts, and no-op compute never enter the delta and unhealthy WAL aborts cutover in `src/wal/maintenance_tests.rs`
 - [X] T109 [US3] Restrict recorder success exits and propagate failed-closed WAL health to maintenance in `src/wal/mod.rs`, then run T108 GREEN
-- [ ] T110 [US3] Write and run a runtime RED proving async conflict, dropped future, callback panic, and cancellation create no delta group and promptly release coordination in `src/compaction/online_tests.rs`
-- [ ] T111 [US3] Preserve pre-acceptance async/panic exits and token-safe cleanup in `src/key_set_store.rs` and `src/maintenance_coordination.rs`, then run T110 GREEN
+- [X] T110 [US3] Write and run a runtime RED proving async conflict, dropped future, callback panic, and cancellation create no delta group and promptly release coordination in `src/compaction/online_tests.rs`
+- [X] T111 [US3] Preserve pre-acceptance async/panic exits and token-safe cleanup in `src/key_set_store.rs` and `src/maintenance_coordination.rs`, then run T110 GREEN
 
 ### Snapshot, staging, and cutover
 

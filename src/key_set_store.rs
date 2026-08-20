@@ -246,6 +246,28 @@ impl<W: Write> DurableKeySetStore<W> {
     }
 
     #[cfg(test)]
+    pub(crate) fn begin_online_probe(
+        &self,
+        max_delta_bytes: u64,
+    ) -> Result<crate::maintenance_coordination::OnlineAttemptGuard<'_, W>, ()> {
+        crate::maintenance_coordination::OnlineAttemptGuard::begin(
+            &self.maintenance,
+            &self.wal,
+            max_delta_bytes,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delta_group_count_probe(&self) -> usize {
+        self.wal.delta_group_count_probe()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_delta_recorder_probe(&self) -> bool {
+        self.wal.has_delta_recorder_probe()
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_probe_parts(
         initial: impl IntoIterator<Item = (Vec<u8>, HashSet<Vec<u8>>)>,
         wal: WalStorage<W>,

@@ -1,6 +1,9 @@
 //! Private online-compaction behavior tests.
 
+use std::future::Future;
+use std::pin::pin;
 use std::sync::{mpsc, Arc};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use crate::key_map_store::DurableKeyMapStore;
@@ -199,4 +202,93 @@ fn assert_callback_releases_map_guards() {
     }
     waiter.join().unwrap();
     assert!(acquired_while_callback_paused.is_ok());
+}
+
+#[test]
+fn async_conflict_cancellation_and_callback_panic_leave_no_delta_or_coordination() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        DurableKeySetStore::try_init_new(directory.path())
+            .unwrap()
+            .into_store(),
+    );
+    let key = b"conflict".to_vec();
+    store.append(key.clone(), b"seed".to_vec());
+    let attempt = store.begin_online_probe(u64::MAX).unwrap();
+    assert_ne!(attempt.token(), 0);
+    assert!(store.begin_online_probe(u64::MAX).is_err());
+
+    let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+    let (release_tx, release_rx) = mpsc::sync_channel(0);
+    let conflict_store = Arc::clone(&store);
+    let conflict_key = key.clone();
+    let conflict = std::thread::spawn(move || {
+        block_on_online(
+            conflict_store.try_compute_async(conflict_key, async move |working| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                working.insert(b"stale-candidate".to_vec());
+            }),
+        )
+    });
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    store.append(key.clone(), b"concurrent".to_vec());
+    release_tx.send(()).unwrap();
+    let conflict_error = conflict.join().unwrap().unwrap_err();
+    assert_eq!(conflict_error.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(store.delta_group_count_probe(), 1);
+
+    store.try_compute(key.clone(), |_| {}).unwrap();
+    assert_eq!(store.delta_group_count_probe(), 1);
+
+    let callback_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store
+            .try_compute(b"panic".to_vec(), |_| {
+                panic!("scripted sync callback panic")
+            })
+            .unwrap();
+    }));
+    assert!(callback_panic.is_err());
+    assert_eq!(store.delta_group_count_probe(), 1);
+    drop(store.maintenance_probe().exclusive());
+
+    {
+        let future = store.try_compute_async(b"cancelled".to_vec(), async |working| {
+            working.insert(b"discarded".to_vec());
+            std::future::pending::<()>().await;
+        });
+        let mut future = pin!(future);
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+    }
+    assert_eq!(store.delta_group_count_probe(), 1);
+    drop(store.maintenance_probe().exclusive());
+
+    let async_panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        block_on_online(store.try_compute_async(b"async-panic".to_vec(), async |_| {
+            panic!("scripted async callback panic");
+        }))
+    }));
+    assert!(async_panic.is_err());
+    assert_eq!(store.delta_group_count_probe(), 1);
+    drop(store.maintenance_probe().exclusive());
+
+    drop(attempt);
+    assert!(!store.has_delta_recorder_probe());
+    let next = store.begin_online_probe(u64::MAX).unwrap();
+    drop(next);
+    assert!(!store.has_delta_recorder_probe());
+}
+
+fn block_on_online<F: Future>(future: F) -> F::Output {
+    let waker = Waker::noop();
+    let mut context = Context::from_waker(waker);
+    let mut future = pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
 }
