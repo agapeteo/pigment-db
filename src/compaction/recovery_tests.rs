@@ -9,6 +9,7 @@ use crate::compaction::publication::{
     publish_closed_previous_with_checkpoint, publish_closed_replacement_with_checkpoint,
     read_published_manifest, ClosedCleanupStage, ClosedPreviousStage, ClosedReplacementStage,
 };
+use crate::test_support::durability_snapshot::{DurabilitySnapshot, DurableNamespaceImage};
 use crate::test_support::maintenance_fixtures::{
     active_name, create_current_v2, create_segmented_v2, snapshot_directory, FixtureFamily,
 };
@@ -822,4 +823,207 @@ fn every_file_initializer_resolves_maintenance_before_ordinary_wal_recovery() {
     let evidence = snapshot_directory(_root.path()).unwrap();
     assert!(crate::key_value_store::DurableKeyValueStore::try_init_new(&store_dir).is_err());
     assert_eq!(snapshot_directory(_root.path()).unwrap(), evidence);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClosedFaultCut {
+    StagingCreate,
+    StagingWrite,
+    StagingSync,
+    StagingValidate,
+    ManifestWrite,
+    ManifestSync,
+    PreviousMove,
+    PreviousPhaseRewrite,
+    ReplacementMove,
+    ReplacementReopen,
+    ReplacementPhaseRewrite,
+    CleanupPhaseRewrite,
+    Cleanup,
+}
+
+struct ModeledClosedPaths {
+    parent: std::path::PathBuf,
+    source: std::path::PathBuf,
+    staging: std::path::PathBuf,
+    previous: std::path::PathBuf,
+    manifest: std::path::PathBuf,
+    manifest_next: std::path::PathBuf,
+}
+
+fn modeled_closed_paths(family: FixtureFamily) -> ModeledClosedPaths {
+    let parent = std::path::PathBuf::from("/modeled-parent");
+    let active = std::path::Path::new(active_name(family));
+    ModeledClosedPaths {
+        source: parent.join("store").join(active),
+        staging: parent.join("store.compaction-next").join(active),
+        previous: parent.join("store.compaction-previous").join(active),
+        manifest: parent.join("store.compaction-manifest"),
+        manifest_next: parent.join("store.compaction-manifest.next"),
+        parent,
+    }
+}
+
+fn finish_modeled_manifest_publication(
+    snapshot: &mut DurabilitySnapshot,
+    paths: &ModeledClosedPaths,
+    phase: &[u8],
+    policy: crate::DurabilityPolicy,
+) {
+    snapshot.write(&paths.manifest_next, phase).unwrap();
+    if policy == crate::DurabilityPolicy::Physical {
+        snapshot.sync_file(&paths.manifest_next).unwrap();
+    }
+    snapshot
+        .rename_replace(&paths.manifest_next, &paths.manifest)
+        .unwrap();
+    if policy == crate::DurabilityPolicy::Physical {
+        snapshot.sync_directory(&paths.parent).unwrap();
+    }
+}
+
+fn modeled_closed_fault_image(
+    family: FixtureFamily,
+    policy: crate::DurabilityPolicy,
+    cut: ClosedFaultCut,
+) -> (ModeledClosedPaths, DurableNamespaceImage) {
+    let paths = modeled_closed_paths(family);
+    let mut snapshot = DurabilitySnapshot::new(None);
+    snapshot.write(&paths.source, b"old-complete").unwrap();
+    snapshot.sync_file(&paths.source).unwrap();
+    snapshot.sync_directory(&paths.parent).unwrap();
+
+    if cut == ClosedFaultCut::StagingCreate {
+        return (paths, modeled_interruption_image(&mut snapshot, policy));
+    }
+    snapshot.write(&paths.staging, b"new-partial").unwrap();
+    if cut == ClosedFaultCut::StagingWrite {
+        return (paths, modeled_interruption_image(&mut snapshot, policy));
+    }
+    snapshot.write(&paths.staging, b"new-complete").unwrap();
+    if cut == ClosedFaultCut::StagingSync {
+        return (paths, modeled_interruption_image(&mut snapshot, policy));
+    }
+    if policy == crate::DurabilityPolicy::Physical {
+        snapshot.sync_file(&paths.staging).unwrap();
+    }
+    if cut == ClosedFaultCut::StagingValidate {
+        return (paths, modeled_interruption_image(&mut snapshot, policy));
+    }
+
+    snapshot
+        .write(&paths.manifest_next, b"Prepared-partial")
+        .unwrap();
+    if cut == ClosedFaultCut::ManifestWrite {
+        return (paths, modeled_interruption_image(&mut snapshot, policy));
+    }
+    snapshot.write(&paths.manifest_next, b"Prepared").unwrap();
+    if cut == ClosedFaultCut::ManifestSync {
+        return (paths, modeled_interruption_image(&mut snapshot, policy));
+    }
+    if policy == crate::DurabilityPolicy::Physical {
+        snapshot.sync_file(&paths.manifest_next).unwrap();
+    }
+    snapshot
+        .rename_replace(&paths.manifest_next, &paths.manifest)
+        .unwrap();
+    if policy == crate::DurabilityPolicy::Physical {
+        snapshot.sync_directory(&paths.parent).unwrap();
+    }
+
+    snapshot.rename(&paths.source, &paths.previous).unwrap();
+    if policy == crate::DurabilityPolicy::Physical {
+        snapshot.sync_directory(&paths.parent).unwrap();
+    }
+    if cut == ClosedFaultCut::PreviousMove {
+        return (paths, modeled_interruption_image(&mut snapshot, policy));
+    }
+    finish_modeled_manifest_publication(&mut snapshot, &paths, b"PreviousPublished", policy);
+    if cut == ClosedFaultCut::PreviousPhaseRewrite {
+        return (paths, modeled_interruption_image(&mut snapshot, policy));
+    }
+
+    snapshot.rename(&paths.staging, &paths.source).unwrap();
+    if policy == crate::DurabilityPolicy::Physical {
+        snapshot.sync_directory(&paths.parent).unwrap();
+    }
+    if cut == ClosedFaultCut::ReplacementMove {
+        return (paths, modeled_interruption_image(&mut snapshot, policy));
+    }
+    if cut == ClosedFaultCut::ReplacementReopen {
+        return (paths, modeled_interruption_image(&mut snapshot, policy));
+    }
+    finish_modeled_manifest_publication(&mut snapshot, &paths, b"ReplacementPublished", policy);
+    if cut == ClosedFaultCut::ReplacementPhaseRewrite {
+        return (paths, modeled_interruption_image(&mut snapshot, policy));
+    }
+    finish_modeled_manifest_publication(&mut snapshot, &paths, b"CleanupPending", policy);
+    if cut == ClosedFaultCut::CleanupPhaseRewrite {
+        return (paths, modeled_interruption_image(&mut snapshot, policy));
+    }
+    snapshot.remove(&paths.previous).unwrap();
+    if policy == crate::DurabilityPolicy::Physical {
+        snapshot.sync_directory(&paths.parent).unwrap();
+    }
+    (paths, modeled_interruption_image(&mut snapshot, policy))
+}
+
+fn modeled_interruption_image(
+    snapshot: &mut DurabilitySnapshot,
+    policy: crate::DurabilityPolicy,
+) -> DurableNamespaceImage {
+    match policy {
+        crate::DurabilityPolicy::Buffered => snapshot.volatile_image(),
+        crate::DurabilityPolicy::Physical => snapshot.simulate_power_loss(),
+    }
+}
+
+#[test]
+fn every_closed_fault_cut_retains_a_complete_authority_for_all_families_and_policies() {
+    let cuts = [
+        ClosedFaultCut::StagingCreate,
+        ClosedFaultCut::StagingWrite,
+        ClosedFaultCut::StagingSync,
+        ClosedFaultCut::StagingValidate,
+        ClosedFaultCut::ManifestWrite,
+        ClosedFaultCut::ManifestSync,
+        ClosedFaultCut::PreviousMove,
+        ClosedFaultCut::PreviousPhaseRewrite,
+        ClosedFaultCut::ReplacementMove,
+        ClosedFaultCut::ReplacementReopen,
+        ClosedFaultCut::ReplacementPhaseRewrite,
+        ClosedFaultCut::CleanupPhaseRewrite,
+        ClosedFaultCut::Cleanup,
+    ];
+    for family in [
+        FixtureFamily::KeyValue,
+        FixtureFamily::KeySet,
+        FixtureFamily::KeyMap,
+    ] {
+        for policy in [
+            crate::DurabilityPolicy::Buffered,
+            crate::DurabilityPolicy::Physical,
+        ] {
+            for cut in cuts {
+                let (paths, image) = modeled_closed_fault_image(family, policy, cut);
+                let authorities = [
+                    image.files.get(&paths.source),
+                    image.files.get(&paths.previous),
+                    image.files.get(&paths.staging),
+                ];
+                assert!(
+                    authorities.iter().flatten().any(|bytes| {
+                        bytes.as_slice() == b"old-complete" || bytes.as_slice() == b"new-complete"
+                    }),
+                    "{family:?} {policy:?} {cut:?} lost every complete authority: {image:?}"
+                );
+                assert!(
+                    image.files.get(&paths.source).is_none_or(|bytes| {
+                        bytes.as_slice() == b"old-complete" || bytes.as_slice() == b"new-complete"
+                    }),
+                    "{family:?} {policy:?} {cut:?} exposed partial canonical bytes"
+                );
+            }
+        }
+    }
 }
