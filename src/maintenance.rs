@@ -410,7 +410,18 @@ pub fn inspect_storage(
         .map_err(|error| map_inspection_error(store_dir.to_path_buf(), error))
 }
 
-#[allow(dead_code)]
+/// Compacts every current-format family in a closed directory in place.
+///
+/// The caller must close every store instance for `store_dir` before calling
+/// this function. Pigment DB detects same-process overlap and returns
+/// [`CompactionError::FailedClosed`] without changing storage.
+pub fn compact_directory_in_place(
+    store_dir: impl AsRef<Path>,
+    options: ClosedCompactionOptions,
+) -> Result<DirectoryCompactionOutcome, CompactionError> {
+    compact_directory_in_place_internal(store_dir.as_ref(), options)
+}
+
 pub(crate) fn compact_directory_in_place_internal(
     store_dir: &Path,
     options: ClosedCompactionOptions,

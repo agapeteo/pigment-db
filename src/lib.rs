@@ -22,9 +22,9 @@ pub use config::{
 };
 pub use durability::{DurabilityCapability, DurabilitySupportError};
 pub use maintenance::{
-    inspect_storage, CleanupStatus, ClosedCompactionOptions, CompactionError, CompactionOperation,
-    DirectoryCompactionOutcome, DirectoryStorageStats, FamilyCompactionOutcome, FamilyStorageStats,
-    OnlineCompactionOptions, StoreFamily,
+    compact_directory_in_place, inspect_storage, CleanupStatus, ClosedCompactionOptions,
+    CompactionError, CompactionOperation, DirectoryCompactionOutcome, DirectoryStorageStats,
+    FamilyCompactionOutcome, FamilyStorageStats, OnlineCompactionOptions, StoreFamily,
 };
 mod wal;
 pub use wal::{MutationFailure, PersistenceOperation};

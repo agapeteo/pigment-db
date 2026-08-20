@@ -160,11 +160,11 @@
 - [X] T083 [US2] Write and run a runtime RED proving all three file-store initializers resolve maintenance before ordinary WAL recovery and preserve evidence on failure in `tests/compaction_recovery/contract.rs`
 - [X] T084 [US2] Invoke maintenance recovery before normal WAL recovery in `src/key_value_store.rs`, `src/key_set_store.rs`, `src/key_map_store.rs`, and `src/wal/recovery.rs`, then run T083 GREEN and existing recovery suites
 - [X] T085 [US2] Run the expected-GREEN private fault-model matrix for every staging create/write/sync/validate, manifest write/sync, previous/replacement move, reopen, phase rewrite, and cleanup cut across all families and modeled buffered/physical policies in `src/compaction/recovery_tests.rs`
-- [ ] T086 [US2] Run the expected-GREEN subprocess termination/reopen matrix at every T085 cut, asserting only public reopen state/errors and artifact snapshots in `tests/compaction_recovery/{phases,faults}.rs` via `src/test_support/fault_checkpoint.rs`; any newly exposed behavior gap must receive its own RED–GREEN pair before continuing
+- [X] T086 [US2] Run the expected-GREEN subprocess termination/reopen matrix at every T085 cut, asserting only public reopen state/errors and artifact snapshots in `tests/compaction_recovery/{phases,faults}.rs` via `src/test_support/fault_checkpoint.rs`; any newly exposed behavior gap must receive its own RED–GREEN pair before continuing
 
 ### Public US2 promotion and checkpoint
 
-- [ ] T087 [US2] Promote `compact_directory_in_place`, buffered-default/physical-builder closed options, directory/family outcomes, operation-specific I/O paths, and cleanup status over GREEN private behavior in `src/maintenance.rs` and `src/lib.rs`, with first public executions GREEN in `tests/closed_compaction/contract.rs`
+- [X] T087 [US2] Promote `compact_directory_in_place`, buffered-default/physical-builder closed options, directory/family outcomes, operation-specific I/O paths, and cleanup status over GREEN private behavior in `src/maintenance.rs` and `src/lib.rs`, with first public executions GREEN in `tests/closed_compaction/contract.rs`
 - [ ] T088 [US2] Add public all-family, active-only, segmented, safe-tail, mixed-directory, repeated-compaction, cleanup-retry, exact timestamp, and three-reopen acceptance coverage under buffered and supported physical policies in `tests/closed_compaction/{key_value,key_set,key_map,contract}.rs`
 - [ ] T089 [US2] Run the complete US2, crash/reopen, existing recovery, migration, buffered/physical model, and same-process ownership suites and record SC-002/SC-003 GREEN evidence in `specs/008-current-compaction-durability/quickstart.md`
 
