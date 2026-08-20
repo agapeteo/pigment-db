@@ -6,7 +6,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::compaction::inspection::{inspect_directory, FamilyInspection, InspectedFamily};
-use crate::compaction::manifest::{ArtifactDescriptor, ArtifactRole};
+use crate::compaction::manifest::{verify_descriptor, ArtifactDescriptor, ArtifactRole};
 use crate::compaction::publication::{directory_artifact_paths, MaintenanceArtifactPaths};
 use crate::wal::replay::{
     encode_current_key_map_snapshot_with_metadata, encode_current_key_set_snapshot_with_metadata,
@@ -61,6 +61,12 @@ pub(crate) struct PreparedClosedStaging {
 }
 
 #[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ValidatedClosedStaging {
+    pub(crate) staging: CapturedGeneration,
+}
+
+#[allow(dead_code)]
 pub(crate) fn prepare_closed_staging(
     store_dir: &Path,
     options: ClosedCompactionOptions,
@@ -93,6 +99,109 @@ pub(crate) fn prepare_closed_staging(
         paths,
         replacement_inventory,
     })
+}
+
+#[allow(dead_code)]
+pub(crate) fn validate_closed_staging(
+    prepared: &PreparedClosedStaging,
+) -> Result<ValidatedClosedStaging, CompactionError> {
+    let anchor = prepared
+        .paths
+        .staging
+        .parent()
+        .ok_or_else(|| CompactionError::Io {
+            operation: CompactionOperation::ValidateStaging,
+            path: prepared.paths.staging.clone(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "staging directory has no parent anchor",
+            ),
+        })?;
+    for descriptor in &prepared.replacement_inventory {
+        verify_descriptor(anchor, descriptor).map_err(|_| CompactionError::InvalidArtifact {
+            path: anchor.join(&descriptor.relative_path),
+        })?;
+    }
+    let staging =
+        capture_closed_generation(&prepared.paths.staging).map_err(|error| match error {
+            CompactionError::Io { path, source, .. } => CompactionError::Io {
+                operation: CompactionOperation::ValidateStaging,
+                path,
+                source,
+            },
+            error => error,
+        })?;
+    if staging.families.len() != prepared.capture.families.len() {
+        return Err(staging_mismatch("family count"));
+    }
+    for (source, replacement) in prepared.capture.families.iter().zip(&staging.families) {
+        if source.family != replacement.family || replacement.sealed_segment_count != 0 {
+            return Err(staging_mismatch("family identity"));
+        }
+        if source.state != replacement.state {
+            return Err(staging_mismatch("logical state"));
+        }
+        if source.granularity_nanos != replacement.granularity_nanos
+            || source.last_bucket != replacement.last_bucket
+        {
+            return Err(staging_mismatch("timestamp metadata"));
+        }
+    }
+    reopen_and_compare_public_state(&prepared.paths.staging, &prepared.capture.families)?;
+    Ok(ValidatedClosedStaging { staging })
+}
+
+fn staging_mismatch(field: &str) -> CompactionError {
+    CompactionError::FailedClosed {
+        detail: format!("validated staging {field} does not match captured source"),
+    }
+}
+
+fn reopen_and_compare_public_state(
+    staging: &Path,
+    families: &[CapturedFamily],
+) -> Result<(), CompactionError> {
+    for family in families {
+        let matches = match &family.state {
+            CapturedLogicalState::Value(expected) => {
+                let store = crate::key_value_store::DurableKeyValueStore::try_init_new(staging)
+                    .map_err(|error| staging_reopen_error(staging, error.to_string()))?
+                    .into_store();
+                store.size() == expected.len()
+                    && expected
+                        .iter()
+                        .all(|(key, value)| store.get(key) == Some(value.clone()))
+            }
+            CapturedLogicalState::Set(expected) => {
+                let store = crate::key_set_store::DurableKeySetStore::try_init_new(staging)
+                    .map_err(|error| staging_reopen_error(staging, error.to_string()))?
+                    .into_store();
+                store.size() == expected.len()
+                    && expected
+                        .iter()
+                        .all(|(key, values)| store.get_hashset(key).as_ref() == Some(values))
+            }
+            CapturedLogicalState::Map(expected) => {
+                let store = crate::key_map_store::DurableKeyMapStore::try_init_new(staging)
+                    .map_err(|error| staging_reopen_error(staging, error.to_string()))?
+                    .into_store();
+                store.size() == expected.len()
+                    && expected
+                        .iter()
+                        .all(|(key, map)| store.get_sorted_map(key).as_ref() == Some(map))
+            }
+        };
+        if !matches {
+            return Err(staging_mismatch("public logical state"));
+        }
+    }
+    Ok(())
+}
+
+fn staging_reopen_error(staging: &Path, detail: String) -> CompactionError {
+    CompactionError::FailedClosed {
+        detail: format!("staging reopen failed for {}: {detail}", staging.display()),
+    }
 }
 
 fn capture_closed_generation(store_dir: &Path) -> Result<CapturedGeneration, CompactionError> {

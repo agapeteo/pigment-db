@@ -5,6 +5,10 @@ use crate::test_support::maintenance_fixtures::{
     active_name, create_segmented_v2, snapshot_directory, FixtureFamily,
 };
 use crate::wal::format::V2CodecProbe;
+use crate::wal::replay::{
+    encode_current_key_set_snapshot_with_metadata, encode_current_key_value_snapshot_with_metadata,
+    KeySetSnapshot,
+};
 
 #[test]
 fn open_or_opening_directory_blocks_closed_claim_without_cross_directory_coordination() {
@@ -130,4 +134,74 @@ fn closed_capture_builds_one_current_active_per_family_in_unique_sibling_staging
         snapshot_directory(&prepared.capture.source_dir).unwrap(),
         source_before
     );
+}
+
+#[test]
+fn staging_family_state_or_timestamp_mismatch_rejects_validation_without_publication() {
+    #[derive(Clone, Copy)]
+    enum Mismatch {
+        Family,
+        State,
+        Timestamp,
+    }
+
+    for mismatch in [Mismatch::Family, Mismatch::State, Mismatch::Timestamp] {
+        let root = tempfile::tempdir().unwrap();
+        let store_dir = root.path().join("store");
+        std::fs::create_dir(&store_dir).unwrap();
+        create_segmented_v2(&store_dir, FixtureFamily::KeyValue);
+        let source_before = snapshot_directory(&store_dir).unwrap();
+        let mut prepared =
+            super::prepare_closed_staging(&store_dir, crate::ClosedCompactionOptions::default())
+                .unwrap();
+        assert!(super::validate_closed_staging(&prepared).is_ok());
+        let captured = &prepared.capture.families[0];
+        let super::CapturedLogicalState::Value(snapshot) = &captured.state else {
+            panic!("fixture must capture key/value state");
+        };
+        let mismatching = match mismatch {
+            Mismatch::Family => encode_current_key_set_snapshot_with_metadata(
+                &KeySetSnapshot::new(),
+                captured.granularity_nanos,
+                captured.last_bucket,
+            )
+            .unwrap(),
+            Mismatch::State => {
+                let mut changed = snapshot.clone();
+                changed.insert(b"unexpected".to_vec(), b"state".to_vec());
+                encode_current_key_value_snapshot_with_metadata(
+                    &changed,
+                    captured.granularity_nanos,
+                    captured.last_bucket,
+                )
+                .unwrap()
+            }
+            Mismatch::Timestamp => encode_current_key_value_snapshot_with_metadata(
+                snapshot,
+                captured.granularity_nanos + 1,
+                captured.last_bucket + 1,
+            )
+            .unwrap(),
+        };
+        let staged_active = prepared.paths.staging.join("kv.wal.dat");
+        std::fs::write(&staged_active, &mismatching).unwrap();
+        let descriptor = prepared
+            .replacement_inventory
+            .iter_mut()
+            .find(|descriptor| descriptor.relative_path.ends_with("kv.wal.dat"))
+            .unwrap();
+        descriptor.length = u64::try_from(mismatching.len()).unwrap();
+        descriptor.checksum = crc32fast::hash(&mismatching);
+        let all_before_validation = snapshot_directory(root.path()).unwrap();
+
+        assert!(super::validate_closed_staging(&prepared).is_err());
+
+        assert_eq!(
+            snapshot_directory(root.path()).unwrap(),
+            all_before_validation
+        );
+        assert_eq!(snapshot_directory(&store_dir).unwrap(), source_before);
+        assert!(!prepared.paths.manifest.exists());
+        assert!(!prepared.paths.previous.exists());
+    }
 }
