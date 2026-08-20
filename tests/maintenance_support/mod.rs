@@ -15,6 +15,7 @@ pub(crate) const PHASE_ENV: &str = "PIGMENT_DB_MAINTENANCE_PHASE";
 pub(crate) const CUT_ENV: &str = "PIGMENT_DB_MAINTENANCE_CUT";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum Family {
     KeyValue,
     KeySet,
@@ -51,6 +52,65 @@ pub(crate) fn byte_snapshot(root: &Path) -> io::Result<BTreeMap<PathBuf, Vec<u8>
             std::fs::read(entry.path())?,
         );
     }
+    Ok(snapshot)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct NamespaceEntrySnapshot {
+    kind: &'static str,
+    len: u64,
+    readonly: bool,
+    modified: Option<std::time::SystemTime>,
+    bytes: Option<Vec<u8>>,
+}
+
+pub(crate) fn namespace_snapshot(
+    root: &Path,
+) -> io::Result<BTreeMap<PathBuf, NamespaceEntrySnapshot>> {
+    fn visit(
+        root: &Path,
+        directory: &Path,
+        snapshot: &mut BTreeMap<PathBuf, NamespaceEntrySnapshot>,
+    ) -> io::Result<()> {
+        let mut entries: Vec<_> = std::fs::read_dir(directory)?.collect::<Result<_, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let path = entry.path();
+            let metadata = std::fs::symlink_metadata(&path)?;
+            let file_type = metadata.file_type();
+            let kind = if file_type.is_file() {
+                "file"
+            } else if file_type.is_dir() {
+                "directory"
+            } else if file_type.is_symlink() {
+                "symlink"
+            } else {
+                "other"
+            };
+            snapshot.insert(
+                path.strip_prefix(root)
+                    .expect("snapshot path remains below root")
+                    .to_path_buf(),
+                NamespaceEntrySnapshot {
+                    kind,
+                    len: metadata.len(),
+                    readonly: metadata.permissions().readonly(),
+                    modified: metadata.modified().ok(),
+                    bytes: file_type
+                        .is_file()
+                        .then(|| std::fs::read(&path))
+                        .transpose()?,
+                },
+            );
+            if file_type.is_dir() {
+                visit(root, &path, snapshot)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut snapshot = BTreeMap::new();
+    visit(root, root, &mut snapshot)?;
     Ok(snapshot)
 }
 

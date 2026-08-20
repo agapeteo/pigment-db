@@ -121,6 +121,23 @@ implementing the earlier exact-byte inspection slices, so the implementation
 retained the GREEN behavior and extracted it into focused helpers rather than
 deliberately regressing arithmetic to manufacture a RED result.
 
+### User Story 1 storage-inspection GREEN checkpoint (2026-08-20)
+
+SC-001 is GREEN. Empty, active-only, segmented, mixed-family, recoverable-tail,
+legacy, corrupt, malformed, missing-segment, wrong-family, unexpected-entry,
+ambiguous-generation, and open-family fixtures all returned the specified
+exact statistics or structured classification. Every public fixture compared
+native `OsString`-preserving relative names, file/directory type, length,
+permissions, modification metadata, and file bytes before and after inspection.
+
+The checkpoint completed with zero failures:
+
+- `cargo test --lib compaction::inspection -- --test-threads=1` (9 passed);
+- `cargo test --test maintenance_api --test storage_inspection -- --test-threads=1` (9 passed);
+- `cargo test --doc -- --test-threads=1` (3 compile-fail specialization checks passed);
+- `cargo fmt --all -- --check`;
+- `cargo clippy --all-targets --all-features -- -D warnings`.
+
 ## 7. Expected caller usage
 
 Callers inspect and choose when to compact; Pigment DB schedules nothing. Closed callers drop every same-process store before `compact_directory_in_place`. Online callers invoke `try_compact_online` on exactly one file-backed store and may choose a delta bound; policy is inherited. `CleanupStatus::Pending` means replacement publication succeeded and ordinary use may continue, with cleanup retried at reopen or a later explicit compaction. `MigrationRequired` means the caller must run `pigment-db-migrate` separately.

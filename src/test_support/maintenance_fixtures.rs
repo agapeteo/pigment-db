@@ -13,6 +13,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum FixtureFamily {
     KeyValue,
     KeySet,

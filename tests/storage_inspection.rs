@@ -10,5 +10,7 @@ mod key_map;
 mod key_set;
 #[path = "storage_inspection/key_value.rs"]
 mod key_value;
+#[path = "maintenance_support/mod.rs"]
+mod maintenance_support;
 #[path = "storage_inspection/support.rs"]
 mod support;

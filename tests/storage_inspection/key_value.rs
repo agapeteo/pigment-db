@@ -3,6 +3,8 @@
 use pigment_db::key_value_store::DurableKeyValueStore;
 use pigment_db::{DurableStoreOptions, StoreFamily, WalSegmentSize};
 
+use crate::maintenance_support::namespace_snapshot;
+
 #[test]
 fn open_key_value_stats_match_current_segment_files() {
     let directory = tempfile::tempdir().unwrap();
@@ -14,6 +16,7 @@ fn open_key_value_stats_match_current_segment_files() {
     store.put(b"one".to_vec(), b"1".to_vec());
     store.put(b"two".to_vec(), b"2".to_vec());
 
+    let before = namespace_snapshot(directory.path()).unwrap();
     let stats = store.storage_stats().unwrap();
 
     assert_eq!(stats.family(), StoreFamily::KeyValue);
@@ -28,4 +31,5 @@ fn open_key_value_stats_match_current_segment_files() {
         stats.total_bytes(),
         stats.active_bytes() + stats.sealed_segment_bytes()
     );
+    assert_eq!(namespace_snapshot(directory.path()).unwrap(), before);
 }

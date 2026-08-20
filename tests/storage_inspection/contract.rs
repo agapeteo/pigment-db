@@ -6,12 +6,16 @@ use pigment_db::key_value_store::DurableKeyValueStore;
 use pigment_db::{inspect_storage, DurableStoreOptions, StoreFamily, WalSegmentSize};
 use std::io::Write as _;
 
+use crate::maintenance_support::namespace_snapshot;
+
 #[test]
 fn public_inspection_and_open_store_methods_report_exact_deterministic_totals() {
     let empty = tempfile::tempdir().unwrap();
+    let empty_before = namespace_snapshot(empty.path()).unwrap();
     let empty_stats = inspect_storage(empty.path()).unwrap();
     assert!(empty_stats.families().is_empty());
     assert_eq!(empty_stats.total_bytes(), 0);
+    assert_eq!(namespace_snapshot(empty.path()).unwrap(), empty_before);
 
     let directory = tempfile::tempdir().unwrap();
     let options = DurableStoreOptions::default()
@@ -32,6 +36,7 @@ fn public_inspection_and_open_store_methods_report_exact_deterministic_totals() 
     map.put(b"book".to_vec(), 1_usize.into(), b"one".to_vec());
     map.put(b"book".to_vec(), 2_usize.into(), b"two".to_vec());
 
+    let before = namespace_snapshot(directory.path()).unwrap();
     let directory_stats = inspect_storage(directory.path()).unwrap();
     assert_eq!(
         directory_stats
@@ -66,6 +71,7 @@ fn public_inspection_and_open_store_methods_report_exact_deterministic_totals() 
         );
         assert!(actual.sealed_segment_count() >= 1);
     }
+    assert_eq!(namespace_snapshot(directory.path()).unwrap(), before);
 }
 
 #[test]
@@ -85,10 +91,15 @@ fn public_inspection_measures_a_recoverable_tail_without_repair() {
     file.flush().unwrap();
     drop(file);
     let before = std::fs::read(&path).unwrap();
+    let namespace_before = namespace_snapshot(directory.path()).unwrap();
 
     let stats = inspect_storage(directory.path()).unwrap();
 
     assert_eq!(stats.families().len(), 1);
     assert_eq!(stats.total_bytes(), u64::try_from(before.len()).unwrap());
     assert_eq!(std::fs::read(path).unwrap(), before);
+    assert_eq!(
+        namespace_snapshot(directory.path()).unwrap(),
+        namespace_before
+    );
 }

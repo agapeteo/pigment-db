@@ -30,6 +30,7 @@ pub(crate) struct FamilyInspection {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum InspectedFamily {
     KeyValue,
     KeySet,

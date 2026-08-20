@@ -154,9 +154,11 @@ fn unknown_entry(root: &std::path::Path) {
     std::fs::write(root.join("notes.txt"), b"not a Pigment DB artifact").unwrap();
 }
 
+type InvalidArtifactCase = (&'static str, fn(&std::path::Path));
+
 #[test]
 fn invalid_artifacts_are_rejected_without_mutation() {
-    let cases: &[(&str, fn(&std::path::Path))] = &[
+    let cases: &[InvalidArtifactCase] = &[
         ("malformed segment name", malformed_segment_name),
         ("missing leading segment", missing_leading_segment),
         ("missing middle segment", missing_middle_segment),

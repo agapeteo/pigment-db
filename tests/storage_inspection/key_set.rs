@@ -3,6 +3,8 @@
 use pigment_db::key_set_store::DurableKeySetStore;
 use pigment_db::StoreFamily;
 
+use crate::maintenance_support::namespace_snapshot;
+
 #[test]
 fn open_key_set_stats_are_family_specialized() {
     let directory = tempfile::tempdir().unwrap();
@@ -11,9 +13,11 @@ fn open_key_set_stats_are_family_specialized() {
         .into_store();
     store.append(b"set".to_vec(), b"member".to_vec());
 
+    let before = namespace_snapshot(directory.path()).unwrap();
     let stats = store.storage_stats().unwrap();
 
     assert_eq!(stats.family(), StoreFamily::KeySet);
     assert_eq!(stats.sealed_segment_count(), 0);
     assert_eq!(stats.total_bytes(), stats.active_bytes());
+    assert_eq!(namespace_snapshot(directory.path()).unwrap(), before);
 }
