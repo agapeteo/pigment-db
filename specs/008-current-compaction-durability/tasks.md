@@ -62,8 +62,8 @@
 
 ### RED–GREEN inspection slices
 
-- [ ] T019 [US1] Write and run a runtime RED for an empty directory returning no families, zero total, and an unchanged namespace through the private inspection seam in `src/compaction/inspection.rs`
-- [ ] T020 [US1] Implement only empty-directory discovery and immutable directory opening in `src/compaction/inspection.rs`, then run T019 GREEN
+- [X] T019 [US1] Write and run a runtime RED for an empty directory returning no families, zero total, and an unchanged namespace through the private inspection seam in `src/compaction/inspection.rs`
+- [X] T020 [US1] Implement only empty-directory discovery and immutable directory opening in `src/compaction/inspection.rs`, then run T019 GREEN
 - [ ] T021 [US1] Write and run a runtime RED for exact active-only key/value, key/set, key/map, and deterministic family ordering through the private seam in `src/compaction/inspection_tests.rs`
 - [ ] T022 [US1] Implement canonical active discovery, current-V2 replay validation, and family identity extraction in `src/compaction/inspection.rs` and `src/wal/replay.rs`, then run T021 GREEN
 - [ ] T023 [US1] Write and run a runtime RED for the single strict-directory behavior: contiguous sealed segments produce exact active/sealed/count/total bytes, while any unexpected entry rejects inspection and leaves the directory byte-identical in `src/compaction/inspection_tests.rs`
