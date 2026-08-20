@@ -1483,6 +1483,44 @@ pub(crate) fn encode_key_map_snapshot(
     bytes
 }
 
+pub(crate) fn encode_current_key_map_snapshot(
+    snapshot: &KeyMapSnapshot,
+) -> Result<Vec<u8>, ValidationError> {
+    let mut encoded = V2CodecProbe::encode_header(V2HeaderProbeFields {
+        kind: 3,
+        granularity_nanos: 60_000_000_000,
+        base_bucket: 0,
+        segment_id: 0,
+        segment_base: 0,
+    })
+    .to_vec();
+    let mut keys = snapshot.keys().collect::<Vec<_>>();
+    keys.sort();
+    for key in keys {
+        for (search_key, value) in &snapshot[key] {
+            let offset = encoded.len();
+            let start =
+                u64::try_from(offset).map_err(|_| ValidationError::InvalidPayload { offset })?;
+            let payload = bincode::serialize(&SortedMapEntry::new(
+                key.clone(),
+                search_key.clone(),
+                value.clone(),
+            ))
+            .map_err(|_| ValidationError::InvalidPayload { offset })?;
+            encoded.extend_from_slice(&V2CodecProbe::encode_complete_record(V2RecordProbeFields {
+                action: MAP_PUT_V2_ACT,
+                payload: &payload,
+                physical_start: start,
+                mutation_start: start,
+                index: 0,
+                count: 1,
+                timestamp_bucket: 0,
+            }));
+        }
+    }
+    Ok(encoded)
+}
+
 pub(crate) fn key_map_is_proper_snapshot_prefix(
     active: &HashMap<Vec<u8>, BTreeMap<SearchKey, Vec<u8>>>,
     legacy: &HashMap<Vec<u8>, BTreeMap<SearchKey, Vec<u8>>>,
