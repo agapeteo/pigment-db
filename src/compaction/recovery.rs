@@ -1,8 +1,177 @@
 //! Interrupted-compaction recovery internals.
 
+#![allow(dead_code)]
+
+use std::collections::BTreeSet;
 use std::ffi::OsString;
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+
+use super::manifest::{
+    verify_descriptor, ArtifactDescriptor, CompactionManifest, ManifestMode, ManifestPhase,
+    ManifestScope,
+};
+use super::publication::MaintenanceArtifactPaths;
+use crate::wal::replay::{
+    classify_key_map_read_only, classify_key_set_read_only, classify_key_value_read_only,
+};
+use crate::{CompactionError, CompactionOperation, StoreFamily};
+
+pub(crate) fn recover_prepared_closed(
+    store_dir: &Path,
+    paths: &MaintenanceArtifactPaths,
+    manifest: &CompactionManifest,
+) -> Result<(), CompactionError> {
+    if manifest.phase != ManifestPhase::Prepared
+        || manifest.mode != ManifestMode::ClosedDirectory
+        || manifest.scope != ManifestScope::Directory
+        || !manifest.source_finalized
+    {
+        return Err(CompactionError::FailedClosed {
+            detail: "closed Prepared recovery received contradictory manifest state".to_owned(),
+        });
+    }
+
+    let canonical_exists = path_exists(store_dir)?;
+    let previous_exists = path_exists(&paths.previous)?;
+    let canonical_valid =
+        canonical_exists && generation_matches(store_dir, &manifest.source_inventory);
+    let previous_valid =
+        previous_exists && generation_matches(&paths.previous, &manifest.source_inventory);
+    match (
+        canonical_exists,
+        canonical_valid,
+        previous_exists,
+        previous_valid,
+    ) {
+        (true, true, false, _) => {}
+        (false, _, true, true) => {
+            fs::rename(&paths.previous, store_dir).map_err(|source| CompactionError::Io {
+                operation: CompactionOperation::PublishPrevious,
+                path: store_dir.to_path_buf(),
+                source,
+            })?;
+        }
+        _ => {
+            let mut evidence = vec![store_dir.to_path_buf(), paths.previous.clone()];
+            if path_exists(&paths.staging).unwrap_or(true) {
+                evidence.push(paths.staging.clone());
+            }
+            return Err(CompactionError::AuthorityUndetermined { paths: evidence });
+        }
+    }
+
+    if path_exists(&paths.staging)?
+        && !generation_matches(&paths.staging, &manifest.replacement_inventory)
+    {
+        let metadata =
+            fs::symlink_metadata(&paths.staging).map_err(|source| CompactionError::Io {
+                operation: CompactionOperation::Cleanup,
+                path: paths.staging.clone(),
+                source,
+            })?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(CompactionError::AuthorityUndetermined {
+                paths: vec![store_dir.to_path_buf(), paths.staging.clone()],
+            });
+        }
+        fs::remove_dir_all(&paths.staging).map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::Cleanup,
+            path: paths.staging.clone(),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn source_descriptors_match(anchor: &Path, manifest: &CompactionManifest) -> bool {
+    let prefix_mode = manifest.phase == ManifestPhase::Prepared
+        && manifest.mode == ManifestMode::OnlineFamily
+        && !manifest.source_finalized;
+    manifest.source_inventory.iter().all(|descriptor| {
+        let path = anchor.join(&descriptor.relative_path);
+        if !prefix_mode {
+            return verify_descriptor(anchor, descriptor).is_ok();
+        }
+        let Ok(bytes) = fs::read(path) else {
+            return false;
+        };
+        let Ok(length) = usize::try_from(descriptor.length) else {
+            return false;
+        };
+        let Some(prefix) = bytes.get(..length) else {
+            return false;
+        };
+        if crc32fast::hash(prefix) != descriptor.checksum {
+            return false;
+        }
+        match descriptor.family {
+            Some(StoreFamily::KeyValue) => classify_key_value_read_only(&bytes).is_ok(),
+            Some(StoreFamily::KeySet) => classify_key_set_read_only(&bytes).is_ok(),
+            Some(StoreFamily::KeyMap) => classify_key_map_read_only(&bytes).is_ok(),
+            None => false,
+        }
+    })
+}
+
+fn path_exists(path: &Path) -> Result<bool, CompactionError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(CompactionError::Io {
+            operation: CompactionOperation::Inspect,
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn generation_matches(location: &Path, descriptors: &[ArtifactDescriptor]) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(location) else {
+        return false;
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    let Some(parent) = location.parent() else {
+        return false;
+    };
+    let Some(location_name) = location.file_name() else {
+        return false;
+    };
+    let mut expected_names = BTreeSet::new();
+    for source in descriptors {
+        let Some(file_name) = source.relative_path.file_name() else {
+            return false;
+        };
+        if !expected_names.insert(OsString::from(file_name)) {
+            return false;
+        }
+        let mut translated = source.clone();
+        translated.relative_path = PathBuf::from(location_name).join(file_name);
+        if verify_descriptor(parent, &translated).is_err() {
+            return false;
+        }
+    }
+    let Ok(entries) = fs::read_dir(location) else {
+        return false;
+    };
+    let mut actual_names = BTreeSet::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let Ok(file_type) = entry.file_type() else {
+            return false;
+        };
+        if !file_type.is_file() {
+            return false;
+        }
+        actual_names.insert(entry.file_name());
+    }
+    actual_names == expected_names
+}
 
 #[derive(Debug, Default, Eq, PartialEq)]
 pub(crate) struct UntrustedMaintenanceEvidence {

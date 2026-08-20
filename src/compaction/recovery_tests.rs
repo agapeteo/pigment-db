@@ -1,13 +1,16 @@
 //! Private compaction-recovery behavior tests.
 
 use crate::compaction::manifest::ManifestPhase;
+use crate::compaction::manifest::{
+    ArtifactDescriptor, ArtifactRole, CompactionManifest, ManifestMode, ManifestScope,
+};
 use crate::compaction::publication::{
     cleanup_closed_with_checkpoint, publish_closed_prepared,
     publish_closed_previous_with_checkpoint, publish_closed_replacement_with_checkpoint,
     read_published_manifest, ClosedCleanupStage, ClosedPreviousStage, ClosedReplacementStage,
 };
 use crate::test_support::maintenance_fixtures::{
-    create_segmented_v2, snapshot_directory, FixtureFamily,
+    active_name, create_current_v2, create_segmented_v2, snapshot_directory, FixtureFamily,
 };
 
 fn prepared_fixture() -> (
@@ -282,4 +285,98 @@ fn cleanup_is_phase_ordered_exact_manifest_last_and_faults_are_pending() {
     assert_eq!(snapshot_directory(&store_dir).unwrap(), canonical);
     assert!(!prepared.paths.previous.exists());
     assert!(!prepared.paths.manifest.exists());
+}
+
+#[test]
+fn prepared_recovery_restores_verified_old_and_discards_only_incomplete_owned_staging() {
+    let (_root, store_dir, prepared) = prepared_fixture();
+    let old = snapshot_directory(&store_dir).unwrap();
+    let staging = snapshot_directory(&prepared.paths.staging).unwrap();
+    let manifest = publish_closed_prepared(&prepared, crate::DurabilityPolicy::Buffered).unwrap();
+    crate::compaction::recovery::recover_prepared_closed(&store_dir, &prepared.paths, &manifest)
+        .unwrap();
+    assert_eq!(snapshot_directory(&store_dir).unwrap(), old);
+    assert_eq!(
+        snapshot_directory(&prepared.paths.staging).unwrap(),
+        staging
+    );
+    assert!(!prepared.paths.previous.exists());
+
+    let (_root, store_dir, prepared) = prepared_fixture();
+    let old = snapshot_directory(&store_dir).unwrap();
+    let mut manifest =
+        publish_closed_prepared(&prepared, crate::DurabilityPolicy::Buffered).unwrap();
+    assert!(
+        publish_closed_previous_with_checkpoint(&prepared, &mut manifest, |stage| {
+            if stage == ClosedPreviousStage::SourceMoved {
+                Err(std::io::Error::other("injected split Prepared"))
+            } else {
+                Ok(())
+            }
+        })
+        .is_err()
+    );
+    crate::compaction::recovery::recover_prepared_closed(&store_dir, &prepared.paths, &manifest)
+        .unwrap();
+    assert_eq!(snapshot_directory(&store_dir).unwrap(), old);
+    assert!(!prepared.paths.previous.exists());
+    crate::compaction::recovery::recover_prepared_closed(&store_dir, &prepared.paths, &manifest)
+        .unwrap();
+
+    let (_root, store_dir, prepared) = prepared_fixture();
+    let old = snapshot_directory(&store_dir).unwrap();
+    let manifest = publish_closed_prepared(&prepared, crate::DurabilityPolicy::Buffered).unwrap();
+    let staged_active = prepared.paths.staging.join("kv.wal.dat");
+    std::fs::write(&staged_active, b"incomplete-owned-staging").unwrap();
+    crate::compaction::recovery::recover_prepared_closed(&store_dir, &prepared.paths, &manifest)
+        .unwrap();
+    assert_eq!(snapshot_directory(&store_dir).unwrap(), old);
+    assert!(!prepared.paths.staging.exists());
+    assert!(prepared.paths.manifest.is_file());
+}
+
+#[test]
+fn only_unfinalized_online_prepared_accepts_valid_source_prefix_advancement() {
+    let directory = tempfile::tempdir().unwrap();
+    create_current_v2(directory.path(), FixtureFamily::KeyValue);
+    let active = directory.path().join(active_name(FixtureFamily::KeyValue));
+    let prefix = std::fs::read(&active).unwrap();
+    let descriptor = ArtifactDescriptor {
+        relative_path: std::path::PathBuf::from(active_name(FixtureFamily::KeyValue)),
+        role: ArtifactRole::Active,
+        family: Some(crate::StoreFamily::KeyValue),
+        length: u64::try_from(prefix.len()).unwrap(),
+        checksum: crc32fast::hash(&prefix),
+    };
+    let store = crate::key_value_store::DurableKeyValueStore::try_init_new(directory.path())
+        .unwrap()
+        .into_store();
+    store.put(b"advanced".to_vec(), b"value".to_vec());
+    drop(store);
+    assert!(std::fs::metadata(&active).unwrap().len() > descriptor.length);
+
+    let mut manifest = CompactionManifest {
+        operation_id: *b"prefix-advance-1",
+        mode: ManifestMode::OnlineFamily,
+        scope: ManifestScope::Family {
+            family: crate::StoreFamily::KeyValue,
+            active_name: std::path::PathBuf::from(active_name(FixtureFamily::KeyValue)),
+        },
+        phase: ManifestPhase::Prepared,
+        source_finalized: false,
+        durability: crate::DurabilityPolicy::Buffered,
+        source_inventory: vec![descriptor],
+        staging_location: std::path::PathBuf::from("kv.wal.dat.pigment-compact.next"),
+        previous_location: std::path::PathBuf::from("kv.wal.dat.pigment-compact.previous"),
+        replacement_inventory: Vec::new(),
+    };
+    assert!(crate::compaction::recovery::source_descriptors_match(
+        directory.path(),
+        &manifest
+    ));
+    manifest.source_finalized = true;
+    assert!(!crate::compaction::recovery::source_descriptors_match(
+        directory.path(),
+        &manifest
+    ));
 }
