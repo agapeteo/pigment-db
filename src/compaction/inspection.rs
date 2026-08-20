@@ -4,6 +4,7 @@ use std::collections::{btree_map::Entry, BTreeMap};
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::recovery::{classify_runtime_envelope, RuntimeEnvelopeClassification};
 use crate::wal::recovery::canonical_sealed_segment_id;
 use crate::wal::replay::{
     classify_key_map_read_only, classify_key_set_read_only, classify_key_value_read_only,
@@ -37,6 +38,14 @@ impl InspectedFamily {
             Self::KeyValue => "kv.wal.dat",
             Self::KeySet => "set.wal.dat",
             Self::KeyMap => "map.wal.dat",
+        }
+    }
+
+    fn record_kind(self) -> u8 {
+        match self {
+            Self::KeyValue => 1,
+            Self::KeySet => 2,
+            Self::KeyMap => 3,
         }
     }
 }
@@ -73,6 +82,16 @@ fn invalid_artifact(detail: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, detail)
 }
 
+fn migration_required(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "recognized older Pigment DB artifact at {} requires explicit migration with pigment-db-migrate",
+            path.display()
+        ),
+    )
+}
+
 fn validate_current_chain(
     family: InspectedFamily,
     sealed: &BTreeMap<u64, PathBuf>,
@@ -93,6 +112,16 @@ fn validate_current_chain(
     let active_byte_len = u64::try_from(active_bytes.len())
         .map_err(|_| invalid_artifact("active length exceeds u64"))?;
     chain.extend_from_slice(&active_bytes);
+    if classify_runtime_envelope(&chain, family.record_kind())
+        == RuntimeEnvelopeClassification::RecognizedOlder
+    {
+        let affected_path = sealed
+            .values()
+            .next()
+            .map(PathBuf::as_path)
+            .unwrap_or(active);
+        return Err(migration_required(affected_path));
+    }
     let is_current_v2 = chain.starts_with(b"PIGWAL\r\n")
         && chain
             .get(8..10)

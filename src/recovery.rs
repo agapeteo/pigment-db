@@ -12,6 +12,148 @@ use std::io;
 use std::path::PathBuf;
 
 use crate::durability::DurabilitySupportError;
+use crate::wal::format::V1CodecProbe;
+use crate::wal::model::{
+    DELETE_ACT, MAP_PUT_ACT, MAP_REMOVE_ACT, PUT_ACT, SET_APPEND_ACT, SET_REMOVE_ACT,
+};
+use crate::wal::replay::CheckedFrames;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeEnvelopeClassification {
+    Current,
+    RecognizedOlder,
+    Invalid,
+}
+
+fn action_matches_family(expected_kind: u8, action: u8) -> bool {
+    match expected_kind {
+        1 => matches!(action, DELETE_ACT | PUT_ACT),
+        2 => matches!(action, DELETE_ACT | SET_APPEND_ACT | SET_REMOVE_ACT),
+        3 => matches!(action, DELETE_ACT | MAP_PUT_ACT | MAP_REMOVE_ACT),
+        _ => false,
+    }
+}
+
+fn complete_unversioned_envelope(bytes: &[u8], expected_kind: u8) -> bool {
+    CheckedFrames::new(bytes)
+        .all(|frame| frame.is_ok_and(|frame| action_matches_family(expected_kind, frame.action())))
+}
+
+fn complete_v1_envelope(bytes: &[u8], expected_kind: u8) -> bool {
+    let header_valid = bytes.len() >= V1CodecProbe::HEADER_LEN
+        && V1CodecProbe::magic_is_valid(bytes)
+        && V1CodecProbe::version_is_valid(bytes)
+        && V1CodecProbe::header_length_is_valid(bytes)
+        && V1CodecProbe::kind_is_valid(bytes)
+        && bytes[12] == expected_kind
+        && V1CodecProbe::timestamp_unit_is_valid(bytes)
+        && V1CodecProbe::flags_are_valid(bytes)
+        && V1CodecProbe::granularity_is_valid(bytes)
+        && V1CodecProbe::reserved_is_valid(bytes)
+        && V1CodecProbe::header_crc_is_valid(bytes);
+    if !header_valid {
+        return false;
+    }
+
+    let mut offset = V1CodecProbe::HEADER_LEN;
+    let mut group = None::<(u32, u32, u32, u64)>;
+    let mut previous_timestamp = V1CodecProbe::base_bucket(bytes).unwrap_or(0);
+    while offset < bytes.len() {
+        let Some(payload_len) = bytes
+            .get(offset + 6..offset + 10)
+            .and_then(|value| value.try_into().ok())
+            .map(u32::from_le_bytes)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            return false;
+        };
+        let Some(end) = offset
+            .checked_add(V1CodecProbe::EMPTY_RECORD_LEN)
+            .and_then(|fixed| fixed.checked_add(payload_len))
+            .filter(|end| *end <= bytes.len())
+        else {
+            return false;
+        };
+        let frame = &bytes[offset..end];
+        let action = frame[3];
+        let structurally_valid = action_matches_family(expected_kind, action)
+            && V1CodecProbe::record_marker_is_valid(frame)
+            && V1CodecProbe::record_version_is_valid(frame)
+            && V1CodecProbe::record_action_is_valid(frame)
+            && V1CodecProbe::record_header_length_is_valid(frame)
+            && V1CodecProbe::record_length_complement_is_valid(frame)
+            && u32::try_from(offset)
+                .is_ok_and(|start| V1CodecProbe::record_physical_start_is_valid(frame, start))
+            && V1CodecProbe::record_mutation_start_is_valid(frame)
+            && V1CodecProbe::record_index_count_are_valid(frame)
+            && V1CodecProbe::record_timestamp_bucket(frame).is_some()
+            && V1CodecProbe::record_crc_is_valid(frame);
+        if !structurally_valid {
+            return false;
+        }
+
+        let mutation_start = u32::from_le_bytes(frame[18..22].try_into().unwrap());
+        let index = u32::from_le_bytes(frame[22..26].try_into().unwrap());
+        let count = u32::from_le_bytes(frame[26..30].try_into().unwrap());
+        let timestamp = u64::from_le_bytes(frame[30..38].try_into().unwrap());
+        match group {
+            None => {
+                if index != 0
+                    || usize::try_from(mutation_start).ok() != Some(offset)
+                    || timestamp < previous_timestamp
+                {
+                    return false;
+                }
+                group = Some((mutation_start, 1, count, timestamp));
+            }
+            Some((expected_start, expected_index, expected_count, expected_timestamp)) => {
+                if mutation_start != expected_start
+                    || index != expected_index
+                    || count != expected_count
+                    || timestamp != expected_timestamp
+                {
+                    return false;
+                }
+                group = Some((
+                    expected_start,
+                    expected_index + 1,
+                    expected_count,
+                    timestamp,
+                ));
+            }
+        }
+        if group.is_some_and(|(_, next_index, count, _)| next_index == count) {
+            previous_timestamp = timestamp;
+            group = None;
+        }
+        offset = end;
+    }
+    group.is_none()
+}
+
+pub(crate) fn classify_runtime_envelope(
+    bytes: &[u8],
+    expected_kind: u8,
+) -> RuntimeEnvelopeClassification {
+    if bytes.starts_with(b"PIGWAL\r\n") {
+        let version = bytes
+            .get(8..10)
+            .and_then(|value| value.try_into().ok())
+            .map(u16::from_le_bytes);
+        return match version {
+            Some(2) => RuntimeEnvelopeClassification::Current,
+            Some(1) if complete_v1_envelope(bytes, expected_kind) => {
+                RuntimeEnvelopeClassification::RecognizedOlder
+            }
+            _ => RuntimeEnvelopeClassification::Invalid,
+        };
+    }
+    if complete_unversioned_envelope(bytes, expected_kind) {
+        RuntimeEnvelopeClassification::RecognizedOlder
+    } else {
+        RuntimeEnvelopeClassification::Invalid
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Describes whether initialization resolved interrupted-maintenance artifacts.

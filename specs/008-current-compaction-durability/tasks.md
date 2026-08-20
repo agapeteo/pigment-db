@@ -72,8 +72,8 @@
 - [X] T026 [US1] Implement only the strict canonical namespace and current-record validation needed for T025 in `src/compaction/inspection.rs`, then run T025 GREEN and T021–T024
 - [X] T027 [US1] Write and run a runtime RED proving a normally recoverable terminal current-V2 tail is classified and measured without repair, truncate, rename, create, or sync in `src/compaction/inspection_tests.rs`
 - [X] T028 [US1] Factor a read-only accepted-prefix replay/classification path without invoking normal recovery mutation in `src/wal/replay.rs` and `src/compaction/inspection.rs`, then run T027 GREEN
-- [ ] T029 [US1] Write and run a runtime RED proving every recognized older envelope returns the affected path and `pigment-db-migrate` guidance without decoding application data in `src/compaction/inspection_tests.rs`
-- [ ] T030 [US1] Implement a bounded shallow legacy-envelope classifier shared with runtime recovery but not migration conversion in `src/compaction/inspection.rs` and `src/recovery.rs`, then run T029 GREEN
+- [X] T029 [US1] Write and run a runtime RED proving every recognized older envelope returns the affected path and `pigment-db-migrate` guidance without decoding application data in `src/compaction/inspection_tests.rs`
+- [X] T030 [US1] Implement a bounded shallow legacy-envelope classifier shared with runtime recovery but not migration conversion in `src/compaction/inspection.rs` and `src/recovery.rs`, then run T029 GREEN
 - [ ] T031 [US1] Write and run a runtime RED distinguishing ambiguous complete maintenance generations from invalid non-competing debris while preserving every byte in `src/compaction/inspection_tests.rs`
 - [ ] T032 [US1] Implement read-only maintenance-evidence classification and exact relevant-path collection in `src/compaction/inspection.rs` and `src/compaction/recovery.rs`, then run T031 GREEN
 - [ ] T033 [US1] Write and run a runtime RED for checked per-family and directory arithmetic overflow using synthetic descriptors in `src/compaction/inspection.rs`

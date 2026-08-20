@@ -14,6 +14,7 @@ use crate::durability::{
     preflight_directory, preflight_file, preflight_file_handle, synchronize_directory,
     validate_compile_target,
 };
+use crate::recovery::{classify_runtime_envelope, RuntimeEnvelopeClassification};
 use crate::wal::format::{
     HeaderProbeClassification, V1CodecProbe, V2CodecProbe, V2HeaderProbeFields,
 };
@@ -36,6 +37,14 @@ impl StoreKind {
             Self::Map => "map.wal.dat",
         }
     }
+
+    fn record_kind(self) -> u8 {
+        match self {
+            Self::Value => 1,
+            Self::Set => 2,
+            Self::Map => 3,
+        }
+    }
 }
 
 pub(crate) fn canonical_sealed_segment_id(name: &OsStr, active_name: &str) -> Option<u64> {
@@ -50,6 +59,7 @@ pub(crate) fn canonical_sealed_segment_id(name: &OsStr, active_name: &str) -> Op
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ArtifactPaths {
+    pub(crate) kind: StoreKind,
     pub(crate) active: PathBuf,
     pub(crate) legacy: PathBuf,
     pub(crate) staging: PathBuf,
@@ -59,6 +69,7 @@ impl ArtifactPaths {
     pub(crate) fn new(directory: &Path, kind: StoreKind) -> Self {
         let file_name = kind.file_name();
         Self {
+            kind,
             active: directory.join(file_name),
             legacy: directory.join(format!(".{file_name}")),
             staging: directory.join(format!(".{file_name}.next")),
@@ -1723,6 +1734,26 @@ fn initialize_snapshot_impl<S: Clone + Eq + Default>(
                 RecoveryStatus::Normal
             },
         });
+    }
+    if !allow_v1_startup {
+        if active_bytes.as_deref().is_some_and(|bytes| {
+            classify_runtime_envelope(bytes, paths.kind.record_kind())
+                == RuntimeEnvelopeClassification::RecognizedOlder
+        }) {
+            return Err(RecoveryError::MigrationRequired {
+                path: paths.active.clone(),
+            });
+        }
+        if active_bytes.is_none()
+            && legacy_bytes.as_deref().is_some_and(|bytes| {
+                classify_runtime_envelope(bytes, paths.kind.record_kind())
+                    == RuntimeEnvelopeClassification::RecognizedOlder
+            })
+        {
+            return Err(RecoveryError::MigrationRequired {
+                path: paths.legacy.clone(),
+            });
+        }
     }
     let active_is_versioned = active_bytes
         .as_deref()

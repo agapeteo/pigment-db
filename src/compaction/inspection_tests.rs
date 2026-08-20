@@ -215,3 +215,87 @@ fn recoverable_terminal_tail_is_measured_without_repair() {
         assert_eq!(snapshot_directory(directory.path()).unwrap(), before);
     }
 }
+
+fn v1_header(kind: u8) -> [u8; 40] {
+    let mut bytes = [0; 40];
+    bytes[..8].copy_from_slice(b"PIGWAL\r\n");
+    bytes[8..10].copy_from_slice(&1_u16.to_le_bytes());
+    bytes[10..12].copy_from_slice(&40_u16.to_le_bytes());
+    bytes[12] = kind;
+    bytes[13] = 1;
+    bytes[16..24].copy_from_slice(&60_000_000_000_u64.to_le_bytes());
+    let crc = crc32fast::hash(&bytes[..36]);
+    bytes[36..40].copy_from_slice(&crc.to_le_bytes());
+    bytes
+}
+
+fn opaque_v1_value_envelope() -> Vec<u8> {
+    use crate::wal::format::{RecordProbeFields, V1CodecProbe};
+
+    let mut bytes = V1CodecProbe::encode_header_with_kind(1).to_vec();
+    bytes.extend_from_slice(&V1CodecProbe::encode_complete_record(RecordProbeFields {
+        action: 1,
+        payload: &[0xff],
+        physical_start: V1CodecProbe::HEADER_LEN as u32,
+        mutation_start: V1CodecProbe::HEADER_LEN as u32,
+        index: 0,
+        count: 1,
+        timestamp_bucket: 0,
+    }));
+    bytes
+}
+
+#[test]
+fn recognized_older_envelopes_require_external_migration_without_mutation() {
+    let cases = [
+        (
+            "legacy key/value",
+            FixtureFamily::KeyValue,
+            include_bytes!("../../tests/fixtures/legacy/kv.wal.dat").to_vec(),
+        ),
+        (
+            "legacy key/set",
+            FixtureFamily::KeySet,
+            include_bytes!("../../tests/fixtures/legacy/set.wal.dat").to_vec(),
+        ),
+        (
+            "legacy key/map",
+            FixtureFamily::KeyMap,
+            include_bytes!("../../tests/fixtures/legacy/map.wal.dat").to_vec(),
+        ),
+        (
+            "V1 key/value",
+            FixtureFamily::KeyValue,
+            v1_header(1).to_vec(),
+        ),
+        ("V1 key/set", FixtureFamily::KeySet, v1_header(2).to_vec()),
+        ("V1 key/map", FixtureFamily::KeyMap, v1_header(3).to_vec()),
+        (
+            "V1 opaque application payload",
+            FixtureFamily::KeyValue,
+            opaque_v1_value_envelope(),
+        ),
+    ];
+
+    for (name, family, bytes) in &cases {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(active_name(*family));
+        std::fs::write(&path, bytes).unwrap();
+        let before = snapshot_directory(directory.path()).unwrap();
+
+        let error = inspect_directory(directory.path()).unwrap_err();
+        let message = error.to_string();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported, "{name}");
+        assert!(
+            message.contains(path.to_str().unwrap()),
+            "{name}: {message}"
+        );
+        assert!(message.contains("pigment-db-migrate"), "{name}: {message}");
+        assert_eq!(
+            snapshot_directory(directory.path()).unwrap(),
+            before,
+            "{name} must remain byte-identical"
+        );
+    }
+}
