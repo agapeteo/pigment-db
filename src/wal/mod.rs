@@ -38,6 +38,12 @@ mod ordering_tests;
 #[cfg(test)]
 mod durability_tests;
 
+#[cfg(test)]
+mod maintenance_tests;
+
+#[cfg(test)]
+pub(crate) fn maintenance_test_sentinel() {}
+
 struct WalState<W: Write> {
     offset: u64,
     active_len: u64,

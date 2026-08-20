@@ -55,3 +55,54 @@ fn recovery_workflow_runs_the_complete_suite_on_linux() {
         "recovery workflow must run the complete all-target/all-feature suite on Linux"
     );
 }
+
+#[test]
+fn maintenance_skeletons_are_registered_without_public_crate_exports() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    for relative in [
+        "src/maintenance.rs",
+        "src/compaction/mod.rs",
+        "src/compaction/inspection.rs",
+        "src/compaction/manifest.rs",
+        "src/compaction/publication.rs",
+        "src/compaction/recovery.rs",
+        "src/compaction/inspection_tests.rs",
+        "src/compaction/closed_tests.rs",
+        "src/compaction/recovery_tests.rs",
+        "src/compaction/online_tests.rs",
+        "src/wal/maintenance_tests.rs",
+    ] {
+        assert!(root.join(relative).is_file(), "missing private {relative}");
+    }
+
+    let crate_root = fs::read_to_string(root.join("src/lib.rs")).expect("read crate root");
+    assert!(crate_root.lines().any(|line| line == "mod compaction;"));
+    assert!(crate_root.lines().any(|line| line == "mod maintenance;"));
+    assert!(!crate_root.contains("pub mod compaction"));
+    assert!(!crate_root.contains("pub mod maintenance"));
+    assert!(!crate_root.contains("pub use maintenance"));
+
+    let compaction = fs::read_to_string(root.join("src/compaction/mod.rs"))
+        .expect("read compaction module root");
+    for module in ["inspection", "manifest", "publication", "recovery"] {
+        assert!(
+            compaction
+                .lines()
+                .any(|line| line == format!("pub(crate) mod {module};")),
+            "private compaction module `{module}` is not registered"
+        );
+    }
+    for module in [
+        "inspection_tests",
+        "closed_tests",
+        "recovery_tests",
+        "online_tests",
+    ] {
+        let registration = format!("mod {module};");
+        assert!(compaction.contains("#[cfg(test)]"));
+        assert!(compaction.lines().any(|line| line == registration));
+    }
+
+    let wal = fs::read_to_string(root.join("src/wal/mod.rs")).expect("read WAL module root");
+    assert!(wal.contains("#[cfg(test)]\nmod maintenance_tests;"));
+}

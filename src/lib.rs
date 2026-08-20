@@ -11,8 +11,10 @@ pub mod key_value_store;
 pub mod model;
 pub mod recovery;
 pub use recovery::{RecoveryError, RecoveryOperation, RecoveryOutcome, RecoveryStatus};
+mod compaction;
 mod config;
 mod durability;
+mod maintenance;
 pub use config::{
     DurabilityPolicy, DurableStoreOptions, TimestampGranularity, TimestampGranularityError,
     WalSegmentSize, WalSegmentSizeError,
@@ -46,6 +48,11 @@ mod test_support;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn private_maintenance_skeleton_is_linked() {
+        super::maintenance::test_sentinel();
+    }
+
     #[test]
     fn it_works() {
         let result = 2 + 2;
