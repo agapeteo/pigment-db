@@ -60,6 +60,12 @@ pub(crate) struct V2RecordProbeFields<'a> {
     pub(crate) timestamp_bucket: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CurrentV2EncodingError {
+    InvalidMetadata,
+    OffsetOverflow,
+}
+
 impl V1CodecProbe {
     pub(crate) const HEADER_LEN: usize = 40;
     pub(crate) const EMPTY_RECORD_LEN: usize = 46;
@@ -724,4 +730,41 @@ impl V2CodecProbe {
         };
         stored == crc32fast::hash(&bytes[..crc_start])
     }
+}
+
+pub(crate) fn encode_current_v2_snapshot_header(
+    kind: u8,
+    granularity_nanos: u64,
+    last_bucket: u64,
+) -> Result<Vec<u8>, CurrentV2EncodingError> {
+    if !matches!(kind, 1..=3) || granularity_nanos == 0 {
+        return Err(CurrentV2EncodingError::InvalidMetadata);
+    }
+    Ok(V2CodecProbe::encode_header(V2HeaderProbeFields {
+        kind,
+        granularity_nanos,
+        base_bucket: last_bucket,
+        segment_id: 0,
+        segment_base: 0,
+    })
+    .to_vec())
+}
+
+pub(crate) fn append_current_v2_snapshot_record(
+    encoded: &mut Vec<u8>,
+    action: u8,
+    payload: &[u8],
+    timestamp_bucket: u64,
+) -> Result<(), CurrentV2EncodingError> {
+    let start = u64::try_from(encoded.len()).map_err(|_| CurrentV2EncodingError::OffsetOverflow)?;
+    encoded.extend_from_slice(&V2CodecProbe::encode_complete_record(V2RecordProbeFields {
+        action,
+        payload,
+        physical_start: start,
+        mutation_start: start,
+        index: 0,
+        count: 1,
+        timestamp_bucket,
+    }));
+    Ok(())
 }

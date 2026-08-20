@@ -3,7 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
-use super::format::{V1CodecProbe, V2CodecProbe, V2HeaderProbeFields, V2RecordProbeFields};
+use super::format::{
+    append_current_v2_snapshot_record, encode_current_v2_snapshot_header, V1CodecProbe,
+    V2CodecProbe,
+};
 use super::model::{
     crc, decode_current_sorted_map_entry, decode_current_sorted_map_key,
     decode_historical_sorted_map_entry, decode_historical_sorted_map_key, KeyValueData,
@@ -1200,34 +1203,29 @@ pub(crate) fn encode_key_value_snapshot(snapshot: &HashMap<Vec<u8>, Vec<u8>>) ->
     bytes
 }
 
+#[allow(dead_code)]
 pub(crate) fn encode_current_key_value_snapshot(
     snapshot: &KeyValueSnapshot,
 ) -> Result<Vec<u8>, ValidationError> {
-    let mut encoded = V2CodecProbe::encode_header(V2HeaderProbeFields {
-        kind: 1,
-        granularity_nanos: 60_000_000_000,
-        base_bucket: 0,
-        segment_id: 0,
-        segment_base: 0,
-    })
-    .to_vec();
+    encode_current_key_value_snapshot_with_metadata(snapshot, 60_000_000_000, 0)
+}
+
+#[allow(dead_code)]
+pub(crate) fn encode_current_key_value_snapshot_with_metadata(
+    snapshot: &KeyValueSnapshot,
+    granularity_nanos: u64,
+    last_bucket: u64,
+) -> Result<Vec<u8>, ValidationError> {
+    let mut encoded = encode_current_v2_snapshot_header(1, granularity_nanos, last_bucket)
+        .map_err(|_| ValidationError::InvalidPayload { offset: 0 })?;
     let mut entries = snapshot.iter().collect::<Vec<_>>();
     entries.sort_by_key(|(key, _)| *key);
     for (key, value) in entries {
         let offset = encoded.len();
-        let start =
-            u64::try_from(offset).map_err(|_| ValidationError::InvalidPayload { offset })?;
         let payload = bincode::serialize(&KeyValueData::new(key.clone(), value.clone()))
             .map_err(|_| ValidationError::InvalidPayload { offset })?;
-        encoded.extend_from_slice(&V2CodecProbe::encode_complete_record(V2RecordProbeFields {
-            action: PUT_ACT,
-            payload: &payload,
-            physical_start: start,
-            mutation_start: start,
-            index: 0,
-            count: 1,
-            timestamp_bucket: 0,
-        }));
+        append_current_v2_snapshot_record(&mut encoded, PUT_ACT, &payload, last_bucket)
+            .map_err(|_| ValidationError::InvalidPayload { offset })?;
     }
     Ok(encoded)
 }
@@ -1334,17 +1332,21 @@ pub(crate) fn encode_key_set_snapshot(snapshot: &HashMap<Vec<u8>, HashSet<Vec<u8
     bytes
 }
 
+#[allow(dead_code)]
 pub(crate) fn encode_current_key_set_snapshot(
     snapshot: &KeySetSnapshot,
 ) -> Result<Vec<u8>, ValidationError> {
-    let mut encoded = V2CodecProbe::encode_header(V2HeaderProbeFields {
-        kind: 2,
-        granularity_nanos: 60_000_000_000,
-        base_bucket: 0,
-        segment_id: 0,
-        segment_base: 0,
-    })
-    .to_vec();
+    encode_current_key_set_snapshot_with_metadata(snapshot, 60_000_000_000, 0)
+}
+
+#[allow(dead_code)]
+pub(crate) fn encode_current_key_set_snapshot_with_metadata(
+    snapshot: &KeySetSnapshot,
+    granularity_nanos: u64,
+    last_bucket: u64,
+) -> Result<Vec<u8>, ValidationError> {
+    let mut encoded = encode_current_v2_snapshot_header(2, granularity_nanos, last_bucket)
+        .map_err(|_| ValidationError::InvalidPayload { offset: 0 })?;
     let mut keys = snapshot.keys().collect::<Vec<_>>();
     keys.sort();
     for key in keys {
@@ -1352,19 +1354,10 @@ pub(crate) fn encode_current_key_set_snapshot(
         values.sort();
         for value in values {
             let offset = encoded.len();
-            let start =
-                u64::try_from(offset).map_err(|_| ValidationError::InvalidPayload { offset })?;
             let payload = bincode::serialize(&KeyValueData::new(key.clone(), value.clone()))
                 .map_err(|_| ValidationError::InvalidPayload { offset })?;
-            encoded.extend_from_slice(&V2CodecProbe::encode_complete_record(V2RecordProbeFields {
-                action: SET_APPEND_ACT,
-                payload: &payload,
-                physical_start: start,
-                mutation_start: start,
-                index: 0,
-                count: 1,
-                timestamp_bucket: 0,
-            }));
+            append_current_v2_snapshot_record(&mut encoded, SET_APPEND_ACT, &payload, last_bucket)
+                .map_err(|_| ValidationError::InvalidPayload { offset })?;
         }
     }
     Ok(encoded)
@@ -1483,39 +1476,34 @@ pub(crate) fn encode_key_map_snapshot(
     bytes
 }
 
+#[allow(dead_code)]
 pub(crate) fn encode_current_key_map_snapshot(
     snapshot: &KeyMapSnapshot,
 ) -> Result<Vec<u8>, ValidationError> {
-    let mut encoded = V2CodecProbe::encode_header(V2HeaderProbeFields {
-        kind: 3,
-        granularity_nanos: 60_000_000_000,
-        base_bucket: 0,
-        segment_id: 0,
-        segment_base: 0,
-    })
-    .to_vec();
+    encode_current_key_map_snapshot_with_metadata(snapshot, 60_000_000_000, 0)
+}
+
+#[allow(dead_code)]
+pub(crate) fn encode_current_key_map_snapshot_with_metadata(
+    snapshot: &KeyMapSnapshot,
+    granularity_nanos: u64,
+    last_bucket: u64,
+) -> Result<Vec<u8>, ValidationError> {
+    let mut encoded = encode_current_v2_snapshot_header(3, granularity_nanos, last_bucket)
+        .map_err(|_| ValidationError::InvalidPayload { offset: 0 })?;
     let mut keys = snapshot.keys().collect::<Vec<_>>();
     keys.sort();
     for key in keys {
         for (search_key, value) in &snapshot[key] {
             let offset = encoded.len();
-            let start =
-                u64::try_from(offset).map_err(|_| ValidationError::InvalidPayload { offset })?;
             let payload = bincode::serialize(&SortedMapEntry::new(
                 key.clone(),
                 search_key.clone(),
                 value.clone(),
             ))
             .map_err(|_| ValidationError::InvalidPayload { offset })?;
-            encoded.extend_from_slice(&V2CodecProbe::encode_complete_record(V2RecordProbeFields {
-                action: MAP_PUT_V2_ACT,
-                payload: &payload,
-                physical_start: start,
-                mutation_start: start,
-                index: 0,
-                count: 1,
-                timestamp_bucket: 0,
-            }));
+            append_current_v2_snapshot_record(&mut encoded, MAP_PUT_V2_ACT, &payload, last_bucket)
+                .map_err(|_| ValidationError::InvalidPayload { offset })?;
         }
     }
     Ok(encoded)

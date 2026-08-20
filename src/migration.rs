@@ -7,7 +7,9 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::model::SortedMapEntry;
-use crate::wal::format::{V2CodecProbe, V2HeaderProbeFields, V2RecordProbeFields};
+use crate::wal::format::{
+    append_current_v2_snapshot_record, encode_current_v2_snapshot_header, V2CodecProbe,
+};
 use crate::wal::model::{KeyValueData, MAP_PUT_V2_ACT, SET_APPEND_ACT};
 use crate::wal::replay::{
     replay_key_map, replay_key_map_tail, replay_key_set, replay_key_set_tail, replay_key_value,
@@ -932,31 +934,14 @@ impl MigrationProbe {
         granularity: u64,
         last_bucket: u64,
     ) -> Vec<u8> {
-        let header = V2CodecProbe::encode_header(V2HeaderProbeFields {
-            kind: 1,
-            granularity_nanos: granularity,
-            base_bucket: last_bucket,
-            segment_id: 0,
-            segment_base: 0,
-        });
-        let mut converted = header.to_vec();
+        let mut converted = encode_current_v2_snapshot_header(1, granularity, last_bucket)
+            .expect("validated migration metadata must encode");
         let mut entries = snapshot.iter().collect::<Vec<_>>();
         entries.sort_by_key(|(key, _)| *key);
         for (key, value) in entries {
             let payload = bincode::serialize(&KeyValueData::new(key.clone(), value.clone()))
                 .expect("captured legacy key/value state must encode");
-            let start = converted.len() as u64;
-            converted.extend_from_slice(&V2CodecProbe::encode_complete_record(
-                V2RecordProbeFields {
-                    action: 1,
-                    payload: &payload,
-                    physical_start: start,
-                    mutation_start: start,
-                    index: 0,
-                    count: 1,
-                    timestamp_bucket: last_bucket,
-                },
-            ));
+            Self::append_v2_snapshot_record(&mut converted, 1, &payload, last_bucket);
         }
         converted
     }
@@ -973,14 +958,8 @@ impl MigrationProbe {
         granularity: u64,
         last_bucket: u64,
     ) -> Vec<u8> {
-        let header = V2CodecProbe::encode_header(V2HeaderProbeFields {
-            kind: 2,
-            granularity_nanos: granularity,
-            base_bucket: last_bucket,
-            segment_id: 0,
-            segment_base: 0,
-        });
-        let mut converted = header.to_vec();
+        let mut converted = encode_current_v2_snapshot_header(2, granularity, last_bucket)
+            .expect("validated migration metadata must encode");
         let mut keys = snapshot.keys().collect::<Vec<_>>();
         keys.sort();
         for key in keys {
@@ -1005,14 +984,8 @@ impl MigrationProbe {
         granularity: u64,
         last_bucket: u64,
     ) -> Vec<u8> {
-        let header = V2CodecProbe::encode_header(V2HeaderProbeFields {
-            kind: 3,
-            granularity_nanos: granularity,
-            base_bucket: last_bucket,
-            segment_id: 0,
-            segment_base: 0,
-        });
-        let mut converted = header.to_vec();
+        let mut converted = encode_current_v2_snapshot_header(3, granularity, last_bucket)
+            .expect("validated migration metadata must encode");
         let mut keys = snapshot.keys().collect::<Vec<_>>();
         keys.sort();
         for key in keys {
@@ -1040,16 +1013,8 @@ impl MigrationProbe {
         payload: &[u8],
         timestamp_bucket: u64,
     ) {
-        let start = converted.len() as u64;
-        converted.extend_from_slice(&V2CodecProbe::encode_complete_record(V2RecordProbeFields {
-            action,
-            payload,
-            physical_start: start,
-            mutation_start: start,
-            index: 0,
-            count: 1,
-            timestamp_bucket,
-        }));
+        append_current_v2_snapshot_record(converted, action, payload, timestamp_bucket)
+            .expect("captured migration snapshot offset must fit current framing");
     }
 }
 

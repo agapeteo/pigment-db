@@ -113,8 +113,8 @@
 - [X] T048 [US2] Extend the GREEN current-V2 encoder for key/set groups in `src/wal/replay.rs`, then run T047 GREEN and T045
 - [X] T049 [US2] Write and run a runtime RED for deterministic key/map current-V2 snapshot encoding with exact sorted-map keys/values in `src/wal/maintenance_tests.rs`
 - [X] T050 [US2] Extend the GREEN current-V2 encoder for key/map groups without historical encoders in `src/wal/replay.rs`, then run T049 GREEN and T045–T048
-- [ ] T051 [US2] Write and run a runtime RED proving all snapshot encoders preserve family identity, timestamp granularity, last accepted bucket, checked offsets, and current V2 framing in `src/wal/maintenance_tests.rs`
-- [ ] T052 [US2] Factor neutral current-V2 header/frame helpers shared by migration output and compaction without calling migration probes in `src/wal/replay.rs`, `src/wal/format.rs`, and `src/migration.rs`, then run T051 GREEN and frozen migration tests
+- [X] T051 [US2] Write and run a runtime RED proving all snapshot encoders preserve family identity, timestamp granularity, last accepted bucket, checked offsets, and current V2 framing in `src/wal/maintenance_tests.rs`
+- [X] T052 [US2] Factor neutral current-V2 header/frame helpers shared by migration output and compaction without calling migration probes in `src/wal/replay.rs`, `src/wal/format.rs`, and `src/migration.rs`, then run T051 GREEN and frozen migration tests
 
 ### Manifest codec and atomic phase publication
 
