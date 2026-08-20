@@ -83,8 +83,8 @@
 
 ### Public US1 promotion and checkpoint
 
-- [ ] T037 [US1] Promote the already-GREEN family/statistics value model, common operation/error source/display chains, documented getters, and future-extensible types in `src/maintenance.rs` and crate-root exports in `src/lib.rs`, with first-execution-GREEN contract assertions in `tests/maintenance_api.rs`
-- [ ] T038 [US1] Promote `inspect_storage` plus three file-backed `storage_stats` methods over GREEN private behavior in `src/maintenance.rs`, `src/key_value_store.rs`, `src/key_set_store.rs`, and `src/key_map_store.rs`, then run first public executions GREEN in `tests/storage_inspection/contract.rs`
+- [X] T037 [US1] Promote the already-GREEN family/statistics value model, common operation/error source/display chains, documented getters, and future-extensible types in `src/maintenance.rs` and crate-root exports in `src/lib.rs`, with first-execution-GREEN contract assertions in `tests/maintenance_api.rs`
+- [X] T038 [US1] Promote `inspect_storage` plus three file-backed `storage_stats` methods over GREEN private behavior in `src/maintenance.rs`, `src/key_value_store.rs`, `src/key_set_store.rs`, and `src/key_map_store.rs`, then run first public executions GREEN in `tests/storage_inspection/contract.rs`
 - [ ] T039 [US1] Add first-execution-GREEN public integration matrices for every valid, legacy, invalid, unexpected, and ambiguous US1 fixture plus deterministic ordering, non-exhaustive matching, file-only specialization, error guidance/source, `Send`/`Sync`, and no-format-version assertions in `tests/maintenance_api.rs` and `tests/storage_inspection/{contract,key_value,key_set,key_map,invalid}.rs`
 - [ ] T040 [US1] Run the complete US1 suite and re-run every fixture with before/after native-name, metadata, and byte snapshots; record SC-001 and the US1 GREEN checkpoint in `specs/008-current-compaction-durability/quickstart.md`
 

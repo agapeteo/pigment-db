@@ -20,6 +20,11 @@ pub use config::{
     WalSegmentSize, WalSegmentSizeError,
 };
 pub use durability::{DurabilityCapability, DurabilitySupportError};
+pub use maintenance::{
+    inspect_storage, CleanupStatus, ClosedCompactionOptions, CompactionError, CompactionOperation,
+    DirectoryCompactionOutcome, DirectoryStorageStats, FamilyCompactionOutcome, FamilyStorageStats,
+    OnlineCompactionOptions, StoreFamily,
+};
 mod wal;
 pub use wal::{MutationFailure, PersistenceOperation};
 

@@ -1,6 +1,8 @@
 //! Current-format artifact inspection internals.
 
 use std::collections::{btree_map::Entry, BTreeMap};
+use std::error::Error;
+use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -31,6 +33,39 @@ pub(crate) enum InspectedFamily {
     KeyValue,
     KeySet,
     KeyMap,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum InspectionClassification {
+    MigrationRequired { path: PathBuf },
+    InvalidArtifact { path: PathBuf },
+    AuthorityUndetermined { paths: Vec<PathBuf> },
+}
+
+impl fmt::Display for InspectionClassification {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MigrationRequired { path } => write!(
+                formatter,
+                "recognized older Pigment DB artifact at {} requires explicit migration with pigment-db-migrate",
+                path.display()
+            ),
+            Self::InvalidArtifact { path } => {
+                write!(formatter, "invalid Pigment DB artifact: {}", path.display())
+            }
+            Self::AuthorityUndetermined { paths } => {
+                write!(formatter, "compaction authority is undetermined among {paths:?}")
+            }
+        }
+    }
+}
+
+impl Error for InspectionClassification {}
+
+pub(crate) fn error_classification(error: &io::Error) -> Option<&InspectionClassification> {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<InspectionClassification>())
 }
 
 impl InspectedFamily {
@@ -83,13 +118,19 @@ fn invalid_artifact(detail: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, detail)
 }
 
+fn invalid_artifact_at(path: PathBuf) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        InspectionClassification::InvalidArtifact { path },
+    )
+}
+
 fn migration_required(path: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
-        format!(
-            "recognized older Pigment DB artifact at {} requires explicit migration with pigment-db-migrate",
-            path.display()
-        ),
+        InspectionClassification::MigrationRequired {
+            path: path.to_path_buf(),
+        },
     )
 }
 
@@ -186,22 +227,22 @@ fn inspect_generation(store_dir: &Path) -> io::Result<DirectoryInspection> {
     for entry in std::fs::read_dir(store_dir)? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
-            return Err(invalid_artifact("canonical artifact is not a file"));
+            return Err(invalid_artifact_at(entry.path()));
         }
         let name = entry.file_name();
         if let Some(family) = family_for_active_name(&name) {
             let family_artifacts = artifacts.entry(family).or_default();
             if family_artifacts.active.replace(entry.path()).is_some() {
-                return Err(invalid_artifact("duplicate active family artifact"));
+                return Err(invalid_artifact_at(entry.path()));
             }
         } else if let Some((family, id)) = sealed_descriptor(&name) {
             let family_artifacts = artifacts.entry(family).or_default();
             if let Entry::Occupied(_) = family_artifacts.sealed.entry(id) {
-                return Err(invalid_artifact("duplicate sealed segment identifier"));
+                return Err(invalid_artifact_at(entry.path()));
             }
             family_artifacts.sealed.insert(id, entry.path());
         } else {
-            return Err(invalid_artifact("unexpected directory artifact"));
+            return Err(invalid_artifact_at(entry.path()));
         }
     }
 
@@ -228,18 +269,18 @@ pub(crate) fn inspect_open_family(
         let name = entry.file_name();
         if family_for_active_name(&name) == Some(family) {
             if !entry.file_type()?.is_file() || artifacts.active.replace(entry.path()).is_some() {
-                return Err(invalid_artifact("invalid selected active family artifact"));
+                return Err(invalid_artifact_at(entry.path()));
             }
         } else if let Some(id) = canonical_sealed_segment_id(&name, family.active_name()) {
             if !entry.file_type()?.is_file() || artifacts.sealed.insert(id, entry.path()).is_some()
             {
-                return Err(invalid_artifact("invalid selected sealed family artifact"));
+                return Err(invalid_artifact_at(entry.path()));
             }
         } else if name
             .to_str()
             .is_some_and(|name| name.starts_with(&sealed_prefix))
         {
-            return Err(invalid_artifact("malformed selected sealed segment name"));
+            return Err(invalid_artifact_at(entry.path()));
         }
     }
     inspect_family_artifacts(family, artifacts)
@@ -256,16 +297,13 @@ pub(crate) fn inspect_directory(store_dir: &Path) -> io::Result<DirectoryInspect
         paths.extend(evidence.invalid_generations);
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            format!("compaction authority is undetermined among {paths:?}"),
+            InspectionClassification::AuthorityUndetermined { paths },
         ));
     }
     if let Some(path) = evidence.invalid_generations.into_iter().next() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "invalid non-competing maintenance artifact: {}",
-                path.display()
-            ),
+            InspectionClassification::InvalidArtifact { path },
         ));
     }
     Ok(inspection)

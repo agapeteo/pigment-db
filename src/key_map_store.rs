@@ -42,6 +42,16 @@ pub struct DurableKeyMapStore<W: Write> {
 
 #[allow(unused)]
 impl DurableKeyMapStore<File> {
+    /// Returns exact storage usage for this open key/sorted-map generation.
+    pub fn storage_stats(&self) -> Result<crate::FamilyStorageStats, crate::CompactionError> {
+        crate::maintenance::public_file_family_storage_stats(
+            self.file_backing
+                .as_deref()
+                .expect("file-backed store retains its directory identity"),
+            crate::compaction::inspection::InspectedFamily::KeyMap,
+        )
+    }
+
     #[allow(dead_code)]
     pub(crate) fn storage_stats_internal(
         &self,
