@@ -1,8 +1,10 @@
 //! Current-format artifact inspection internals.
 
+use std::collections::{btree_map::Entry, BTreeMap};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::wal::recovery::canonical_sealed_segment_id;
 use crate::wal::replay::{replay_key_map, replay_key_set, replay_key_value};
 
 #[derive(Debug, Eq, PartialEq)]
@@ -27,66 +29,127 @@ pub(crate) enum InspectedFamily {
     KeyMap,
 }
 
+impl InspectedFamily {
+    fn active_name(self) -> &'static str {
+        match self {
+            Self::KeyValue => "kv.wal.dat",
+            Self::KeySet => "set.wal.dat",
+            Self::KeyMap => "map.wal.dat",
+        }
+    }
+}
+
+#[derive(Default)]
+struct FamilyArtifacts {
+    active: Option<PathBuf>,
+    sealed: BTreeMap<u64, PathBuf>,
+}
+
+fn family_for_active_name(name: &std::ffi::OsStr) -> Option<InspectedFamily> {
+    [
+        InspectedFamily::KeyValue,
+        InspectedFamily::KeySet,
+        InspectedFamily::KeyMap,
+    ]
+    .into_iter()
+    .find(|family| name == family.active_name())
+}
+
+fn sealed_descriptor(name: &std::ffi::OsStr) -> Option<(InspectedFamily, u64)> {
+    [
+        InspectedFamily::KeyValue,
+        InspectedFamily::KeySet,
+        InspectedFamily::KeyMap,
+    ]
+    .into_iter()
+    .find_map(|family| {
+        canonical_sealed_segment_id(name, family.active_name()).map(|id| (family, id))
+    })
+}
+
+fn invalid_artifact(detail: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, detail)
+}
+
+fn validate_active(family: InspectedFamily, path: &Path) -> io::Result<u64> {
+    let bytes = std::fs::read(path)?;
+    let is_current_v2 = bytes.starts_with(b"PIGWAL\r\n")
+        && bytes
+            .get(8..10)
+            .and_then(|version| version.try_into().ok())
+            .map(u16::from_le_bytes)
+            == Some(2);
+    if !is_current_v2 {
+        return Err(invalid_artifact(
+            "canonical active artifact is not current V2",
+        ));
+    }
+    let replayed = match family {
+        InspectedFamily::KeyValue => replay_key_value(&bytes).map(|_| ()),
+        InspectedFamily::KeySet => replay_key_set(&bytes).map(|_| ()),
+        InspectedFamily::KeyMap => replay_key_map(&bytes).map(|_| ()),
+    };
+    replayed.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    u64::try_from(bytes.len()).map_err(|_| invalid_artifact("active length exceeds u64"))
+}
+
 pub(crate) fn inspect_directory(store_dir: &Path) -> io::Result<DirectoryInspection> {
-    let mut families = std::collections::BTreeMap::new();
+    let mut artifacts = BTreeMap::<InspectedFamily, FamilyArtifacts>::new();
     for entry in std::fs::read_dir(store_dir)? {
         let entry = entry?;
-        let family = match entry.file_name().as_os_str() {
-            name if name == "kv.wal.dat" => InspectedFamily::KeyValue,
-            name if name == "set.wal.dat" => InspectedFamily::KeySet,
-            name if name == "map.wal.dat" => InspectedFamily::KeyMap,
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "non-active current-format inspection is not implemented",
-                ));
-            }
-        };
         if !entry.file_type()?.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "canonical active artifact is not a file",
-            ));
+            return Err(invalid_artifact("canonical artifact is not a file"));
         }
-        let bytes = std::fs::read(entry.path())?;
-        let is_current_v2 = bytes.starts_with(b"PIGWAL\r\n")
-            && bytes
-                .get(8..10)
-                .and_then(|version| version.try_into().ok())
-                .map(u16::from_le_bytes)
-                == Some(2);
-        if !is_current_v2 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "canonical active artifact is not current V2",
-            ));
+        let name = entry.file_name();
+        if let Some(family) = family_for_active_name(&name) {
+            let family_artifacts = artifacts.entry(family).or_default();
+            if family_artifacts.active.replace(entry.path()).is_some() {
+                return Err(invalid_artifact("duplicate active family artifact"));
+            }
+        } else if let Some((family, id)) = sealed_descriptor(&name) {
+            let family_artifacts = artifacts.entry(family).or_default();
+            if let Entry::Occupied(_) = family_artifacts.sealed.entry(id) {
+                return Err(invalid_artifact("duplicate sealed segment identifier"));
+            }
+            family_artifacts.sealed.insert(id, entry.path());
+        } else {
+            return Err(invalid_artifact("unexpected directory artifact"));
         }
-        let replayed = match family {
-            InspectedFamily::KeyValue => replay_key_value(&bytes).map(|_| ()),
-            InspectedFamily::KeySet => replay_key_set(&bytes).map(|_| ()),
-            InspectedFamily::KeyMap => replay_key_map(&bytes).map(|_| ()),
+    }
+
+    let mut families = BTreeMap::new();
+    for (family, artifacts) in artifacts {
+        let active = artifacts
+            .active
+            .ok_or_else(|| invalid_artifact("sealed segment chain has no active artifact"))?;
+        for (expected, actual) in (0_u64..).zip(artifacts.sealed.keys().copied()) {
+            if expected != actual {
+                return Err(invalid_artifact("sealed segment chain is not contiguous"));
+            }
+        }
+        let active_bytes = if artifacts.sealed.is_empty() {
+            validate_active(family, &active)?
+        } else {
+            std::fs::metadata(&active)?.len()
         };
-        replayed.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
-        let active_bytes = u64::try_from(bytes.len())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "active length exceeds u64"))?;
-        if families
-            .insert(
+        let sealed_segment_bytes = artifacts.sealed.values().try_fold(0_u64, |total, path| {
+            total
+                .checked_add(std::fs::metadata(path)?.len())
+                .ok_or_else(|| invalid_artifact("sealed segment byte total overflow"))
+        })?;
+        let total_bytes = active_bytes
+            .checked_add(sealed_segment_bytes)
+            .ok_or_else(|| invalid_artifact("family byte total overflow"))?;
+        families.insert(
+            family,
+            FamilyInspection {
                 family,
-                FamilyInspection {
-                    family,
-                    active_bytes,
-                    sealed_segment_bytes: 0,
-                    sealed_segment_count: 0,
-                    total_bytes: active_bytes,
-                },
-            )
-            .is_some()
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "duplicate active family artifact",
-            ));
-        }
+                active_bytes,
+                sealed_segment_bytes,
+                sealed_segment_count: artifacts.sealed.len(),
+                total_bytes,
+            },
+        );
     }
     let total_bytes = families.values().try_fold(0_u64, |total, family| {
         total.checked_add(family.total_bytes).ok_or_else(|| {

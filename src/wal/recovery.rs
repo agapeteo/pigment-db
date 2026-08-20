@@ -1,6 +1,7 @@
 //! Crash-safe WAL artifact classification and publication.
 
 use std::error::Error;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -35,6 +36,16 @@ impl StoreKind {
             Self::Map => "map.wal.dat",
         }
     }
+}
+
+pub(crate) fn canonical_sealed_segment_id(name: &OsStr, active_name: &str) -> Option<u64> {
+    let name = name.to_str()?;
+    let encoded_id = name.strip_prefix(active_name)?.strip_prefix(".segment-")?;
+    if encoded_id.len() != 20 || !encoded_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let id = encoded_id.parse::<u64>().ok()?;
+    (format!("{id:020}") == encoded_id).then_some(id)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
