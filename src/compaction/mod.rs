@@ -10,7 +10,11 @@ use crate::compaction::inspection::{
     InspectedFamily,
 };
 use crate::compaction::manifest::{verify_descriptor, ArtifactDescriptor, ArtifactRole};
-use crate::compaction::publication::{directory_artifact_paths, MaintenanceArtifactPaths};
+use crate::compaction::publication::{
+    cleanup_closed_with_checkpoint, directory_artifact_paths, publish_closed_prepared,
+    publish_closed_previous_with_checkpoint, publish_closed_replacement_with_checkpoint,
+    MaintenanceArtifactPaths,
+};
 use crate::wal::replay::{
     encode_current_key_map_snapshot_with_metadata, encode_current_key_set_snapshot_with_metadata,
     encode_current_key_value_snapshot_with_metadata, replay_key_map_tail, replay_key_set_tail,
@@ -19,7 +23,7 @@ use crate::wal::replay::{
 };
 use crate::{
     ClosedCompactionOptions, CompactionError, CompactionOperation, DirectoryCompactionOutcome,
-    DurabilityPolicy, StoreFamily,
+    DurabilityPolicy, FamilyCompactionOutcome, StoreFamily,
 };
 
 pub(crate) mod inspection;
@@ -610,7 +614,7 @@ fn active_name(family: StoreFamily) -> &'static str {
 #[allow(dead_code)]
 pub(crate) fn compact_closed_directory(
     store_dir: &Path,
-    _options: ClosedCompactionOptions,
+    options: ClosedCompactionOptions,
 ) -> Result<DirectoryCompactionOutcome, CompactionError> {
     let _claim =
         crate::maintenance_coordination::try_claim_closed(store_dir).map_err(|source| {
@@ -630,9 +634,35 @@ pub(crate) fn compact_closed_directory(
     if inspection.families().is_empty() {
         return Ok(DirectoryCompactionOutcome::empty());
     }
-    Err(CompactionError::FailedClosed {
-        detail: "non-empty closed compaction is not implemented".to_owned(),
-    })
+    let prepared = prepare_closed_staging(store_dir, options)?;
+    validate_closed_staging(&prepared)?;
+    let mut manifest = publish_closed_prepared(&prepared, options.durability_policy())?;
+    publish_closed_previous_with_checkpoint(&prepared, &mut manifest, |_| Ok(()))?;
+    publish_closed_replacement_with_checkpoint(&prepared, &mut manifest, |_| Ok(()))?;
+    let cleanup = cleanup_closed_with_checkpoint(&prepared, &mut manifest, |_| Ok(()))?;
+
+    let mut outcomes = Vec::with_capacity(prepared.capture.families.len());
+    for family in &prepared.capture.families {
+        let after_bytes = prepared
+            .replacement_inventory
+            .iter()
+            .filter(|descriptor| descriptor.family == Some(family.family))
+            .try_fold(0_u64, |total, descriptor| {
+                total
+                    .checked_add(descriptor.length)
+                    .ok_or_else(|| CompactionError::FailedClosed {
+                        detail: "compacted family byte total overflowed u64".to_owned(),
+                    })
+            })?;
+        outcomes.push(FamilyCompactionOutcome::closed(
+            family.family,
+            family.before_bytes,
+            after_bytes,
+            family.sealed_segment_count,
+            cleanup,
+        ));
+    }
+    Ok(DirectoryCompactionOutcome::from_families(outcomes))
 }
 
 #[cfg(test)]

@@ -160,6 +160,23 @@ pub struct FamilyCompactionOutcome {
 }
 
 impl FamilyCompactionOutcome {
+    pub(crate) const fn closed(
+        family: StoreFamily,
+        before_bytes: u64,
+        after_bytes: u64,
+        sealed_segments_removed: usize,
+        cleanup: CleanupStatus,
+    ) -> Self {
+        Self {
+            family,
+            before_bytes,
+            after_bytes,
+            sealed_segments_removed,
+            concurrent_mutations_replayed: 0,
+            cleanup,
+        }
+    }
+
     /// Returns the compacted family.
     pub const fn family(&self) -> StoreFamily {
         self.family
@@ -209,6 +226,10 @@ impl DirectoryCompactionOutcome {
         Self {
             families: Vec::new(),
         }
+    }
+
+    pub(crate) fn from_families(families: Vec<FamilyCompactionOutcome>) -> Self {
+        Self { families }
     }
 }
 

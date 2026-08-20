@@ -2,7 +2,8 @@
 
 use crate::maintenance_coordination::{acquire_open_lease, try_claim_closed};
 use crate::test_support::maintenance_fixtures::{
-    active_name, create_segmented_v2, snapshot_directory, FixtureFamily,
+    active_name, assert_three_reopens, create_segmented_v2, sealed_name, snapshot_directory,
+    FixtureFamily,
 };
 use crate::wal::format::V2CodecProbe;
 use crate::wal::replay::{
@@ -64,6 +65,58 @@ fn empty_closed_compaction_is_an_artifact_free_no_op() {
 
     assert!(outcome.families().is_empty());
     assert_eq!(snapshot_directory(root.path()).unwrap(), before);
+}
+
+#[test]
+fn buffered_nonempty_closed_compaction_runs_the_complete_publication_pipeline() {
+    let root = tempfile::tempdir().unwrap();
+    let store_dir = root.path().join("mixed-store");
+    std::fs::create_dir(&store_dir).unwrap();
+    for family in [
+        FixtureFamily::KeyValue,
+        FixtureFamily::KeySet,
+        FixtureFamily::KeyMap,
+    ] {
+        create_segmented_v2(&store_dir, family);
+    }
+    let before = crate::inspect_storage(&store_dir).unwrap();
+
+    let outcome = crate::maintenance::compact_directory_in_place_internal(
+        &store_dir,
+        crate::ClosedCompactionOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(outcome.families().len(), 3);
+    for (family, expected) in [
+        (FixtureFamily::KeyValue, crate::StoreFamily::KeyValue),
+        (FixtureFamily::KeySet, crate::StoreFamily::KeySet),
+        (FixtureFamily::KeyMap, crate::StoreFamily::KeyMap),
+    ] {
+        let result = outcome
+            .families()
+            .iter()
+            .find(|result| result.family() == expected)
+            .unwrap();
+        let previous = before
+            .families()
+            .iter()
+            .find(|stats| stats.family() == expected)
+            .unwrap();
+        assert_eq!(result.before_bytes(), previous.total_bytes());
+        assert_eq!(result.sealed_segments_removed(), 1);
+        assert_eq!(result.concurrent_mutations_replayed(), 0);
+        assert_eq!(result.cleanup(), crate::CleanupStatus::Complete);
+        assert_eq!(
+            result.after_bytes(),
+            std::fs::metadata(store_dir.join(active_name(family)))
+                .unwrap()
+                .len()
+        );
+        assert!(!store_dir.join(sealed_name(family, 0)).exists());
+        assert_three_reopens(&store_dir, family);
+    }
+    assert_eq!(snapshot_directory(root.path()).unwrap().len(), 3);
 }
 
 #[test]
