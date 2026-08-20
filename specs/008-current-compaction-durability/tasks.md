@@ -122,8 +122,8 @@
 - [X] T054 [US2] Implement the bounded custom-binary manifest envelope and private entities in `src/compaction/manifest.rs`, then run T053 GREEN
 - [X] T055 [US2] Write and run a runtime RED rejecting absolute/parent/alias/duplicate paths, excessive counts/lengths, unknown enum values, and descriptor escape in `src/compaction/manifest.rs`
 - [X] T056 [US2] Implement native relative-path validation, allocation limits, descriptor uniqueness, and exact checksum verification in `src/compaction/manifest.rs`, then run T055 GREEN and T053
-- [ ] T057 [US2] Write and run a runtime RED for buffered atomic `.manifest.next` write/flush/rename, main-manifest precedence, failed temp publication, and no phase advance in `src/compaction/manifest.rs`
-- [ ] T058 [US2] Implement buffered atomic manifest publication and same-parent native artifact naming in `src/compaction/manifest.rs` and `src/compaction/publication.rs`, then run T057 GREEN
+- [X] T057 [US2] Write and run a runtime RED for buffered atomic `.manifest.next` write/flush/rename, main-manifest precedence, failed temp publication, and no phase advance in `src/compaction/manifest.rs`
+- [X] T058 [US2] Implement buffered atomic manifest publication and same-parent native artifact naming in `src/compaction/manifest.rs` and `src/compaction/publication.rs`, then run T057 GREEN
 
 ### Closed staging, validation, and source stability
 

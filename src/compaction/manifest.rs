@@ -597,6 +597,10 @@ pub(crate) fn test_sentinel() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compaction::publication::{
+        directory_artifact_paths, family_artifact_paths, publish_manifest_buffered,
+        publish_manifest_buffered_with_checkpoint, read_published_manifest, ManifestPublishStage,
+    };
 
     fn rechecksum(encoded: &mut [u8]) {
         let checksum_start = encoded.len() - std::mem::size_of::<u32>();
@@ -874,5 +878,107 @@ mod tests {
             ),
             Err(ManifestCodecError::InvalidPath)
         );
+    }
+
+    #[test]
+    fn buffered_manifest_publication_writes_flushes_then_renames_and_main_wins() {
+        let parent = tempfile::tempdir().unwrap();
+        let store_dir = parent.path().join("database");
+        std::fs::create_dir(&store_dir).unwrap();
+        let paths = directory_artifact_paths(&store_dir).unwrap();
+        let prepared = manifest(
+            ManifestScope::Directory,
+            ManifestPhase::Prepared,
+            DurabilityPolicy::Buffered,
+        );
+        let mut stages = Vec::new();
+        publish_manifest_buffered_with_checkpoint(&paths, &prepared, |stage| {
+            stages.push(stage);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            stages,
+            [
+                ManifestPublishStage::Created,
+                ManifestPublishStage::Written,
+                ManifestPublishStage::Flushed,
+                ManifestPublishStage::Renamed,
+            ]
+        );
+        assert_eq!(
+            read_published_manifest(&paths).unwrap(),
+            Some(prepared.clone())
+        );
+        assert!(!paths.manifest_next.exists());
+
+        let mut unpublished = prepared.clone();
+        unpublished.phase = ManifestPhase::CleanupPending;
+        std::fs::write(&paths.manifest_next, encode_manifest(&unpublished).unwrap()).unwrap();
+        assert_eq!(read_published_manifest(&paths).unwrap(), Some(prepared));
+    }
+
+    #[test]
+    fn failed_temp_publication_preserves_main_phase_and_unpublished_evidence() {
+        let parent = tempfile::tempdir().unwrap();
+        let store_dir = parent.path().join("database");
+        std::fs::create_dir(&store_dir).unwrap();
+        let paths = directory_artifact_paths(&store_dir).unwrap();
+        let prepared = manifest(
+            ManifestScope::Directory,
+            ManifestPhase::Prepared,
+            DurabilityPolicy::Buffered,
+        );
+        publish_manifest_buffered(&paths, &prepared).unwrap();
+
+        let mut next = prepared.clone();
+        next.phase = ManifestPhase::PreviousPublished;
+        let failure = publish_manifest_buffered_with_checkpoint(&paths, &next, |stage| {
+            if stage == ManifestPublishStage::Flushed {
+                Err(std::io::Error::other("injected pre-rename failure"))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(failure.is_err());
+        assert_eq!(read_published_manifest(&paths).unwrap(), Some(prepared));
+        assert_eq!(
+            decode_manifest(&std::fs::read(&paths.manifest_next).unwrap()).unwrap(),
+            next
+        );
+        assert!(publish_manifest_buffered(&paths, &next).is_err());
+    }
+
+    #[test]
+    fn maintenance_artifact_names_append_to_native_directory_and_family_names() {
+        let parent = tempfile::tempdir().unwrap();
+        let store_dir = parent.path().join("dâtabase");
+        let directory = directory_artifact_paths(&store_dir).unwrap();
+        assert_eq!(
+            directory.manifest.file_name().unwrap(),
+            ".dâtabase.pigment-compact.manifest"
+        );
+        assert_eq!(
+            directory.manifest_next.file_name().unwrap(),
+            ".dâtabase.pigment-compact.manifest.next"
+        );
+        assert_eq!(
+            directory.staging.file_name().unwrap(),
+            ".dâtabase.pigment-compact.next"
+        );
+        assert_eq!(
+            directory.previous.file_name().unwrap(),
+            ".dâtabase.pigment-compact.previous"
+        );
+
+        let family = family_artifact_paths(&store_dir.join("key_value_store")).unwrap();
+        assert_eq!(
+            family.manifest.file_name().unwrap(),
+            "key_value_store.pigment-compact.manifest"
+        );
+        assert_eq!(family.manifest.parent(), Some(store_dir.as_path()));
+        assert_eq!(family.manifest_next.parent(), Some(store_dir.as_path()));
+        assert_eq!(family.staging.parent(), Some(store_dir.as_path()));
+        assert_eq!(family.previous.parent(), Some(store_dir.as_path()));
     }
 }
