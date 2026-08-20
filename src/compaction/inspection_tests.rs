@@ -355,3 +355,75 @@ fn complete_competing_generations_are_ambiguous_but_non_competing_debris_is_inva
         assert_eq!(snapshot_directory(root.path()).unwrap(), before, "{suffix}");
     }
 }
+
+#[test]
+fn open_store_adapters_report_only_their_current_family_without_recovery() {
+    let root = tempfile::tempdir().unwrap();
+    let store_dir = root.path().join("store");
+    std::fs::create_dir(&store_dir).unwrap();
+    for family in [
+        FixtureFamily::KeyValue,
+        FixtureFamily::KeySet,
+        FixtureFamily::KeyMap,
+    ] {
+        create_segmented_v2(&store_dir, family);
+    }
+    let value = crate::key_value_store::DurableKeyValueStore::try_init_new(&store_dir)
+        .unwrap()
+        .into_store();
+    let set = crate::key_set_store::DurableKeySetStore::try_init_new(&store_dir)
+        .unwrap()
+        .into_store();
+    let map = crate::key_map_store::DurableKeyMapStore::try_init_new(&store_dir)
+        .unwrap()
+        .into_store();
+
+    let previous = sibling_maintenance_path(&store_dir, "previous");
+    std::fs::create_dir(&previous).unwrap();
+    create_current_v2(&previous, FixtureFamily::KeyValue);
+    std::fs::write(
+        store_dir.join(".kv.wal.dat.next"),
+        b"unresolved recovery evidence",
+    )
+    .unwrap();
+    let before = snapshot_directory(root.path()).unwrap();
+    let store_snapshot = snapshot_directory(&store_dir).unwrap();
+
+    let cases = [
+        (
+            value.storage_stats_probe(),
+            InspectedFamily::KeyValue,
+            FixtureFamily::KeyValue,
+        ),
+        (
+            set.storage_stats_probe(),
+            InspectedFamily::KeySet,
+            FixtureFamily::KeySet,
+        ),
+        (
+            map.storage_stats_probe(),
+            InspectedFamily::KeyMap,
+            FixtureFamily::KeyMap,
+        ),
+    ];
+    for (actual, inspected_family, fixture_family) in cases {
+        let actual = actual.unwrap();
+        let active_path = std::path::Path::new(active_name(fixture_family));
+        let active_bytes = u64::try_from(store_snapshot.get(active_path).unwrap().len()).unwrap();
+        let prefix = format!("{}.segment-", active_name(fixture_family).to_string_lossy());
+        let sealed: Vec<_> = store_snapshot
+            .iter()
+            .filter(|(path, _)| path.to_string_lossy().starts_with(&prefix))
+            .collect();
+        let sealed_bytes = sealed
+            .iter()
+            .map(|(_, bytes)| u64::try_from(bytes.len()).unwrap())
+            .sum::<u64>();
+        assert_eq!(actual.family, inspected_family);
+        assert_eq!(actual.active_bytes, active_bytes);
+        assert_eq!(actual.sealed_segment_bytes, sealed_bytes);
+        assert_eq!(actual.sealed_segment_count, sealed.len());
+        assert_eq!(actual.total_bytes, active_bytes + sealed_bytes);
+    }
+    assert_eq!(snapshot_directory(root.path()).unwrap(), before);
+}

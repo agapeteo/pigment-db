@@ -94,6 +94,7 @@ fn different_shard_prepares_but_waits_for_busy_wal() {
     let mut store = DurableKeyValueStore {
         store: DashMap::new(),
         wal: WalStorage::new_with_rollback(writer, rollback_blocking),
+        file_backing: None,
         mutation_observer: MutationObserver::default(),
     };
     let keys = select_shard_keys(&store.store);
@@ -194,6 +195,7 @@ fn rejected_put_and_remove_preserve_state_and_allow_progress() {
         let store = DurableKeyValueStore {
             store: DashMap::new(),
             wal: WalStorage::new_with_rollback(writer, rollback_scripted),
+            file_backing: None,
             mutation_observer: MutationObserver::default(),
         };
         let key = b"key".to_vec();

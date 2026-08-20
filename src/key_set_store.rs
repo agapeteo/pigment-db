@@ -2,7 +2,7 @@ use dashmap::DashMap;
 use log::info;
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use std::fs::File;
 
@@ -35,11 +35,31 @@ use crate::test_support::mutation_schedule::{MutationObserver, MutationPhase};
 pub struct DurableKeySetStore<W: Write> {
     store: DashMap<Vec<u8>, HashSet<Vec<u8>>>,
     wal: WalStorage<W>,
+    file_backing: Option<PathBuf>,
     #[cfg(test)]
     mutation_observer: MutationObserver,
 }
 
 impl DurableKeySetStore<File> {
+    #[allow(dead_code)]
+    pub(crate) fn storage_stats_internal(
+        &self,
+    ) -> std::io::Result<crate::compaction::inspection::FamilyInspection> {
+        crate::maintenance::file_family_storage_stats(
+            self.file_backing
+                .as_deref()
+                .expect("file-backed store retains its directory identity"),
+            crate::compaction::inspection::InspectedFamily::KeySet,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn storage_stats_probe(
+        &self,
+    ) -> std::io::Result<crate::compaction::inspection::FamilyInspection> {
+        self.storage_stats_internal()
+    }
+
     /// Opens a file-backed key/set store and returns structured recovery status
     /// or error information without panicking for expected startup failures.
     pub fn try_init_new(
@@ -66,7 +86,8 @@ impl DurableKeySetStore<File> {
         store_dir: impl AsRef<Path>,
         options: Option<DurableStoreOptions>,
     ) -> Result<RecoveryOutcome<Self>, RecoveryError> {
-        let paths = ArtifactPaths::new(store_dir.as_ref(), StoreKind::Set);
+        let store_dir = store_dir.as_ref();
+        let paths = ArtifactPaths::new(store_dir, StoreKind::Set);
         let durability_policy = options
             .map(DurableStoreOptions::durability_policy)
             .unwrap_or_default();
@@ -99,10 +120,17 @@ impl DurableKeySetStore<File> {
         for (key, values) in initialized.snapshot {
             store.insert(key, values);
         }
+        let file_backing =
+            std::fs::canonicalize(store_dir).map_err(|source| RecoveryError::Io {
+                operation: crate::RecoveryOperation::Open,
+                path: paths.active.clone(),
+                source,
+            })?;
         Ok(RecoveryOutcome::new(
             DurableKeySetStore {
                 store,
                 wal: initialized.wal,
+                file_backing: Some(file_backing),
                 #[cfg(test)]
                 mutation_observer: MutationObserver::default(),
             },
@@ -130,6 +158,7 @@ impl DurableKeySetStore<Vec<u8>> {
         DurableKeySetStore {
             store: DashMap::new(),
             wal: WalStorage::new_vec_based(),
+            file_backing: None,
             #[cfg(test)]
             mutation_observer: MutationObserver::default(),
         }
@@ -154,6 +183,7 @@ impl DurableKeySetStore<Vec<u8>> {
         Ok(DurableKeySetStore {
             store: DashMap::new(),
             wal: WalStorage::new_vec_based_v1(&header),
+            file_backing: None,
             #[cfg(test)]
             mutation_observer: MutationObserver::default(),
         })
@@ -177,6 +207,7 @@ impl<W: Write> DurableKeySetStore<W> {
         Self {
             store: initial.into_iter().collect(),
             wal,
+            file_backing: None,
             mutation_observer,
         }
     }
@@ -817,6 +848,7 @@ mod tests {
         let store = DurableKeySetStore {
             store: DashMap::new(),
             wal: WalStorage::new_with_rollback(writer, rollback),
+            file_backing: None,
             mutation_observer: MutationObserver::default(),
         };
         (store, state)

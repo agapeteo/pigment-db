@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::wal::format::V1CodecProbe;
 use crate::wal::recovery::{
@@ -30,11 +30,31 @@ use crate::test_support::mutation_schedule::{MutationObserver, MutationPhase};
 pub struct DurableKeyValueStore<W: Write> {
     store: DashMap<Vec<u8>, Vec<u8>>,
     wal: WalStorage<W>,
+    file_backing: Option<PathBuf>,
     #[cfg(test)]
     mutation_observer: MutationObserver,
 }
 
 impl DurableKeyValueStore<File> {
+    #[allow(dead_code)]
+    pub(crate) fn storage_stats_internal(
+        &self,
+    ) -> std::io::Result<crate::compaction::inspection::FamilyInspection> {
+        crate::maintenance::file_family_storage_stats(
+            self.file_backing
+                .as_deref()
+                .expect("file-backed store retains its directory identity"),
+            crate::compaction::inspection::InspectedFamily::KeyValue,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn storage_stats_probe(
+        &self,
+    ) -> std::io::Result<crate::compaction::inspection::FamilyInspection> {
+        self.storage_stats_internal()
+    }
+
     /// Opens a file-backed key/value store without panicking on expected
     /// recovery or filesystem failures.
     ///
@@ -66,7 +86,8 @@ impl DurableKeyValueStore<File> {
         store_dir: impl AsRef<Path>,
         options: Option<DurableStoreOptions>,
     ) -> Result<RecoveryOutcome<Self>, RecoveryError> {
-        let paths = ArtifactPaths::new(store_dir.as_ref(), StoreKind::Value);
+        let store_dir = store_dir.as_ref();
+        let paths = ArtifactPaths::new(store_dir, StoreKind::Value);
         let durability_policy = options
             .map(DurableStoreOptions::durability_policy)
             .unwrap_or_default();
@@ -99,10 +120,17 @@ impl DurableKeyValueStore<File> {
         for (key, value) in initialized.snapshot {
             store.insert(key, value);
         }
+        let file_backing =
+            std::fs::canonicalize(store_dir).map_err(|source| RecoveryError::Io {
+                operation: crate::RecoveryOperation::Open,
+                path: paths.active.clone(),
+                source,
+            })?;
         Ok(RecoveryOutcome::new(
             DurableKeyValueStore {
                 store,
                 wal: initialized.wal,
+                file_backing: Some(file_backing),
                 #[cfg(test)]
                 mutation_observer: MutationObserver::default(),
             },
@@ -138,6 +166,7 @@ impl DurableKeyValueStore<Vec<u8>> {
         DurableKeyValueStore {
             store: DashMap::new(),
             wal: WalStorage::new_vec_based(),
+            file_backing: None,
             #[cfg(test)]
             mutation_observer: MutationObserver::default(),
         }
@@ -161,6 +190,7 @@ impl DurableKeyValueStore<Vec<u8>> {
         Ok(DurableKeyValueStore {
             store: DashMap::new(),
             wal: WalStorage::new_vec_based_v1(&header),
+            file_backing: None,
             #[cfg(test)]
             mutation_observer: MutationObserver::default(),
         })
@@ -184,6 +214,7 @@ impl<W: Write> DurableKeyValueStore<W> {
         Self {
             store: initial.into_iter().collect(),
             wal,
+            file_backing: None,
             mutation_observer,
         }
     }

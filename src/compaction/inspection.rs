@@ -157,6 +157,30 @@ fn validate_current_chain(
     Ok((active_byte_len, sealed_segment_bytes))
 }
 
+fn inspect_family_artifacts(
+    family: InspectedFamily,
+    artifacts: FamilyArtifacts,
+) -> io::Result<FamilyInspection> {
+    let active = artifacts
+        .active
+        .ok_or_else(|| invalid_artifact("sealed segment chain has no active artifact"))?;
+    for (expected, actual) in (0_u64..).zip(artifacts.sealed.keys().copied()) {
+        if expected != actual {
+            return Err(invalid_artifact("sealed segment chain is not contiguous"));
+        }
+    }
+    let (active_bytes, sealed_segment_bytes) =
+        validate_current_chain(family, &artifacts.sealed, &active)?;
+    let total_bytes = checked_family_total(active_bytes, sealed_segment_bytes)?;
+    Ok(FamilyInspection {
+        family,
+        active_bytes,
+        sealed_segment_bytes,
+        sealed_segment_count: artifacts.sealed.len(),
+        total_bytes,
+    })
+}
+
 fn inspect_generation(store_dir: &Path) -> io::Result<DirectoryInspection> {
     let mut artifacts = BTreeMap::<InspectedFamily, FamilyArtifacts>::new();
     for entry in std::fs::read_dir(store_dir)? {
@@ -183,27 +207,7 @@ fn inspect_generation(store_dir: &Path) -> io::Result<DirectoryInspection> {
 
     let mut families = BTreeMap::new();
     for (family, artifacts) in artifacts {
-        let active = artifacts
-            .active
-            .ok_or_else(|| invalid_artifact("sealed segment chain has no active artifact"))?;
-        for (expected, actual) in (0_u64..).zip(artifacts.sealed.keys().copied()) {
-            if expected != actual {
-                return Err(invalid_artifact("sealed segment chain is not contiguous"));
-            }
-        }
-        let (active_bytes, sealed_segment_bytes) =
-            validate_current_chain(family, &artifacts.sealed, &active)?;
-        let total_bytes = checked_family_total(active_bytes, sealed_segment_bytes)?;
-        families.insert(
-            family,
-            FamilyInspection {
-                family,
-                active_bytes,
-                sealed_segment_bytes,
-                sealed_segment_count: artifacts.sealed.len(),
-                total_bytes,
-            },
-        );
+        families.insert(family, inspect_family_artifacts(family, artifacts)?);
     }
     let family_totals = families.values().map(|family| &family.total_bytes);
     let total_bytes = checked_directory_total(family_totals)?;
@@ -211,6 +215,34 @@ fn inspect_generation(store_dir: &Path) -> io::Result<DirectoryInspection> {
         families: families.into_values().collect(),
         total_bytes,
     })
+}
+
+pub(crate) fn inspect_open_family(
+    store_dir: &Path,
+    family: InspectedFamily,
+) -> io::Result<FamilyInspection> {
+    let mut artifacts = FamilyArtifacts::default();
+    let sealed_prefix = format!("{}.segment-", family.active_name());
+    for entry in std::fs::read_dir(store_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if family_for_active_name(&name) == Some(family) {
+            if !entry.file_type()?.is_file() || artifacts.active.replace(entry.path()).is_some() {
+                return Err(invalid_artifact("invalid selected active family artifact"));
+            }
+        } else if let Some(id) = canonical_sealed_segment_id(&name, family.active_name()) {
+            if !entry.file_type()?.is_file() || artifacts.sealed.insert(id, entry.path()).is_some()
+            {
+                return Err(invalid_artifact("invalid selected sealed family artifact"));
+            }
+        } else if name
+            .to_str()
+            .is_some_and(|name| name.starts_with(&sealed_prefix))
+        {
+            return Err(invalid_artifact("malformed selected sealed segment name"));
+        }
+    }
+    inspect_family_artifacts(family, artifacts)
 }
 
 pub(crate) fn inspect_directory(store_dir: &Path) -> io::Result<DirectoryInspection> {
