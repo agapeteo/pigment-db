@@ -155,8 +155,8 @@
 - [X] T078 [US2] Implement `ReplacementPublished` validation and authority confirmation in `src/compaction/recovery.rs`, then run T077 GREEN
 - [X] T079 [US2] Write and run a runtime RED for `CleanupPending` replacement-prefix validation, missing-target idempotence, mismatching-target preservation, and safe repeated retry in `src/compaction/recovery_tests.rs`
 - [X] T080 [US2] Implement exact/prefix cleanup recovery and manifest-last convergence in `src/compaction/recovery.rs`, then run T079 GREEN
-- [ ] T081 [US2] Write and run a runtime RED classifying missing/corrupt/contradictory manifests as `AuthorityUndetermined` only when competing authority cannot be resolved and otherwise `InvalidArtifact` in `src/compaction/recovery_tests.rs`
-- [ ] T082 [US2] Implement fail-closed manifestless evidence classification without mutation in `src/compaction/recovery.rs`, then run T081 GREEN
+- [X] T081 [US2] Write and run a runtime RED classifying missing/corrupt/contradictory manifests as `AuthorityUndetermined` only when competing authority cannot be resolved and otherwise `InvalidArtifact` in `src/compaction/recovery_tests.rs`
+- [X] T082 [US2] Implement fail-closed manifestless evidence classification without mutation in `src/compaction/recovery.rs`, then run T081 GREEN
 - [ ] T083 [US2] Write and run a runtime RED proving all three file-store initializers resolve maintenance before ordinary WAL recovery and preserve evidence on failure in `tests/compaction_recovery/contract.rs`
 - [ ] T084 [US2] Invoke maintenance recovery before normal WAL recovery in `src/key_value_store.rs`, `src/key_set_store.rs`, `src/key_map_store.rs`, and `src/wal/recovery.rs`, then run T083 GREEN and existing recovery suites
 - [ ] T085 [US2] Run the expected-GREEN private fault-model matrix for every staging create/write/sync/validate, manifest write/sync, previous/replacement move, reopen, phase rewrite, and cleanup cut across all families and modeled buffered/physical policies in `src/compaction/recovery_tests.rs`

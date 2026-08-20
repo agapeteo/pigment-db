@@ -12,7 +12,9 @@ use super::manifest::{
     verify_descriptor, ArtifactDescriptor, CompactionManifest, ManifestMode, ManifestPhase,
     ManifestScope,
 };
-use super::publication::{publish_manifest_for_policy, MaintenanceArtifactPaths};
+use super::publication::{
+    publish_manifest_for_policy, read_published_manifest, MaintenanceArtifactPaths,
+};
 use crate::wal::replay::{
     classify_key_map_read_only, classify_key_set_read_only, classify_key_value_read_only,
 };
@@ -29,6 +31,91 @@ pub(crate) enum RecoveryCleanupStage {
     Artifact(usize),
     Directory,
     Manifest,
+}
+
+pub(crate) fn classify_untrusted_closed_authority(
+    store_dir: &Path,
+    paths: &MaintenanceArtifactPaths,
+) -> Result<(), CompactionError> {
+    let canonical = evidence_state(store_dir, true)?;
+    let staging = evidence_state(&paths.staging, false)?;
+    let previous = evidence_state(&paths.previous, false)?;
+    let manifest_state = match read_published_manifest(paths) {
+        Ok(Some(_)) => EvidenceState::Complete,
+        Ok(None) => EvidenceState::Missing,
+        Err(_) => EvidenceState::Invalid,
+    };
+    let manifest_next = if path_exists(&paths.manifest_next)? {
+        EvidenceState::Invalid
+    } else {
+        EvidenceState::Missing
+    };
+
+    let complete_siblings = [(&paths.staging, staging), (&paths.previous, previous)]
+        .into_iter()
+        .filter(|(_, state)| *state == EvidenceState::Complete)
+        .map(|(path, _)| path.clone())
+        .collect::<Vec<_>>();
+    if !complete_siblings.is_empty() {
+        let mut evidence = Vec::new();
+        if canonical != EvidenceState::Missing {
+            evidence.push(store_dir.to_path_buf());
+        }
+        evidence.extend(complete_siblings);
+        if manifest_state != EvidenceState::Missing {
+            evidence.push(paths.manifest.clone());
+        }
+        return Err(CompactionError::AuthorityUndetermined { paths: evidence });
+    }
+
+    if canonical == EvidenceState::Invalid {
+        return Err(CompactionError::InvalidArtifact {
+            path: store_dir.to_path_buf(),
+        });
+    }
+    for (path, state) in [
+        (&paths.staging, staging),
+        (&paths.previous, previous),
+        (&paths.manifest_next, manifest_next),
+        (&paths.manifest, manifest_state),
+    ] {
+        if state == EvidenceState::Invalid {
+            return Err(CompactionError::InvalidArtifact { path: path.clone() });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EvidenceState {
+    Missing,
+    Complete,
+    Invalid,
+}
+
+fn evidence_state(path: &Path, allow_empty: bool) -> Result<EvidenceState, CompactionError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(EvidenceState::Missing);
+        }
+        Err(source) => {
+            return Err(CompactionError::Io {
+                operation: CompactionOperation::Inspect,
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Ok(EvidenceState::Invalid);
+    }
+    match super::inspection::inspect_generation(path) {
+        Ok(generation) if allow_empty || !generation.families.is_empty() => {
+            Ok(EvidenceState::Complete)
+        }
+        _ => Ok(EvidenceState::Invalid),
+    }
 }
 
 pub(crate) fn recover_cleanup_pending_closed(

@@ -646,3 +646,93 @@ fn cleanup_pending_validates_replacement_and_retries_missing_exact_targets_idemp
     ));
     assert_eq!(snapshot_directory(_root.path()).unwrap(), evidence);
 }
+
+fn copy_generation(source: &std::path::Path, destination: &std::path::Path) {
+    std::fs::create_dir(destination).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), destination.join(entry.file_name())).unwrap();
+    }
+}
+
+#[test]
+fn untrusted_manifest_evidence_distinguishes_ambiguity_from_invalid_debris_without_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let store_dir = root.path().join("store");
+    std::fs::create_dir(&store_dir).unwrap();
+    create_current_v2(&store_dir, FixtureFamily::KeyValue);
+    let paths = crate::compaction::publication::directory_artifact_paths(&store_dir).unwrap();
+    assert!(
+        crate::compaction::recovery::classify_untrusted_closed_authority(&store_dir, &paths)
+            .is_ok()
+    );
+
+    let root = tempfile::tempdir().unwrap();
+    let store_dir = root.path().join("store");
+    std::fs::create_dir(&store_dir).unwrap();
+    create_current_v2(&store_dir, FixtureFamily::KeyValue);
+    let paths = crate::compaction::publication::directory_artifact_paths(&store_dir).unwrap();
+    std::fs::write(&paths.manifest, b"corrupt manifest").unwrap();
+    let evidence = snapshot_directory(root.path()).unwrap();
+    assert!(matches!(
+        crate::compaction::recovery::classify_untrusted_closed_authority(&store_dir, &paths),
+        Err(crate::CompactionError::InvalidArtifact { ref path }) if path == &paths.manifest
+    ));
+    assert_eq!(snapshot_directory(root.path()).unwrap(), evidence);
+
+    let root = tempfile::tempdir().unwrap();
+    let store_dir = root.path().join("store");
+    std::fs::create_dir(&store_dir).unwrap();
+    create_current_v2(&store_dir, FixtureFamily::KeyValue);
+    let paths = crate::compaction::publication::directory_artifact_paths(&store_dir).unwrap();
+    std::fs::create_dir(&paths.staging).unwrap();
+    std::fs::write(paths.staging.join("junk"), b"invalid").unwrap();
+    let evidence = snapshot_directory(root.path()).unwrap();
+    assert!(matches!(
+        crate::compaction::recovery::classify_untrusted_closed_authority(&store_dir, &paths),
+        Err(crate::CompactionError::InvalidArtifact { ref path }) if path == &paths.staging
+    ));
+    assert_eq!(snapshot_directory(root.path()).unwrap(), evidence);
+
+    let root = tempfile::tempdir().unwrap();
+    let store_dir = root.path().join("store");
+    std::fs::create_dir(&store_dir).unwrap();
+    create_current_v2(&store_dir, FixtureFamily::KeyValue);
+    let paths = crate::compaction::publication::directory_artifact_paths(&store_dir).unwrap();
+    copy_generation(&store_dir, &paths.staging);
+    let evidence = snapshot_directory(root.path()).unwrap();
+    assert!(matches!(
+        crate::compaction::recovery::classify_untrusted_closed_authority(&store_dir, &paths),
+        Err(crate::CompactionError::AuthorityUndetermined { .. })
+    ));
+    assert_eq!(snapshot_directory(root.path()).unwrap(), evidence);
+
+    let root = tempfile::tempdir().unwrap();
+    let store_dir = root.path().join("store");
+    std::fs::create_dir(&store_dir).unwrap();
+    create_current_v2(&store_dir, FixtureFamily::KeyValue);
+    let paths = crate::compaction::publication::directory_artifact_paths(&store_dir).unwrap();
+    std::fs::rename(&store_dir, &paths.previous).unwrap();
+    let evidence = snapshot_directory(root.path()).unwrap();
+    assert!(matches!(
+        crate::compaction::recovery::classify_untrusted_closed_authority(&store_dir, &paths),
+        Err(crate::CompactionError::AuthorityUndetermined { .. })
+    ));
+    assert_eq!(snapshot_directory(root.path()).unwrap(), evidence);
+
+    let (_root, store_dir, prepared) = prepared_fixture();
+    let mut contradictory =
+        publish_closed_prepared(&prepared, crate::DurabilityPolicy::Buffered).unwrap();
+    contradictory.phase = ManifestPhase::CleanupPending;
+    crate::compaction::publication::publish_manifest_buffered(&prepared.paths, &contradictory)
+        .unwrap();
+    let evidence = snapshot_directory(_root.path()).unwrap();
+    assert!(matches!(
+        crate::compaction::recovery::classify_untrusted_closed_authority(
+            &store_dir,
+            &prepared.paths
+        ),
+        Err(crate::CompactionError::AuthorityUndetermined { .. })
+    ));
+    assert_eq!(snapshot_directory(_root.path()).unwrap(), evidence);
+}
