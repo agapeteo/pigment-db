@@ -57,7 +57,7 @@ fn recovery_workflow_runs_the_complete_suite_on_linux() {
 }
 
 #[test]
-fn maintenance_skeletons_are_registered_without_public_crate_exports() {
+fn maintenance_public_api_is_narrow_while_implementation_modules_remain_private() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     for relative in [
         "src/maintenance.rs",
@@ -80,7 +80,8 @@ fn maintenance_skeletons_are_registered_without_public_crate_exports() {
     assert!(crate_root.lines().any(|line| line == "mod maintenance;"));
     assert!(!crate_root.contains("pub mod compaction"));
     assert!(!crate_root.contains("pub mod maintenance"));
-    assert!(!crate_root.contains("pub use maintenance"));
+    assert!(crate_root.contains("compact_directory_in_place, inspect_storage"));
+    assert!(!crate_root.contains("pub use compaction"));
 
     let compaction = fs::read_to_string(root.join("src/compaction/mod.rs"))
         .expect("read compaction module root");

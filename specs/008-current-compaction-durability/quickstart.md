@@ -138,6 +138,39 @@ The checkpoint completed with zero failures:
 - `cargo fmt --all -- --check`;
 - `cargo clippy --all-targets --all-features -- -D warnings`.
 
+### User Story 2 closed-compaction GREEN checkpoint (2026-08-20)
+
+SC-002 is GREEN. Public buffered and supported physical compaction reduced
+active-only, segmented, recoverable-tail, and mixed key/value, key/set, and
+key/map directories to exactly one active V2 segment per family. Exact logical
+state, family identity, timestamp granularity, and the last accepted timestamp
+bucket remained stable through three consecutive reopenings. Repeated
+compaction was byte-idempotent for unchanged active data, and a deferred
+`CleanupPending` generation converged on the next explicit compaction.
+
+SC-003 is GREEN. The deterministic fault model covered 13 staging,
+manifest, move, reopen, phase-rewrite, and cleanup cuts for all three families
+under buffered process-interruption and physical power-loss semantics. The
+subprocess matrix then terminated real buffered compaction at 20 exact
+phase/cut points for every family (60 child processes). Each public initializer
+either recovered exact old/new state or returned a structured
+`AuthorityUndetermined`/`InvalidArtifact` result without changing any evidence;
+no cut removed the last complete authority.
+
+The checkpoint completed with zero failures:
+
+- `cargo test --lib compaction:: -- --test-threads=1` (38 passed, including the
+  complete child-process matrix);
+- `cargo test --test closed_compaction -- --test-threads=1` (10 passed);
+- `cargo test --test recovery --test migration_cli -- --test-threads=1` (33
+  passed);
+- `cargo test --all-targets --all-features -- --test-threads=1` (all debug
+  library, binary, integration, crash, durability-model, compatibility, and
+  documentation test targets passed; release-only benchmarks remained
+  intentionally ignored);
+- `cargo fmt --all -- --check`;
+- `cargo clippy --all-targets --all-features -- -D warnings`.
+
 ## 7. Expected caller usage
 
 Callers inspect and choose when to compact; Pigment DB schedules nothing. Closed callers drop every same-process store before `compact_directory_in_place`. Online callers invoke `try_compact_online` on exactly one file-backed store and may choose a delta bound; policy is inherited. `CleanupStatus::Pending` means replacement publication succeeded and ordinary use may continue, with cleanup retried at reopen or a later explicit compaction. `MigrationRequired` means the caller must run `pigment-db-migrate` separately.
