@@ -254,3 +254,32 @@ fn final_source_inventory_rejects_add_remove_rename_and_length_changes_without_m
         assert!(!prepared.paths.previous.exists());
     }
 }
+
+#[test]
+fn final_source_inventory_rejects_same_length_byte_replacement_without_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let store_dir = root.path().join("store");
+    std::fs::create_dir(&store_dir).unwrap();
+    create_segmented_v2(&store_dir, FixtureFamily::KeyValue);
+    let prepared =
+        super::prepare_closed_staging(&store_dir, crate::ClosedCompactionOptions::default())
+            .unwrap();
+    super::validate_closed_staging(&prepared).unwrap();
+    super::revalidate_closed_source_inventory(&prepared).unwrap();
+
+    let active = store_dir.join("kv.wal.dat");
+    let mut changed = std::fs::read(&active).unwrap();
+    let last = changed.last_mut().unwrap();
+    *last ^= 0xff;
+    std::fs::write(&active, changed).unwrap();
+    let before_revalidation = snapshot_directory(root.path()).unwrap();
+
+    assert!(super::revalidate_closed_source_inventory(&prepared).is_err());
+
+    assert_eq!(
+        snapshot_directory(root.path()).unwrap(),
+        before_revalidation
+    );
+    assert!(!prepared.paths.manifest.exists());
+    assert!(!prepared.paths.previous.exists());
+}

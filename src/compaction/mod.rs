@@ -5,7 +5,9 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-use crate::compaction::inspection::{inspect_directory, FamilyInspection, InspectedFamily};
+use crate::compaction::inspection::{
+    exact_artifact_bytes_match, inspect_directory, FamilyInspection, InspectedFamily,
+};
 use crate::compaction::manifest::{verify_descriptor, ArtifactDescriptor, ArtifactRole};
 use crate::compaction::publication::{directory_artifact_paths, MaintenanceArtifactPaths};
 use crate::wal::replay::{
@@ -203,6 +205,30 @@ pub(crate) fn revalidate_closed_source_inventory(
         return Err(source_revalidation_error(
             "native inventory or artifact length changed after capture",
         ));
+    }
+    let anchor = prepared
+        .capture
+        .source_dir
+        .parent()
+        .ok_or_else(|| source_revalidation_error("directory has no parent anchor"))?;
+    for descriptor in &prepared.capture.inventory {
+        let expected_bytes = prepared
+            .capture
+            .source_bytes
+            .get(&descriptor.relative_path)
+            .ok_or_else(|| source_revalidation_error("captured bytes are incomplete"))?;
+        let path = anchor.join(&descriptor.relative_path);
+        let matches = exact_artifact_bytes_match(&path, expected_bytes, descriptor.checksum)
+            .map_err(|source| CompactionError::Io {
+                operation: CompactionOperation::Capture,
+                path,
+                source,
+            })?;
+        if !matches {
+            return Err(source_revalidation_error(
+                "artifact checksum or exact bytes changed after capture",
+            ));
+        }
     }
     Ok(())
 }

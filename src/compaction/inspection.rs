@@ -150,6 +150,15 @@ fn checked_directory_total<'a>(totals: impl IntoIterator<Item = &'a u64>) -> io:
     })
 }
 
+pub(crate) fn exact_artifact_bytes_match(
+    path: &Path,
+    expected: &[u8],
+    expected_checksum: u32,
+) -> io::Result<bool> {
+    let actual = std::fs::read(path)?;
+    Ok(crc32fast::hash(&actual) == expected_checksum && actual == expected)
+}
+
 fn validate_current_chain(
     family: InspectedFamily,
     sealed: &BTreeMap<u64, PathBuf>,

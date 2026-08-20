@@ -133,8 +133,8 @@
 - [X] T062 [US2] Implement complete staging reopen and public-state/metadata comparison in `src/compaction/mod.rs` and `src/compaction/inspection.rs`, then run T061 GREEN
 - [X] T063 [US2] Write and run one table-driven runtime RED for the single exact-source-stability behavior across additions, removals, renames, and length changes between capture and publication in `src/compaction/closed_tests.rs`
 - [X] T064 [US2] Implement final native inventory and length reread before publication in `src/compaction/mod.rs`, then run T063 GREEN
-- [ ] T065 [US2] Write and run a runtime RED for same-length source-byte replacement after capture in `src/compaction/closed_tests.rs`
-- [ ] T066 [US2] Add exact source checksums/byte comparison to the final stability gate in `src/compaction/mod.rs` and `src/compaction/inspection.rs`, then run T065 GREEN and T063
+- [X] T065 [US2] Write and run a runtime RED for same-length source-byte replacement after capture in `src/compaction/closed_tests.rs`
+- [X] T066 [US2] Add exact source checksums/byte comparison to the final stability gate in `src/compaction/mod.rs` and `src/compaction/inspection.rs`, then run T065 GREEN and T063
 
 ### Authority publication and cleanup
 
