@@ -20,6 +20,104 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
+#[test]
+fn every_set_acceptance_uses_maintenance_but_async_user_work_does_not() {
+    let store = Arc::new(DurableKeySetStore::new_vec_based());
+    for key in [
+        b"remove-member".as_slice(),
+        b"compute",
+        b"if-present",
+        b"callback-remove",
+        b"remove-key",
+    ] {
+        store.append(key.to_vec(), b"seed".to_vec());
+    }
+    let exclusive = store.maintenance_probe().exclusive();
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let mut workers = Vec::new();
+
+    for (label, mutation) in [
+        ("append", 0_u8),
+        ("remove-member", 1),
+        ("compute", 2),
+        ("if-present", 3),
+        ("if-absent", 4),
+        ("callback-remove", 5),
+        ("remove-key", 6),
+    ] {
+        let worker_store = Arc::clone(&store);
+        let worker_tx = completed_tx.clone();
+        workers.push(std::thread::spawn(move || {
+            match mutation {
+                0 => worker_store.append(b"append".to_vec(), b"value".to_vec()),
+                1 => worker_store.remove_from_set(b"remove-member".to_vec(), b"seed".to_vec()),
+                2 => worker_store.compute(b"compute".to_vec(), |set| {
+                    set.insert(b"value".to_vec());
+                }),
+                3 => worker_store.compute_if_present(b"if-present".to_vec(), |set| {
+                    set.insert(b"value".to_vec());
+                }),
+                4 => worker_store.compute_if_absent(b"if-absent".to_vec(), |set| {
+                    set.insert(b"value".to_vec());
+                }),
+                5 => worker_store.remove_from_set_callback(
+                    b"callback-remove".to_vec(),
+                    b"seed".to_vec(),
+                    |_| {},
+                ),
+                6 => worker_store.remove_key(b"remove-key"),
+                _ => unreachable!(),
+            }
+            worker_tx.send(label).unwrap();
+        }));
+    }
+    drop(completed_tx);
+
+    assert!(completed_rx
+        .recv_timeout(std::time::Duration::from_millis(100))
+        .is_err());
+    drop(exclusive);
+    let completed = completed_rx.iter().collect::<HashSet<_>>();
+    assert_eq!(
+        completed,
+        HashSet::from([
+            "append",
+            "remove-member",
+            "compute",
+            "if-present",
+            "if-absent",
+            "callback-remove",
+            "remove-key",
+        ])
+    );
+    for worker in workers {
+        worker.join().unwrap();
+    }
+
+    store.append(b"async".to_vec(), b"seed".to_vec());
+    let exclusive = store.maintenance_probe().exclusive();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+    let (async_tx, async_rx) = mpsc::sync_channel(0);
+    let async_store = Arc::clone(&store);
+    let async_worker = std::thread::spawn(move || {
+        let result = block_on(
+            async_store.try_compute_async(b"async".to_vec(), async |set| {
+                entered_tx.send(()).unwrap();
+                set.insert(b"accepted".to_vec());
+            }),
+        );
+        async_tx.send(result).unwrap();
+    });
+    entered_rx.recv_timeout(WATCHDOG).unwrap();
+    assert!(async_rx
+        .recv_timeout(std::time::Duration::from_millis(100))
+        .is_err());
+    drop(exclusive);
+    async_rx.recv_timeout(WATCHDOG).unwrap().unwrap();
+    async_worker.join().unwrap();
+    assert!(store.contains_in_set(b"async", b"accepted"));
+}
+
 /// CMO-CROSS-1/3/4: set mutations retain only their selected data-map shard.
 #[test]
 fn different_shard_progress_and_same_shard_waiting() {

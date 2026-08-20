@@ -308,6 +308,7 @@ impl<W: Write> DurableKeySetStore<W> {
     }
 
     pub(crate) fn try_append_core(&self, key: Vec<u8>, val: Vec<u8>) -> std::io::Result<()> {
+        let _maintenance = self.maintenance.shared();
         match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
                 #[cfg(test)]
@@ -366,6 +367,7 @@ impl<W: Write> DurableKeySetStore<W> {
         key: Vec<u8>,
         set_entry: Vec<u8>,
     ) -> std::io::Result<()> {
+        let _maintenance = self.maintenance.shared();
         #[cfg(test)]
         let observed_key = key.clone();
         if let Some(mut entry) = self.store.get_mut(&key) {
@@ -439,6 +441,7 @@ impl<W: Write> DurableKeySetStore<W> {
         key: Vec<u8>,
         func: impl FnOnce(&mut HashSet<Vec<u8>>),
     ) -> std::io::Result<()> {
+        let _maintenance = self.maintenance.shared();
         match self.store.entry(key.clone()) {
             Entry::Occupied(mut occupied_entry) => {
                 let original = occupied_entry.get().clone();
@@ -547,6 +550,7 @@ impl<W: Write> DurableKeySetStore<W> {
         let mut working = original.clone().unwrap_or_default();
         func(&mut working).await;
 
+        let _maintenance = self.maintenance.shared();
         let conflict = || {
             std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
@@ -624,6 +628,7 @@ impl<W: Write> DurableKeySetStore<W> {
         key: Vec<u8>,
         func: impl FnOnce(&mut HashSet<Vec<u8>>),
     ) -> std::io::Result<()> {
+        let _maintenance = self.maintenance.shared();
         match self.store.entry(key.clone()) {
             Entry::Occupied(mut occupied_entry) => {
                 let original = occupied_entry.get().clone();
@@ -676,6 +681,7 @@ impl<W: Write> DurableKeySetStore<W> {
         key: Vec<u8>,
         func: impl FnOnce(&mut HashSet<Vec<u8>>),
     ) -> std::io::Result<()> {
+        let _maintenance = self.maintenance.shared();
         match self.store.entry(key.clone()) {
             Entry::Occupied(_) => Ok(()),
             Entry::Vacant(vacant_entry) => {
@@ -737,52 +743,56 @@ impl<W: Write> DurableKeySetStore<W> {
         #[cfg(test)]
         let observed_key = key.clone();
         let mut callback_entry = Some(set_entry);
-        let removed_key = match self.store.entry(key) {
-            Entry::Occupied(mut entry) => {
-                let removes_final_member = entry.get().len() == 1
-                    && entry
-                        .get()
-                        .contains(callback_entry.as_ref().expect("removal entry"));
-                #[cfg(test)]
-                self.mutation_observer
-                    .notify(entry.key(), MutationPhase::AcceptanceEntered);
-                if removes_final_member {
-                    self.wal.try_store_delete_event(entry.key())?;
+        let removed_key = {
+            let _maintenance = self.maintenance.shared();
+            let removed_key = match self.store.entry(key) {
+                Entry::Occupied(mut entry) => {
+                    let removes_final_member = entry.get().len() == 1
+                        && entry
+                            .get()
+                            .contains(callback_entry.as_ref().expect("removal entry"));
+                    #[cfg(test)]
+                    self.mutation_observer
+                        .notify(entry.key(), MutationPhase::AcceptanceEntered);
+                    if removes_final_member {
+                        self.wal.try_store_delete_event(entry.key())?;
+                        #[cfg(test)]
+                        self.mutation_observer
+                            .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
+                        entry.remove();
+                        true
+                    } else {
+                        let set_entry = callback_entry.take().expect("removal entry");
+                        let (_key, set_entry) = self
+                            .wal
+                            .try_store_remove_from_set_event(entry.key().clone(), set_entry)?;
+                        #[cfg(test)]
+                        self.mutation_observer
+                            .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
+                        entry.get_mut().remove(&set_entry);
+                        false
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    #[cfg(test)]
+                    self.mutation_observer
+                        .notify(entry.key(), MutationPhase::AcceptanceEntered);
+                    self.wal.try_store_remove_from_set_event(
+                        entry.key().clone(),
+                        callback_entry.take().expect("removal entry"),
+                    )?;
                     #[cfg(test)]
                     self.mutation_observer
                         .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
-                    entry.remove();
-                    true
-                } else {
-                    let set_entry = callback_entry.take().expect("removal entry");
-                    let (_key, set_entry) = self
-                        .wal
-                        .try_store_remove_from_set_event(entry.key().clone(), set_entry)?;
-                    #[cfg(test)]
-                    self.mutation_observer
-                        .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
-                    entry.get_mut().remove(&set_entry);
+                    drop(entry);
                     false
                 }
-            }
-            Entry::Vacant(entry) => {
-                #[cfg(test)]
-                self.mutation_observer
-                    .notify(entry.key(), MutationPhase::AcceptanceEntered);
-                self.wal.try_store_remove_from_set_event(
-                    entry.key().clone(),
-                    callback_entry.take().expect("removal entry"),
-                )?;
-                #[cfg(test)]
-                self.mutation_observer
-                    .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
-                drop(entry);
-                false
-            }
+            };
+            #[cfg(test)]
+            self.mutation_observer
+                .notify(&observed_key, MutationPhase::Published);
+            removed_key
         };
-        #[cfg(test)]
-        self.mutation_observer
-            .notify(&observed_key, MutationPhase::Published);
         if removed_key {
             key_removed_callback(
                 callback_entry
@@ -804,6 +814,7 @@ impl<W: Write> DurableKeySetStore<W> {
     }
 
     pub(crate) fn try_remove_key_core(&self, key: &[u8]) -> std::io::Result<()> {
+        let _maintenance = self.maintenance.shared();
         match self.store.entry(key.to_vec()) {
             Entry::Occupied(entry) => {
                 #[cfg(test)]
