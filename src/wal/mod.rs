@@ -59,6 +59,117 @@ struct WalState<W: Write> {
     rollback_barrier: Option<crate::durability::DataBarrier<W>>,
     rotation: Option<RotationSupport<W>>,
     frame_buffer: Vec<u8>,
+    delta_recorder: Option<DeltaRecorder>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecordedFrame {
+    action: u8,
+    payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecordedMutation {
+    timestamp_bucket: u64,
+    frames: Vec<RecordedFrame>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeltaRecordResult {
+    Recorded,
+    Overflowed,
+    AlreadyOverflowed,
+}
+
+#[derive(Debug)]
+struct DeltaRecorder {
+    token: u64,
+    limit: u64,
+    used_bytes: u64,
+    groups: Vec<RecordedMutation>,
+    overflowed: bool,
+}
+
+impl DeltaRecorder {
+    fn new(token: u64, limit: u64) -> Self {
+        Self {
+            token,
+            limit,
+            used_bytes: 0,
+            groups: Vec::new(),
+            overflowed: false,
+        }
+    }
+
+    fn record_group(
+        &mut self,
+        payload_lengths: impl IntoIterator<Item = usize>,
+        build: impl FnOnce() -> RecordedMutation,
+    ) -> DeltaRecordResult {
+        if self.overflowed {
+            return DeltaRecordResult::AlreadyOverflowed;
+        }
+        let Some(encoded_len) = checked_current_v2_group_encoded_len(payload_lengths) else {
+            self.mark_overflowed();
+            return DeltaRecordResult::Overflowed;
+        };
+        let Some(next_used) = self.used_bytes.checked_add(encoded_len) else {
+            self.mark_overflowed();
+            return DeltaRecordResult::Overflowed;
+        };
+        if next_used > self.limit {
+            self.mark_overflowed();
+            return DeltaRecordResult::Overflowed;
+        }
+        let group = build();
+        debug_assert_eq!(
+            checked_current_v2_group_encoded_len(
+                group.frames.iter().map(|frame| frame.payload.len())
+            ),
+            Some(encoded_len)
+        );
+        self.groups.push(group);
+        self.used_bytes = next_used;
+        DeltaRecordResult::Recorded
+    }
+
+    fn mark_overflowed(&mut self) {
+        self.overflowed = true;
+        self.used_bytes = 0;
+        self.groups.clear();
+        self.groups.shrink_to_fit();
+    }
+}
+
+impl<W: Write> WalState<W> {
+    fn activate_delta(&mut self, token: u64, limit: u64) -> Result<(), ()> {
+        if self.delta_recorder.is_some() {
+            return Err(());
+        }
+        self.delta_recorder = Some(DeltaRecorder::new(token, limit));
+        Ok(())
+    }
+
+    fn detach_delta(&mut self, token: u64) -> Option<DeltaRecorder> {
+        if self
+            .delta_recorder
+            .as_ref()
+            .is_none_or(|recorder| recorder.token != token)
+        {
+            return None;
+        }
+        self.delta_recorder.take()
+    }
+}
+
+fn checked_current_v2_group_encoded_len(
+    payload_lengths: impl IntoIterator<Item = usize>,
+) -> Option<u64> {
+    payload_lengths.into_iter().try_fold(0_u64, |total, len| {
+        total
+            .checked_add(format::V2CodecProbe::EMPTY_RECORD_LEN as u64)?
+            .checked_add(u64::try_from(len).ok()?)
+    })
 }
 
 struct RotationSupport<W: Write> {
@@ -219,6 +330,7 @@ impl WalStorage<File> {
             rollback_barrier: Some(crate::durability::synchronize_file_all),
             rotation: None,
             frame_buffer: Vec::new(),
+            delta_recorder: None,
         };
         let wal_state = RwLock::new(wal_state);
 
@@ -300,6 +412,7 @@ impl WalStorage<File> {
                 rollback_barrier: Some(crate::durability::synchronize_file_all),
                 rotation: None,
                 frame_buffer: Vec::new(),
+                delta_recorder: None,
             }),
         })
     }
@@ -331,6 +444,7 @@ impl WalStorage<File> {
                 rollback_barrier: Some(crate::durability::synchronize_file_all),
                 rotation: None,
                 frame_buffer: Vec::new(),
+                delta_recorder: None,
             }),
         }
     }
@@ -357,6 +471,7 @@ impl WalStorage<File> {
                 rollback_barrier: Some(crate::durability::synchronize_file_all),
                 rotation: None,
                 frame_buffer: Vec::new(),
+                delta_recorder: None,
             }),
         }
     }
@@ -545,6 +660,7 @@ impl WalStorage<Vec<u8>> {
             rollback_barrier: None,
             rotation: None,
             frame_buffer: Vec::new(),
+            delta_recorder: None,
         };
         let wal_state = RwLock::new(wal_state);
 
@@ -583,6 +699,7 @@ impl WalStorage<Vec<u8>> {
                 rollback_barrier: None,
                 rotation: None,
                 frame_buffer: Vec::new(),
+                delta_recorder: None,
             }),
         }
     }
@@ -646,6 +763,7 @@ impl<W: Write> WalStorage<W> {
                 rollback_barrier: None,
                 rotation: None,
                 frame_buffer: Vec::new(),
+                delta_recorder: None,
             }),
         }
     }
@@ -671,6 +789,7 @@ impl<W: Write> WalStorage<W> {
                 rollback_barrier: None,
                 rotation: None,
                 frame_buffer: Vec::new(),
+                delta_recorder: None,
             }),
         }
     }

@@ -1,5 +1,6 @@
 //! Private WAL maintenance behavior tests.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::format::V2CodecProbe;
@@ -10,7 +11,116 @@ use super::replay::{
     replay_key_map, replay_key_set, replay_key_value, KeyMapSnapshot, KeySetSnapshot,
     KeyValueSnapshot,
 };
+use super::{
+    checked_current_v2_group_encoded_len, DeltaRecordResult, DeltaRecorder, RecordedFrame,
+    RecordedMutation, WalStorage,
+};
 use crate::model::{Key, SearchKey};
+
+#[test]
+fn delta_recorder_is_token_bound_exactly_bounded_and_terminal_on_overflow() {
+    let storage = WalStorage::new_vec_based();
+    let exact = group_encoded_len(&[3, 5]);
+    let mut state = storage.wal_state.write().unwrap();
+    assert!(state.activate_delta(11, exact).is_ok());
+    assert!(state.activate_delta(12, exact).is_err());
+    assert!(state.detach_delta(12).is_none());
+
+    let built = Cell::new(false);
+    assert_eq!(
+        state
+            .delta_recorder
+            .as_mut()
+            .unwrap()
+            .record_group([3, 5], || {
+                built.set(true);
+                mutation(7, &[3, 5])
+            }),
+        DeltaRecordResult::Recorded
+    );
+    assert!(built.get());
+    let exact_recorder = state.detach_delta(11).unwrap();
+    assert_eq!(exact_recorder.used_bytes, exact);
+    assert_eq!(exact_recorder.groups, vec![mutation(7, &[3, 5])]);
+    assert!(!exact_recorder.overflowed);
+
+    state.activate_delta(21, exact + 1).unwrap();
+    let recorder = state.delta_recorder.as_mut().unwrap();
+    assert_eq!(
+        recorder.record_group([0], || mutation(8, &[0])),
+        DeltaRecordResult::Recorded
+    );
+    let over_limit_build_ran = Cell::new(false);
+    assert_eq!(
+        recorder.record_group([3, 5], || {
+            over_limit_build_ran.set(true);
+            mutation(9, &[3, 5])
+        }),
+        DeltaRecordResult::Overflowed
+    );
+    assert!(!over_limit_build_ran.get());
+    assert!(recorder.overflowed);
+    assert_eq!(recorder.used_bytes, 0);
+    assert!(recorder.groups.is_empty());
+    assert_eq!(recorder.groups.capacity(), 0);
+
+    let later_build_ran = Cell::new(false);
+    assert_eq!(
+        recorder.record_group([0], || {
+            later_build_ran.set(true);
+            mutation(10, &[0])
+        }),
+        DeltaRecordResult::AlreadyOverflowed
+    );
+    assert!(!later_build_ran.get());
+    assert!(recorder.groups.is_empty());
+
+    let mut arithmetic_overflow = DeltaRecorder::new(31, u64::MAX);
+    arithmetic_overflow.used_bytes = u64::MAX;
+    let overflow_build_ran = Cell::new(false);
+    assert_eq!(
+        arithmetic_overflow.record_group([0], || {
+            overflow_build_ran.set(true);
+            mutation(11, &[0])
+        }),
+        DeltaRecordResult::Overflowed
+    );
+    assert!(!overflow_build_ran.get());
+    assert!(arithmetic_overflow.overflowed);
+    assert_eq!(arithmetic_overflow.used_bytes, 0);
+    assert_eq!(arithmetic_overflow.groups.capacity(), 0);
+
+    let mut first_group_over = DeltaRecorder::new(41, exact - 1);
+    let first_build_ran = Cell::new(false);
+    assert_eq!(
+        first_group_over.record_group([3, 5], || {
+            first_build_ran.set(true);
+            mutation(12, &[3, 5])
+        }),
+        DeltaRecordResult::Overflowed
+    );
+    assert!(!first_build_ran.get());
+    assert!(first_group_over.groups.is_empty());
+    assert_eq!(first_group_over.groups.capacity(), 0);
+}
+
+fn group_encoded_len(payload_lengths: &[usize]) -> u64 {
+    checked_current_v2_group_encoded_len(payload_lengths.iter().copied()).unwrap()
+}
+
+fn mutation(timestamp_bucket: u64, payload_lengths: &[usize]) -> RecordedMutation {
+    RecordedMutation {
+        timestamp_bucket,
+        frames: payload_lengths
+            .iter()
+            .enumerate()
+            .map(|(index, payload_len)| RecordedFrame {
+                action: index as u8 + 1,
+                payload: vec![index as u8; *payload_len],
+            })
+            .collect(),
+    }
+}
 
 #[test]
 fn key_value_snapshot_encodes_as_one_deterministic_current_v2_segment() {
