@@ -472,3 +472,57 @@ fn previous_published_prefers_valid_replacement_then_previous_else_preserves_amb
     ));
     assert_eq!(snapshot_directory(_root.path()).unwrap(), evidence);
 }
+
+#[test]
+fn replacement_published_confirms_only_valid_canonical_while_retaining_previous() {
+    let (_root, store_dir, prepared, mut manifest) = replacement_fixture();
+    let canonical = snapshot_directory(&store_dir).unwrap();
+    let previous = snapshot_directory(&prepared.paths.previous).unwrap();
+    crate::compaction::recovery::recover_replacement_published_closed(
+        &store_dir,
+        &prepared.paths,
+        &mut manifest,
+    )
+    .unwrap();
+    assert_eq!(manifest.phase, ManifestPhase::CleanupPending);
+    assert_eq!(snapshot_directory(&store_dir).unwrap(), canonical);
+    assert_eq!(
+        snapshot_directory(&prepared.paths.previous).unwrap(),
+        previous
+    );
+    assert_eq!(
+        read_published_manifest(&prepared.paths)
+            .unwrap()
+            .unwrap()
+            .phase,
+        ManifestPhase::CleanupPending
+    );
+
+    for missing_previous in [false, true] {
+        let (_root, store_dir, prepared, mut manifest) = replacement_fixture();
+        if missing_previous {
+            std::fs::remove_dir_all(&prepared.paths.previous).unwrap();
+        } else {
+            let canonical_file = std::fs::read_dir(&store_dir)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            std::fs::write(canonical_file, b"invalid canonical replacement").unwrap();
+        }
+        let evidence = snapshot_directory(_root.path()).unwrap();
+        let error = crate::compaction::recovery::recover_replacement_published_closed(
+            &store_dir,
+            &prepared.paths,
+            &mut manifest,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::CompactionError::AuthorityUndetermined { .. }
+        ));
+        assert_eq!(snapshot_directory(_root.path()).unwrap(), evidence);
+        assert_eq!(manifest.phase, ManifestPhase::ReplacementPublished);
+    }
+}

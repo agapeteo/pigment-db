@@ -110,6 +110,35 @@ pub(crate) fn recover_previous_published_closed(
     Err(authority_undetermined(store_dir, paths))
 }
 
+pub(crate) fn recover_replacement_published_closed(
+    store_dir: &Path,
+    paths: &MaintenanceArtifactPaths,
+    manifest: &mut CompactionManifest,
+) -> Result<(), CompactionError> {
+    if manifest.phase != ManifestPhase::ReplacementPublished
+        || manifest.mode != ManifestMode::ClosedDirectory
+        || manifest.scope != ManifestScope::Directory
+        || !manifest.source_finalized
+    {
+        return Err(CompactionError::FailedClosed {
+            detail: "closed ReplacementPublished recovery received contradictory manifest state"
+                .to_owned(),
+        });
+    }
+    let canonical_valid =
+        path_exists(store_dir)? && generation_matches(store_dir, &manifest.replacement_inventory);
+    let previous_valid = path_exists(&paths.previous)?
+        && generation_matches(&paths.previous, &manifest.source_inventory);
+    if !canonical_valid || !previous_valid || path_exists(&paths.staging)? {
+        return Err(authority_undetermined(store_dir, paths));
+    }
+    let mut next = manifest.clone();
+    next.phase = ManifestPhase::CleanupPending;
+    publish_manifest_for_policy(paths, &next, manifest.durability)?;
+    *manifest = next;
+    Ok(())
+}
+
 fn establish_replacement_phase(
     paths: &MaintenanceArtifactPaths,
     manifest: &mut CompactionManifest,
