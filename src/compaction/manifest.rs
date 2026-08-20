@@ -2,7 +2,11 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::ffi::OsString;
+use std::fs;
+use std::io::Read;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 
 use crate::{DurabilityPolicy, StoreFamily};
@@ -13,6 +17,8 @@ const MANIFEST_HEADER_LEN: usize = 16;
 const MANIFEST_VERSION_OFFSET: usize = 8;
 const MANIFEST_BODY_LEN_OFFSET: usize = 12;
 const MAX_MANIFEST_BODY_LEN: usize = 1024 * 1024;
+const MAX_MANIFEST_PATH_LEN: usize = 4096;
+const MAX_MANIFEST_DESCRIPTORS: usize = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ManifestMode {
@@ -76,11 +82,64 @@ pub(crate) enum ManifestCodecError {
     BodyTooLarge,
     ChecksumMismatch,
     InvalidBody,
+    InvalidPath,
+    DuplicatePath,
+    LimitExceeded,
+    DescriptorMismatch,
+}
+
+pub(crate) fn verify_descriptor(
+    anchor: &Path,
+    descriptor: &ArtifactDescriptor,
+) -> Result<(), ManifestCodecError> {
+    validate_relative_path(&descriptor.relative_path)?;
+    let canonical_anchor =
+        fs::canonicalize(anchor).map_err(|_| ManifestCodecError::DescriptorMismatch)?;
+    let mut artifact = anchor.to_path_buf();
+    for component in descriptor.relative_path.components() {
+        let Component::Normal(component) = component else {
+            return Err(ManifestCodecError::InvalidPath);
+        };
+        artifact.push(component);
+        let metadata =
+            fs::symlink_metadata(&artifact).map_err(|_| ManifestCodecError::DescriptorMismatch)?;
+        if metadata.file_type().is_symlink() {
+            return Err(ManifestCodecError::InvalidPath);
+        }
+    }
+    let canonical_artifact =
+        fs::canonicalize(&artifact).map_err(|_| ManifestCodecError::DescriptorMismatch)?;
+    if !canonical_artifact.starts_with(&canonical_anchor) {
+        return Err(ManifestCodecError::InvalidPath);
+    }
+    let metadata =
+        fs::metadata(&canonical_artifact).map_err(|_| ManifestCodecError::DescriptorMismatch)?;
+    if !metadata.is_file() || metadata.len() != descriptor.length {
+        return Err(ManifestCodecError::DescriptorMismatch);
+    }
+    let mut file =
+        fs::File::open(&canonical_artifact).map_err(|_| ManifestCodecError::DescriptorMismatch)?;
+    let mut hasher = crc32fast::Hasher::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|_| ManifestCodecError::DescriptorMismatch)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    if hasher.finalize() != descriptor.checksum {
+        return Err(ManifestCodecError::DescriptorMismatch);
+    }
+    Ok(())
 }
 
 pub(crate) fn encode_manifest(
     manifest: &CompactionManifest,
 ) -> Result<Vec<u8>, ManifestCodecError> {
+    validate_manifest(manifest)?;
     let mut body = BodyWriter::default();
     body.bytes(&manifest.operation_id);
     body.byte(match manifest.mode {
@@ -208,7 +267,7 @@ pub(crate) fn decode_manifest(encoded: &[u8]) -> Result<CompactionManifest, Mani
     if !body.is_finished() {
         return Err(ManifestCodecError::InvalidBody);
     }
-    Ok(CompactionManifest {
+    let manifest = CompactionManifest {
         operation_id,
         mode,
         scope,
@@ -219,7 +278,70 @@ pub(crate) fn decode_manifest(encoded: &[u8]) -> Result<CompactionManifest, Mani
         staging_location,
         previous_location,
         replacement_inventory,
-    })
+    };
+    validate_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn validate_manifest(manifest: &CompactionManifest) -> Result<(), ManifestCodecError> {
+    match (&manifest.mode, &manifest.scope) {
+        (ManifestMode::ClosedDirectory, ManifestScope::Directory)
+        | (ManifestMode::OnlineFamily, ManifestScope::Family { .. }) => {}
+        _ => return Err(ManifestCodecError::InvalidBody),
+    }
+    if manifest.mode == ManifestMode::ClosedDirectory && !manifest.source_finalized {
+        return Err(ManifestCodecError::InvalidBody);
+    }
+    if let ManifestScope::Family { active_name, .. } = &manifest.scope {
+        validate_relative_path(active_name)?;
+    }
+    validate_relative_path(&manifest.staging_location)?;
+    validate_relative_path(&manifest.previous_location)?;
+    if manifest.staging_location == manifest.previous_location {
+        return Err(ManifestCodecError::DuplicatePath);
+    }
+    validate_descriptors(&manifest.source_inventory)?;
+    validate_descriptors(&manifest.replacement_inventory)?;
+    Ok(())
+}
+
+fn validate_descriptors(descriptors: &[ArtifactDescriptor]) -> Result<(), ManifestCodecError> {
+    if descriptors.len() > MAX_MANIFEST_DESCRIPTORS {
+        return Err(ManifestCodecError::LimitExceeded);
+    }
+    let mut paths = HashSet::with_capacity(descriptors.len());
+    for descriptor in descriptors {
+        validate_relative_path(&descriptor.relative_path)?;
+        if !paths.insert(descriptor.relative_path.clone()) {
+            return Err(ManifestCodecError::DuplicatePath);
+        }
+    }
+    Ok(())
+}
+
+fn validate_relative_path(path: &Path) -> Result<(), ManifestCodecError> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Err(ManifestCodecError::InvalidPath);
+    }
+    let native = encode_native_path(path)?;
+    if native.len() > MAX_MANIFEST_PATH_LEN {
+        return Err(ManifestCodecError::LimitExceeded);
+    }
+    let mut canonical = PathBuf::new();
+    let mut component_count = 0_usize;
+    for component in path.components() {
+        let Component::Normal(component) = component else {
+            return Err(ManifestCodecError::InvalidPath);
+        };
+        canonical.push(component);
+        component_count = component_count
+            .checked_add(1)
+            .ok_or(ManifestCodecError::LimitExceeded)?;
+    }
+    if component_count == 0 || canonical.as_os_str() != path.as_os_str() {
+        return Err(ManifestCodecError::InvalidPath);
+    }
+    Ok(())
 }
 
 fn encode_family(family: StoreFamily) -> u8 {
@@ -279,6 +401,9 @@ impl BodyWriter {
 
     fn path(&mut self, path: &Path) -> Result<(), ManifestCodecError> {
         let native = encode_native_path(path)?;
+        if native.len() > MAX_MANIFEST_PATH_LEN {
+            return Err(ManifestCodecError::LimitExceeded);
+        }
         let length = u32::try_from(native.len()).map_err(|_| ManifestCodecError::BodyTooLarge)?;
         self.u32(length);
         self.bytes(&native);
@@ -304,6 +429,9 @@ impl BodyWriter {
         &mut self,
         descriptors: &[ArtifactDescriptor],
     ) -> Result<(), ManifestCodecError> {
+        if descriptors.len() > MAX_MANIFEST_DESCRIPTORS {
+            return Err(ManifestCodecError::LimitExceeded);
+        }
         let count =
             u32::try_from(descriptors.len()).map_err(|_| ManifestCodecError::BodyTooLarge)?;
         self.u32(count);
@@ -363,6 +491,9 @@ impl<'a> BodyReader<'a> {
 
     fn path(&mut self) -> Result<PathBuf, ManifestCodecError> {
         let length = usize::try_from(self.u32()?).map_err(|_| ManifestCodecError::InvalidBody)?;
+        if length > MAX_MANIFEST_PATH_LEN {
+            return Err(ManifestCodecError::LimitExceeded);
+        }
         decode_native_path(self.bytes(length)?)
     }
 
@@ -391,6 +522,9 @@ impl<'a> BodyReader<'a> {
 
     fn descriptors(&mut self) -> Result<Vec<ArtifactDescriptor>, ManifestCodecError> {
         let count = usize::try_from(self.u32()?).map_err(|_| ManifestCodecError::InvalidBody)?;
+        if count > MAX_MANIFEST_DESCRIPTORS {
+            return Err(ManifestCodecError::LimitExceeded);
+        }
         let mut descriptors = Vec::with_capacity(count);
         for _ in 0..count {
             descriptors.push(self.descriptor()?);
@@ -463,6 +597,12 @@ pub(crate) fn test_sentinel() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rechecksum(encoded: &mut [u8]) {
+        let checksum_start = encoded.len() - std::mem::size_of::<u32>();
+        let checksum = crc32fast::hash(&encoded[..checksum_start]);
+        encoded[checksum_start..].copy_from_slice(&checksum.to_le_bytes());
+    }
 
     fn descriptor(name: &str, role: ArtifactRole) -> ArtifactDescriptor {
         ArtifactDescriptor {
@@ -583,6 +723,156 @@ mod tests {
         assert_eq!(
             decode_manifest(&bad_crc),
             Err(ManifestCodecError::ChecksumMismatch)
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_noncanonical_escaping_and_duplicate_native_paths() {
+        let absolute = std::env::current_dir().unwrap().join("absolute-artifact");
+        let parent = PathBuf::from("source").join("..").join("escaped");
+        let alias = PathBuf::from(format!(
+            "source{separator}.{separator}artifact",
+            separator = std::path::MAIN_SEPARATOR
+        ));
+        for invalid in [absolute, parent, alias] {
+            let mut invalid_manifest = manifest(
+                ManifestScope::Directory,
+                ManifestPhase::Prepared,
+                DurabilityPolicy::Buffered,
+            );
+            invalid_manifest.source_inventory[0].relative_path = invalid;
+            assert_eq!(
+                encode_manifest(&invalid_manifest),
+                Err(ManifestCodecError::InvalidPath)
+            );
+        }
+
+        let mut duplicate = manifest(
+            ManifestScope::Directory,
+            ManifestPhase::Prepared,
+            DurabilityPolicy::Buffered,
+        );
+        duplicate
+            .source_inventory
+            .push(duplicate.source_inventory[0].clone());
+        assert_eq!(
+            encode_manifest(&duplicate),
+            Err(ManifestCodecError::DuplicatePath)
+        );
+
+        let mut invalid_location = manifest(
+            ManifestScope::Directory,
+            ManifestPhase::Prepared,
+            DurabilityPolicy::Buffered,
+        );
+        invalid_location.staging_location = PathBuf::from("..").join("staging");
+        assert_eq!(
+            encode_manifest(&invalid_location),
+            Err(ManifestCodecError::InvalidPath)
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_excessive_lengths_counts_and_unknown_enum_values_before_allocation() {
+        let mut excessive_path = manifest(
+            ManifestScope::Directory,
+            ManifestPhase::Prepared,
+            DurabilityPolicy::Buffered,
+        );
+        excessive_path.source_inventory[0].relative_path =
+            PathBuf::from("a".repeat(MAX_MANIFEST_PATH_LEN + 1));
+        assert_eq!(
+            encode_manifest(&excessive_path),
+            Err(ManifestCodecError::LimitExceeded)
+        );
+
+        let mut excessive_count = encode_manifest(&manifest(
+            ManifestScope::Directory,
+            ManifestPhase::Prepared,
+            DurabilityPolicy::Buffered,
+        ))
+        .unwrap();
+        let source_count_offset = MANIFEST_HEADER_LEN + 21;
+        excessive_count[source_count_offset..source_count_offset + 4].copy_from_slice(
+            &u32::try_from(MAX_MANIFEST_DESCRIPTORS + 1)
+                .unwrap()
+                .to_le_bytes(),
+        );
+        rechecksum(&mut excessive_count);
+        assert_eq!(
+            decode_manifest(&excessive_count),
+            Err(ManifestCodecError::LimitExceeded)
+        );
+
+        for body_offset in [16_usize, 17, 18, 19, 20] {
+            let mut unknown = encode_manifest(&manifest(
+                ManifestScope::Directory,
+                ManifestPhase::Prepared,
+                DurabilityPolicy::Buffered,
+            ))
+            .unwrap();
+            unknown[MANIFEST_HEADER_LEN + body_offset] = 0xff;
+            rechecksum(&mut unknown);
+            assert_eq!(
+                decode_manifest(&unknown),
+                Err(ManifestCodecError::InvalidBody)
+            );
+        }
+
+        let mut unknown_descriptor = encode_manifest(&manifest(
+            ManifestScope::Directory,
+            ManifestPhase::Prepared,
+            DurabilityPolicy::Buffered,
+        ))
+        .unwrap();
+        let source_path_len = "source.pigment".len();
+        let role_offset = MANIFEST_HEADER_LEN + 25 + 4 + source_path_len;
+        unknown_descriptor[role_offset] = 0xff;
+        rechecksum(&mut unknown_descriptor);
+        assert_eq!(
+            decode_manifest(&unknown_descriptor),
+            Err(ManifestCodecError::InvalidBody)
+        );
+    }
+
+    #[test]
+    fn descriptor_verification_is_anchor_bounded_and_matches_exact_length_and_checksum() {
+        let directory = tempfile::tempdir().unwrap();
+        let content = b"exact artifact bytes";
+        std::fs::write(directory.path().join("artifact"), content).unwrap();
+        let exact = ArtifactDescriptor {
+            relative_path: PathBuf::from("artifact"),
+            role: ArtifactRole::Active,
+            family: Some(StoreFamily::KeyValue),
+            length: u64::try_from(content.len()).unwrap(),
+            checksum: crc32fast::hash(content),
+        };
+        assert_eq!(verify_descriptor(directory.path(), &exact), Ok(()));
+
+        let mut wrong_length = exact.clone();
+        wrong_length.length += 1;
+        assert_eq!(
+            verify_descriptor(directory.path(), &wrong_length),
+            Err(ManifestCodecError::DescriptorMismatch)
+        );
+        let mut wrong_checksum = exact;
+        wrong_checksum.checksum ^= 1;
+        assert_eq!(
+            verify_descriptor(directory.path(), &wrong_checksum),
+            Err(ManifestCodecError::DescriptorMismatch)
+        );
+        assert_eq!(
+            verify_descriptor(
+                directory.path(),
+                &ArtifactDescriptor {
+                    relative_path: PathBuf::from("..").join("escaped"),
+                    role: ArtifactRole::Active,
+                    family: Some(StoreFamily::KeyValue),
+                    length: 0,
+                    checksum: 0,
+                }
+            ),
+            Err(ManifestCodecError::InvalidPath)
         );
     }
 }
