@@ -808,6 +808,33 @@ impl<W: Write> WalStorage<W> {
     }
 
     #[cfg(test)]
+    pub(crate) fn new_v2_with_physical_probe(
+        writer: W,
+        rollback: fn(&mut W, usize) -> std::io::Result<()>,
+        data_barrier: crate::durability::DataBarrier<W>,
+    ) -> Self {
+        Self {
+            wal_state: RwLock::new(WalState {
+                offset: format::V2CodecProbe::HEADER_LEN as u64,
+                active_len: format::V2CodecProbe::HEADER_LEN as u64,
+                writer,
+                rollback: Some(rollback),
+                health: WalHealth::Ready,
+                format: WalFormat::V2,
+                granularity_nanos: DEFAULT_GRANULARITY_NANOS,
+                last_bucket: 0,
+                clock: || 0,
+                durability_policy: crate::config::DurabilityPolicy::Physical,
+                data_barrier: Some(data_barrier),
+                rollback_barrier: None,
+                rotation: None,
+                frame_buffer: Vec::new(),
+                delta_recorder: None,
+            }),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn commit_compute_batch(&self, actions: Vec<ComputeAction>) -> std::io::Result<()> {
         self.commit_compute_batch_with_format(actions, false)
     }
@@ -1190,6 +1217,7 @@ impl<W: Write> WalStorage<W> {
             state.last_bucket = timestamp_bucket;
             state.offset = accepted_offset;
             state.active_len = physical_checkpoint + encoded_len;
+            record_single_delta_if_active(&mut state, timestamp_bucket, &action);
             return Ok(());
         }
         let checkpoint = u32::try_from(state.offset).map_err(|_| {
@@ -1266,6 +1294,26 @@ impl<W: Write> WalStorage<W> {
         state.active_len = u64::from(accepted_offset);
         Ok(())
     }
+}
+
+#[inline]
+fn record_single_delta_if_active<W: Write>(
+    state: &mut WalState<W>,
+    timestamp_bucket: u64,
+    action: &StoredAction,
+) {
+    let Some(recorder) = state.delta_recorder.as_mut() else {
+        return;
+    };
+    let action_kind = action.v2_act_type();
+    let payload = action.data();
+    let _ = recorder.record_group([payload.len()], || RecordedMutation {
+        timestamp_bucket,
+        frames: vec![RecordedFrame {
+            action: action_kind,
+            payload: payload.to_vec(),
+        }],
+    });
 }
 
 fn maybe_rotate_before<W: Write>(

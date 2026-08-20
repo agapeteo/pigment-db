@@ -197,8 +197,8 @@
 
 - [X] T102 [US3] Write and run a runtime RED for token-bound recorder activation/detach, exact-limit acceptance, first-group-over-limit clearing, checked overflow, later-work skipping, and bounded memory in `src/wal/maintenance_tests.rs`
 - [X] T103 [US3] Implement private `DeltaRecorder`, grouped logical frames, exact V2 encoded-length accounting, and overflow state inside `WalState` in `src/wal/mod.rs`, then run T102 GREEN
-- [ ] T104 [US3] Write and run a runtime RED proving successful single actions enter the delta only after write/flush/physical barrier and in cross-shard WAL acceptance order in `src/wal/maintenance_tests.rs`
-- [ ] T105 [US3] Record already-encoded successful single actions at the acceptance boundary with an allocation-free inactive branch in `src/wal/mod.rs`, then run T104 GREEN
+- [X] T104 [US3] Write and run a runtime RED proving successful single actions enter the delta only after write/flush/physical barrier and in cross-shard WAL acceptance order in `src/wal/maintenance_tests.rs`
+- [X] T105 [US3] Record already-encoded successful single actions at the acceptance boundary with an allocation-free inactive branch in `src/wal/mod.rs`, then run T104 GREEN
 - [ ] T106 [US3] Write and run a runtime RED proving every multi-frame compute acceptance is one atomic ordered delta group with its accepted timestamp bucket in `src/wal/maintenance_tests.rs`
 - [ ] T107 [US3] Record complete compute batches only after durable acceptance in `src/wal/mod.rs`, then run T106 GREEN and compute persistence suites
 - [ ] T108 [US3] Write and run a runtime RED proving rejected writes, failed flush/sync, successful rollback, failed rollback, conflicts, and no-op compute never enter the delta and unhealthy WAL aborts cutover in `src/wal/maintenance_tests.rs`

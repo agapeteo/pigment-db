@@ -2,8 +2,14 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{mpsc, Arc};
+use std::time::Duration;
 
 use super::format::V2CodecProbe;
+use super::model::{
+    KeyValueData, StoredAction, DELETE_ACT, MAP_PUT_V2_ACT, MAP_REMOVE_V2_ACT, PUT_ACT,
+    SET_APPEND_ACT, SET_REMOVE_ACT,
+};
 use super::replay::{
     encode_current_key_map_snapshot, encode_current_key_map_snapshot_with_metadata,
     encode_current_key_set_snapshot, encode_current_key_set_snapshot_with_metadata,
@@ -16,6 +22,9 @@ use super::{
     RecordedMutation, WalStorage,
 };
 use crate::model::{Key, SearchKey};
+use crate::test_support::fault_writer::{
+    rollback_scripted, sync_data_scripted, BarrierKind, ScriptedWriter,
+};
 
 #[test]
 fn delta_recorder_is_token_bound_exactly_bounded_and_terminal_on_overflow() {
@@ -102,6 +111,97 @@ fn delta_recorder_is_token_bound_exactly_bounded_and_terminal_on_overflow() {
     assert!(!first_build_ran.get());
     assert!(first_group_over.groups.is_empty());
     assert_eq!(first_group_over.groups.capacity(), 0);
+}
+
+#[test]
+fn successful_single_actions_record_after_physical_acceptance_in_wal_order() {
+    let header = V2CodecProbe::encode_header(super::format::V2HeaderProbeFields {
+        kind: 1,
+        granularity_nanos: 60_000_000_000,
+        base_bucket: 0,
+        segment_id: 0,
+        segment_base: 0,
+    });
+    let (writer, handle) =
+        ScriptedWriter::scripted_with_bytes(None, false, Some(BarrierKind::Data), header.to_vec());
+    let wal = Arc::new(WalStorage::new_v2_with_physical_probe(
+        writer,
+        rollback_scripted,
+        sync_data_scripted,
+    ));
+    wal.wal_state
+        .write()
+        .unwrap()
+        .activate_delta(101, u64::MAX)
+        .unwrap();
+
+    let first_wal = Arc::clone(&wal);
+    let first = std::thread::spawn(move || {
+        first_wal
+            .try_store_put_event(b"first".to_vec(), b"one".to_vec())
+            .unwrap();
+    });
+    handle.wait_until_barrier_blocked(BarrierKind::Data);
+    let (second_tx, second_rx) = mpsc::sync_channel(0);
+    let second_wal = Arc::clone(&wal);
+    let second = std::thread::spawn(move || {
+        second_wal
+            .try_store_put_event(b"second".to_vec(), b"two".to_vec())
+            .unwrap();
+        second_tx.send(()).unwrap();
+    });
+    assert!(second_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    handle.release_barrier();
+    first.join().unwrap();
+    second_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    second.join().unwrap();
+
+    wal.try_store_delete_event(b"deleted").unwrap();
+    wal.try_store_append_to_set_event_borrowed(b"set", b"added".to_vec())
+        .unwrap();
+    wal.try_store_remove_from_set_event(b"set".to_vec(), b"removed".to_vec())
+        .unwrap();
+    wal.try_store_put_to_map_event(b"map".to_vec(), SearchKey::from(1), b"mapped".to_vec())
+        .unwrap();
+    wal.try_store_remove_from_sorted_map_event(b"map".to_vec(), SearchKey::from(1))
+        .unwrap();
+
+    let recorder = wal.wal_state.write().unwrap().detach_delta(101).unwrap();
+    assert_eq!(recorder.groups.len(), 7);
+    assert_eq!(
+        recorder
+            .groups
+            .iter()
+            .map(|group| group.frames[0].action)
+            .collect::<Vec<_>>(),
+        vec![
+            PUT_ACT,
+            PUT_ACT,
+            DELETE_ACT,
+            SET_APPEND_ACT,
+            SET_REMOVE_ACT,
+            MAP_PUT_V2_ACT,
+            MAP_REMOVE_V2_ACT,
+        ]
+    );
+    assert!(recorder
+        .groups
+        .iter()
+        .all(|group| group.timestamp_bucket == 0 && group.frames.len() == 1));
+    let first_payload =
+        StoredAction::prepare_put(&0, &KeyValueData::new(b"first".to_vec(), b"one".to_vec()));
+    let second_payload =
+        StoredAction::prepare_put(&0, &KeyValueData::new(b"second".to_vec(), b"two".to_vec()));
+    assert_eq!(recorder.groups[0].frames[0].payload, first_payload.data());
+    assert_eq!(recorder.groups[1].frames[0].payload, second_payload.data());
+    let exact_used = checked_current_v2_group_encoded_len(
+        recorder
+            .groups
+            .iter()
+            .flat_map(|group| group.frames.iter().map(|frame| frame.payload.len())),
+    )
+    .unwrap();
+    assert_eq!(recorder.used_bytes, exact_used);
 }
 
 fn group_encoded_len(payload_lengths: &[usize]) -> u64 {
