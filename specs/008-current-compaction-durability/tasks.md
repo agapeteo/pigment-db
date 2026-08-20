@@ -64,8 +64,8 @@
 
 - [X] T019 [US1] Write and run a runtime RED for an empty directory returning no families, zero total, and an unchanged namespace through the private inspection seam in `src/compaction/inspection.rs`
 - [X] T020 [US1] Implement only empty-directory discovery and immutable directory opening in `src/compaction/inspection.rs`, then run T019 GREEN
-- [ ] T021 [US1] Write and run a runtime RED for exact active-only key/value, key/set, key/map, and deterministic family ordering through the private seam in `src/compaction/inspection_tests.rs`
-- [ ] T022 [US1] Implement canonical active discovery, current-V2 replay validation, and family identity extraction in `src/compaction/inspection.rs` and `src/wal/replay.rs`, then run T021 GREEN
+- [X] T021 [US1] Write and run a runtime RED for exact active-only key/value, key/set, key/map, and deterministic family ordering through the private seam in `src/compaction/inspection_tests.rs`
+- [X] T022 [US1] Implement canonical active discovery, current-V2 replay validation, and family identity extraction in `src/compaction/inspection.rs` and `src/wal/replay.rs`, then run T021 GREEN
 - [ ] T023 [US1] Write and run a runtime RED for the single strict-directory behavior: contiguous sealed segments produce exact active/sealed/count/total bytes, while any unexpected entry rejects inspection and leaves the directory byte-identical in `src/compaction/inspection_tests.rs`
 - [ ] T024 [US1] Implement strict sealed-name parsing, continuity checks, and descriptor aggregation in `src/compaction/inspection.rs` and `src/wal/recovery.rs`, then run T023 GREEN
 - [ ] T025 [US1] Write and run one table-driven runtime RED for the single invalid-artifact classification behavior across malformed segment names, missing leading/middle segments, wrong-family canonical artifacts, corrupt headers/records, and unknown entries in `src/compaction/inspection_tests.rs`
