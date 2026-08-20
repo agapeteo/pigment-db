@@ -153,8 +153,8 @@
 - [X] T076 [US2] Implement the evidence-driven `PreviousPublished` decision in `src/compaction/recovery.rs`, then run T075 GREEN
 - [X] T077 [US2] Write and run a runtime RED for `ReplacementPublished` selecting only a validated canonical replacement while retaining previous evidence until confirmation in `src/compaction/recovery_tests.rs`
 - [X] T078 [US2] Implement `ReplacementPublished` validation and authority confirmation in `src/compaction/recovery.rs`, then run T077 GREEN
-- [ ] T079 [US2] Write and run a runtime RED for `CleanupPending` replacement-prefix validation, missing-target idempotence, mismatching-target preservation, and safe repeated retry in `src/compaction/recovery_tests.rs`
-- [ ] T080 [US2] Implement exact/prefix cleanup recovery and manifest-last convergence in `src/compaction/recovery.rs`, then run T079 GREEN
+- [X] T079 [US2] Write and run a runtime RED for `CleanupPending` replacement-prefix validation, missing-target idempotence, mismatching-target preservation, and safe repeated retry in `src/compaction/recovery_tests.rs`
+- [X] T080 [US2] Implement exact/prefix cleanup recovery and manifest-last convergence in `src/compaction/recovery.rs`, then run T079 GREEN
 - [ ] T081 [US2] Write and run a runtime RED classifying missing/corrupt/contradictory manifests as `AuthorityUndetermined` only when competing authority cannot be resolved and otherwise `InvalidArtifact` in `src/compaction/recovery_tests.rs`
 - [ ] T082 [US2] Implement fail-closed manifestless evidence classification without mutation in `src/compaction/recovery.rs`, then run T081 GREEN
 - [ ] T083 [US2] Write and run a runtime RED proving all three file-store initializers resolve maintenance before ordinary WAL recovery and preserve evidence on failure in `tests/compaction_recovery/contract.rs`

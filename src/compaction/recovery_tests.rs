@@ -526,3 +526,123 @@ fn replacement_published_confirms_only_valid_canonical_while_retaining_previous(
         assert_eq!(manifest.phase, ManifestPhase::ReplacementPublished);
     }
 }
+
+#[test]
+fn cleanup_pending_validates_replacement_and_retries_missing_exact_targets_idempotently() {
+    let (_root, store_dir, prepared, mut manifest) = replacement_fixture();
+    crate::compaction::recovery::recover_replacement_published_closed(
+        &store_dir,
+        &prepared.paths,
+        &mut manifest,
+    )
+    .unwrap();
+    std::fs::remove_dir_all(&prepared.paths.previous).unwrap();
+    assert_eq!(
+        crate::compaction::recovery::recover_cleanup_pending_closed(
+            &store_dir,
+            &prepared.paths,
+            &manifest,
+        )
+        .unwrap(),
+        crate::CleanupStatus::Complete
+    );
+    assert!(!prepared.paths.manifest.exists());
+    assert_eq!(
+        crate::compaction::recovery::recover_cleanup_pending_closed(
+            &store_dir,
+            &prepared.paths,
+            &manifest,
+        )
+        .unwrap(),
+        crate::CleanupStatus::Complete
+    );
+
+    let (_root, store_dir, prepared, mut manifest) = replacement_fixture();
+    crate::compaction::recovery::recover_replacement_published_closed(
+        &store_dir,
+        &prepared.paths,
+        &mut manifest,
+    )
+    .unwrap();
+    let previous_file = std::fs::read_dir(&prepared.paths.previous)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut changed = std::fs::read(&previous_file).unwrap();
+    *changed.last_mut().unwrap() ^= 0xff;
+    std::fs::write(&previous_file, changed).unwrap();
+    let evidence = snapshot_directory(_root.path()).unwrap();
+    assert_eq!(
+        crate::compaction::recovery::recover_cleanup_pending_closed(
+            &store_dir,
+            &prepared.paths,
+            &manifest,
+        )
+        .unwrap(),
+        crate::CleanupStatus::Pending
+    );
+    assert_eq!(snapshot_directory(_root.path()).unwrap(), evidence);
+
+    let (_root, store_dir, prepared, mut manifest) = replacement_fixture();
+    crate::compaction::recovery::recover_replacement_published_closed(
+        &store_dir,
+        &prepared.paths,
+        &mut manifest,
+    )
+    .unwrap();
+    let canonical = snapshot_directory(&store_dir).unwrap();
+    let partial = crate::compaction::recovery::recover_cleanup_pending_closed_with_checkpoint(
+        &store_dir,
+        &prepared.paths,
+        &manifest,
+        |stage| {
+            if stage == crate::compaction::recovery::RecoveryCleanupStage::Artifact(1) {
+                Err(std::io::Error::other("injected after first cleanup target"))
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(partial, crate::CleanupStatus::Pending);
+    assert_eq!(snapshot_directory(&store_dir).unwrap(), canonical);
+    assert!(prepared.paths.previous.is_dir());
+    assert_eq!(
+        crate::compaction::recovery::recover_cleanup_pending_closed(
+            &store_dir,
+            &prepared.paths,
+            &manifest,
+        )
+        .unwrap(),
+        crate::CleanupStatus::Complete
+    );
+    assert!(!prepared.paths.previous.exists());
+    assert!(!prepared.paths.manifest.exists());
+
+    let (_root, store_dir, prepared, mut manifest) = replacement_fixture();
+    crate::compaction::recovery::recover_replacement_published_closed(
+        &store_dir,
+        &prepared.paths,
+        &mut manifest,
+    )
+    .unwrap();
+    let canonical_file = std::fs::read_dir(&store_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::write(canonical_file, b"invalid replacement").unwrap();
+    let evidence = snapshot_directory(_root.path()).unwrap();
+    assert!(matches!(
+        crate::compaction::recovery::recover_cleanup_pending_closed(
+            &store_dir,
+            &prepared.paths,
+            &manifest,
+        ),
+        Err(crate::CompactionError::AuthorityUndetermined { .. })
+    ));
+    assert_eq!(snapshot_directory(_root.path()).unwrap(), evidence);
+}

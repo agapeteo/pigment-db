@@ -24,6 +24,124 @@ pub(crate) enum RecoveredAuthority {
     Replacement,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveryCleanupStage {
+    Artifact(usize),
+    Directory,
+    Manifest,
+}
+
+pub(crate) fn recover_cleanup_pending_closed(
+    store_dir: &Path,
+    paths: &MaintenanceArtifactPaths,
+    manifest: &CompactionManifest,
+) -> Result<crate::CleanupStatus, CompactionError> {
+    recover_cleanup_pending_closed_with_checkpoint(store_dir, paths, manifest, |_| Ok(()))
+}
+
+pub(crate) fn recover_cleanup_pending_closed_with_checkpoint(
+    store_dir: &Path,
+    paths: &MaintenanceArtifactPaths,
+    manifest: &CompactionManifest,
+    mut checkpoint: impl FnMut(RecoveryCleanupStage) -> io::Result<()>,
+) -> Result<crate::CleanupStatus, CompactionError> {
+    if manifest.phase != ManifestPhase::CleanupPending
+        || manifest.mode != ManifestMode::ClosedDirectory
+        || manifest.scope != ManifestScope::Directory
+        || !manifest.source_finalized
+    {
+        return Err(CompactionError::FailedClosed {
+            detail: "closed CleanupPending recovery received contradictory manifest state"
+                .to_owned(),
+        });
+    }
+    if !path_exists(store_dir)?
+        || !generation_matches(store_dir, &manifest.replacement_inventory)
+        || path_exists(&paths.staging)?
+    {
+        return Err(authority_undetermined(store_dir, paths));
+    }
+    if !path_exists(&paths.previous)? {
+        return remove_manifest_last(paths, &mut checkpoint);
+    }
+    let metadata = fs::symlink_metadata(&paths.previous).map_err(|source| CompactionError::Io {
+        operation: CompactionOperation::Cleanup,
+        path: paths.previous.clone(),
+        source,
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Ok(crate::CleanupStatus::Pending);
+    }
+    let Some(parent) = paths.previous.parent() else {
+        return Ok(crate::CleanupStatus::Pending);
+    };
+    let Some(previous_name) = paths.previous.file_name() else {
+        return Ok(crate::CleanupStatus::Pending);
+    };
+    let mut by_name = std::collections::BTreeMap::new();
+    for source in &manifest.source_inventory {
+        let Some(file_name) = source.relative_path.file_name() else {
+            return Ok(crate::CleanupStatus::Pending);
+        };
+        if by_name.insert(OsString::from(file_name), source).is_some() {
+            return Ok(crate::CleanupStatus::Pending);
+        }
+    }
+    let entries = match fs::read_dir(&paths.previous) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(crate::CleanupStatus::Pending),
+    };
+    let mut remaining = Vec::new();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return Ok(crate::CleanupStatus::Pending);
+        };
+        let Ok(file_type) = entry.file_type() else {
+            return Ok(crate::CleanupStatus::Pending);
+        };
+        if !file_type.is_file() {
+            return Ok(crate::CleanupStatus::Pending);
+        }
+        let Some(source) = by_name.get(&entry.file_name()) else {
+            return Ok(crate::CleanupStatus::Pending);
+        };
+        let mut translated = (*source).clone();
+        translated.relative_path = PathBuf::from(previous_name).join(entry.file_name());
+        if verify_descriptor(parent, &translated).is_err() {
+            return Ok(crate::CleanupStatus::Pending);
+        }
+        remaining.push(entry.path());
+    }
+    remaining.sort();
+    for (index, path) in remaining.iter().enumerate() {
+        if checkpoint(RecoveryCleanupStage::Artifact(index)).is_err()
+            || fs::remove_file(path).is_err()
+        {
+            return Ok(crate::CleanupStatus::Pending);
+        }
+    }
+    if checkpoint(RecoveryCleanupStage::Directory).is_err()
+        || fs::remove_dir(&paths.previous).is_err()
+    {
+        return Ok(crate::CleanupStatus::Pending);
+    }
+    remove_manifest_last(paths, &mut checkpoint)
+}
+
+fn remove_manifest_last(
+    paths: &MaintenanceArtifactPaths,
+    checkpoint: &mut impl FnMut(RecoveryCleanupStage) -> io::Result<()>,
+) -> Result<crate::CleanupStatus, CompactionError> {
+    if checkpoint(RecoveryCleanupStage::Manifest).is_err() {
+        return Ok(crate::CleanupStatus::Pending);
+    }
+    match fs::remove_file(&paths.manifest) {
+        Ok(()) => Ok(crate::CleanupStatus::Complete),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(crate::CleanupStatus::Complete),
+        Err(_) => Ok(crate::CleanupStatus::Pending),
+    }
+}
+
 pub(crate) fn recover_previous_published_closed(
     store_dir: &Path,
     paths: &MaintenanceArtifactPaths,
