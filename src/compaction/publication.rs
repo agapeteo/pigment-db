@@ -143,8 +143,26 @@ pub(crate) fn cleanup_closed_with_checkpoint(
     {
         return Ok(crate::CleanupStatus::Pending);
     }
+    if manifest.durability == DurabilityPolicy::Physical
+        && prepared
+            .paths
+            .previous
+            .parent()
+            .is_none_or(|parent| crate::durability::synchronize_directory(parent).is_err())
+    {
+        return Ok(crate::CleanupStatus::Pending);
+    }
     if checkpoint(ClosedCleanupStage::BeforeManifest).is_err()
         || fs::remove_file(&prepared.paths.manifest).is_err()
+    {
+        return Ok(crate::CleanupStatus::Pending);
+    }
+    if manifest.durability == DurabilityPolicy::Physical
+        && prepared
+            .paths
+            .manifest
+            .parent()
+            .is_none_or(|parent| crate::durability::synchronize_directory(parent).is_err())
     {
         return Ok(crate::CleanupStatus::Pending);
     }
@@ -189,6 +207,11 @@ pub(crate) fn publish_closed_replacement_with_checkpoint(
             source,
         }
     })?;
+    synchronize_publication_parent(
+        &prepared.capture.source_dir,
+        manifest.durability,
+        CompactionOperation::PublishReplacement,
+    )?;
     #[cfg(test)]
     crate::test_support::fault_checkpoint::exit_at_maintenance_fault(
         crate::test_support::fault_checkpoint::MaintenanceFaultPoint {
@@ -288,6 +311,11 @@ pub(crate) fn publish_closed_previous_with_checkpoint(
             source,
         }
     })?;
+    synchronize_publication_parent(
+        &prepared.paths.previous,
+        manifest.durability,
+        CompactionOperation::PublishPrevious,
+    )?;
     #[cfg(test)]
     crate::test_support::fault_checkpoint::exit_at_maintenance_fault(
         crate::test_support::fault_checkpoint::MaintenanceFaultPoint {
@@ -345,15 +373,12 @@ pub(crate) fn publish_manifest_for_policy(
     manifest: &CompactionManifest,
     durability: DurabilityPolicy,
 ) -> Result<(), CompactionError> {
-    if durability == DurabilityPolicy::Physical {
-        return Err(CompactionError::FailedClosed {
-            detail: "physical manifest publication is not implemented".to_owned(),
-        });
-    }
-    publish_manifest_buffered(paths, manifest).map_err(|source| CompactionError::Io {
-        operation: CompactionOperation::WriteManifest,
-        path: paths.manifest.clone(),
-        source,
+    publish_manifest_with_checkpoint(paths, manifest, durability, |_| Ok(())).map_err(|source| {
+        CompactionError::Io {
+            operation: CompactionOperation::WriteManifest,
+            path: paths.manifest.clone(),
+            source,
+        }
     })
 }
 
@@ -400,12 +425,21 @@ pub(crate) fn publish_manifest_buffered(
     paths: &MaintenanceArtifactPaths,
     manifest: &CompactionManifest,
 ) -> io::Result<()> {
-    publish_manifest_buffered_with_checkpoint(paths, manifest, |_| Ok(()))
+    publish_manifest_with_checkpoint(paths, manifest, DurabilityPolicy::Buffered, |_| Ok(()))
 }
 
 pub(crate) fn publish_manifest_buffered_with_checkpoint(
     paths: &MaintenanceArtifactPaths,
     manifest: &CompactionManifest,
+    checkpoint: impl FnMut(ManifestPublishStage) -> io::Result<()>,
+) -> io::Result<()> {
+    publish_manifest_with_checkpoint(paths, manifest, DurabilityPolicy::Buffered, checkpoint)
+}
+
+fn publish_manifest_with_checkpoint(
+    paths: &MaintenanceArtifactPaths,
+    manifest: &CompactionManifest,
+    durability: DurabilityPolicy,
     mut checkpoint: impl FnMut(ManifestPublishStage) -> io::Result<()>,
 ) -> io::Result<()> {
     let encoded = encode_manifest(manifest)
@@ -423,6 +457,9 @@ pub(crate) fn publish_manifest_buffered_with_checkpoint(
         crate::test_support::fault_checkpoint::MaintenanceCut::ManifestWrite,
     );
     temporary.flush()?;
+    if durability == DurabilityPolicy::Physical {
+        temporary.sync_all()?;
+    }
     checkpoint(ManifestPublishStage::Flushed)?;
     #[cfg(test)]
     exit_at_manifest_fault(
@@ -431,6 +468,15 @@ pub(crate) fn publish_manifest_buffered_with_checkpoint(
     );
     drop(temporary);
     fs::rename(&paths.manifest_next, &paths.manifest)?;
+    if durability == DurabilityPolicy::Physical {
+        let parent = paths.manifest.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "compaction manifest has no parent directory",
+            )
+        })?;
+        crate::durability::synchronize_directory(parent)?;
+    }
     checkpoint(ManifestPublishStage::Renamed)?;
     #[cfg(test)]
     exit_at_manifest_fault(
@@ -438,6 +484,29 @@ pub(crate) fn publish_manifest_buffered_with_checkpoint(
         crate::test_support::fault_checkpoint::MaintenanceCut::ManifestPublish,
     );
     Ok(())
+}
+
+fn synchronize_publication_parent(
+    published: &Path,
+    durability: DurabilityPolicy,
+    operation: CompactionOperation,
+) -> Result<(), CompactionError> {
+    if durability == DurabilityPolicy::Buffered {
+        return Ok(());
+    }
+    let parent = published.parent().ok_or_else(|| CompactionError::Io {
+        operation,
+        path: published.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "published artifact has no parent directory",
+        ),
+    })?;
+    crate::durability::synchronize_directory(parent).map_err(|source| CompactionError::Io {
+        operation,
+        path: parent.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(test)]
