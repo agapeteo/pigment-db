@@ -71,7 +71,7 @@ pub(crate) fn error_classification(error: &io::Error) -> Option<&InspectionClass
 }
 
 impl InspectedFamily {
-    fn active_name(self) -> &'static str {
+    pub(crate) fn active_name(self) -> &'static str {
         match self {
             Self::KeyValue => "kv.wal.dat",
             Self::KeySet => "set.wal.dat",

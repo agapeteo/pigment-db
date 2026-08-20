@@ -357,7 +357,7 @@ impl From<DirectoryInspection> for DirectoryStorageStats {
     }
 }
 
-fn map_inspection_error(default_path: PathBuf, error: io::Error) -> CompactionError {
+pub(crate) fn map_inspection_error(default_path: PathBuf, error: io::Error) -> CompactionError {
     match error_classification(&error).cloned() {
         Some(InspectionClassification::MigrationRequired { path }) => {
             CompactionError::MigrationRequired { path }

@@ -127,8 +127,8 @@
 
 ### Closed staging, validation, and source stability
 
-- [ ] T059 [US2] Write and run a runtime RED for capturing all discovered families and constructing a unique same-parent staging directory with one V2 active file per family while source stays authoritative in `src/compaction/closed_tests.rs`
-- [ ] T060 [US2] Implement exact source capture, staged directory construction, and requested content synchronization in `src/compaction/mod.rs` and `src/compaction/publication.rs`, then run T059 GREEN
+- [X] T059 [US2] Write and run a runtime RED for capturing all discovered families and constructing a unique same-parent staging directory with one V2 active file per family while source stays authoritative in `src/compaction/closed_tests.rs`
+- [X] T060 [US2] Implement exact source capture, staged directory construction, and requested content synchronization in `src/compaction/mod.rs` and `src/compaction/publication.rs`, then run T059 GREEN
 - [ ] T061 [US2] Write and run a runtime RED proving staging reopen/family/state/timestamp mismatch rejects publication and preserves the exact source in `src/compaction/closed_tests.rs`
 - [ ] T062 [US2] Implement complete staging reopen and public-state/metadata comparison in `src/compaction/mod.rs` and `src/compaction/inspection.rs`, then run T061 GREEN
 - [ ] T063 [US2] Write and run one table-driven runtime RED for the single exact-source-stability behavior across additions, removals, renames, and length changes between capture and publication in `src/compaction/closed_tests.rs`

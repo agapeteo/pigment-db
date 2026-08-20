@@ -1,7 +1,10 @@
 //! Private closed-compaction behavior tests.
 
 use crate::maintenance_coordination::{acquire_open_lease, try_claim_closed};
-use crate::test_support::maintenance_fixtures::snapshot_directory;
+use crate::test_support::maintenance_fixtures::{
+    active_name, create_segmented_v2, snapshot_directory, FixtureFamily,
+};
+use crate::wal::format::V2CodecProbe;
 
 #[test]
 fn open_or_opening_directory_blocks_closed_claim_without_cross_directory_coordination() {
@@ -57,4 +60,74 @@ fn empty_closed_compaction_is_an_artifact_free_no_op() {
 
     assert!(outcome.families().is_empty());
     assert_eq!(snapshot_directory(root.path()).unwrap(), before);
+}
+
+#[test]
+fn closed_capture_builds_one_current_active_per_family_in_unique_sibling_staging() {
+    let root = tempfile::tempdir().unwrap();
+    let store_dir = root.path().join("mixed-store");
+    std::fs::create_dir(&store_dir).unwrap();
+    for family in [
+        FixtureFamily::KeyValue,
+        FixtureFamily::KeySet,
+        FixtureFamily::KeyMap,
+    ] {
+        create_segmented_v2(&store_dir, family);
+    }
+    let source_before = snapshot_directory(&store_dir).unwrap();
+
+    let prepared =
+        super::prepare_closed_staging(&store_dir, crate::ClosedCompactionOptions::default())
+            .unwrap();
+
+    assert_eq!(snapshot_directory(&store_dir).unwrap(), source_before);
+    assert_eq!(prepared.capture.source_dir, store_dir);
+    assert_eq!(prepared.capture.families.len(), 3);
+    assert_eq!(prepared.capture.source_bytes.len(), source_before.len());
+    for (name, bytes) in &source_before {
+        assert_eq!(
+            prepared
+                .capture
+                .source_bytes
+                .get(&std::path::Path::new("mixed-store").join(name)),
+            Some(bytes)
+        );
+    }
+    assert_eq!(prepared.paths.staging.parent(), Some(root.path()));
+    assert_ne!(prepared.paths.staging, prepared.capture.source_dir);
+    assert_eq!(prepared.replacement_inventory.len(), 3);
+
+    let staged = snapshot_directory(&prepared.paths.staging).unwrap();
+    assert_eq!(staged.len(), 3);
+    for (family, kind) in [
+        (FixtureFamily::KeyValue, 1),
+        (FixtureFamily::KeySet, 2),
+        (FixtureFamily::KeyMap, 3),
+    ] {
+        let bytes = staged
+            .get(std::path::Path::new(active_name(family)))
+            .unwrap();
+        assert!(V2CodecProbe::header_is_valid(
+            &bytes[..V2CodecProbe::HEADER_LEN]
+        ));
+        assert_eq!(
+            V2CodecProbe::header_kind(&bytes[..V2CodecProbe::HEADER_LEN]),
+            Some(kind)
+        );
+    }
+
+    let staging_before = snapshot_directory(&prepared.paths.staging).unwrap();
+    let collision = super::prepare_closed_staging(
+        &prepared.capture.source_dir,
+        crate::ClosedCompactionOptions::default(),
+    );
+    assert!(collision.is_err());
+    assert_eq!(
+        snapshot_directory(&prepared.paths.staging).unwrap(),
+        staging_before
+    );
+    assert_eq!(
+        snapshot_directory(&prepared.capture.source_dir).unwrap(),
+        source_before
+    );
 }
