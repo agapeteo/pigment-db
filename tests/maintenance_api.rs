@@ -8,6 +8,9 @@ mod maintenance_support;
 use std::collections::BTreeSet;
 use std::error::Error as _;
 
+use pigment_db::key_map_store::DurableKeyMapStore;
+use pigment_db::key_set_store::DurableKeySetStore;
+use pigment_db::key_value_store::DurableKeyValueStore;
 use pigment_db::{
     CleanupStatus, ClosedCompactionOptions, CompactionError, CompactionOperation,
     DirectoryCompactionOutcome, DirectoryStorageStats, DurabilityPolicy, FamilyCompactionOutcome,
@@ -136,4 +139,18 @@ fn public_maintenance_value_model_has_documented_defaults_getters_and_error_sour
         }
         _ => panic!("unexpected non-exhaustive compaction error variant"),
     }
+}
+
+#[test]
+fn storage_stats_methods_are_exactly_file_specialized_and_expose_no_format_identifier() {
+    let _: fn(&DurableKeyValueStore<std::fs::File>) -> Result<FamilyStorageStats, CompactionError> =
+        DurableKeyValueStore::<std::fs::File>::storage_stats;
+    let _: fn(&DurableKeySetStore<std::fs::File>) -> Result<FamilyStorageStats, CompactionError> =
+        DurableKeySetStore::<std::fs::File>::storage_stats;
+    let _: fn(&DurableKeyMapStore<std::fs::File>) -> Result<FamilyStorageStats, CompactionError> =
+        DurableKeyMapStore::<std::fs::File>::storage_stats;
+
+    let public_source = include_str!("../src/maintenance.rs");
+    assert!(!public_source.contains("pub enum FormatVersion"));
+    assert!(!public_source.contains("pub struct FormatVersion"));
 }

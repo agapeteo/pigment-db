@@ -11,6 +11,7 @@ use crate::recovery::{classify_runtime_envelope, RuntimeEnvelopeClassification};
 use crate::wal::recovery::canonical_sealed_segment_id;
 use crate::wal::replay::{
     classify_key_map_read_only, classify_key_set_read_only, classify_key_value_read_only,
+    ValidationError,
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -154,6 +155,7 @@ fn validate_current_chain(
     active: &Path,
 ) -> io::Result<(u64, u64)> {
     let mut chain = Vec::new();
+    let mut sealed_boundaries = Vec::new();
     let mut sealed_segment_bytes = 0_u64;
     for path in sealed.values() {
         let bytes = std::fs::read(path)?;
@@ -163,6 +165,7 @@ fn validate_current_chain(
             .checked_add(byte_len)
             .ok_or_else(|| invalid_artifact("sealed segment byte total overflow"))?;
         chain.extend_from_slice(&bytes);
+        sealed_boundaries.push((chain.len(), path.clone()));
     }
     let active_bytes = std::fs::read(active)?;
     let active_byte_len = u64::try_from(active_bytes.len())
@@ -185,16 +188,33 @@ fn validate_current_chain(
             .map(u16::from_le_bytes)
             == Some(2);
     if !is_current_v2 {
-        return Err(invalid_artifact(
-            "canonical active artifact is not current V2",
-        ));
+        let path = sealed
+            .values()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| active.to_path_buf());
+        return Err(invalid_artifact_at(path));
     }
     let replayed = match family {
         InspectedFamily::KeyValue => classify_key_value_read_only(&chain).map(|_| ()),
         InspectedFamily::KeySet => classify_key_set_read_only(&chain).map(|_| ()),
         InspectedFamily::KeyMap => classify_key_map_read_only(&chain).map(|_| ()),
     };
-    replayed.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    if let Err(error) = replayed {
+        let offset = match error {
+            ValidationError::Truncated { offset }
+            | ValidationError::UnsupportedAction { offset, .. }
+            | ValidationError::InvalidChecksum { offset }
+            | ValidationError::InvalidStartOffset { offset, .. }
+            | ValidationError::InvalidPayload { offset } => offset,
+        };
+        let path = sealed_boundaries
+            .iter()
+            .find(|(end, _)| offset < *end)
+            .map(|(_, path)| path.clone())
+            .unwrap_or_else(|| active.to_path_buf());
+        return Err(invalid_artifact_at(path));
+    }
     Ok((active_byte_len, sealed_segment_bytes))
 }
 
@@ -202,12 +222,23 @@ fn inspect_family_artifacts(
     family: InspectedFamily,
     artifacts: FamilyArtifacts,
 ) -> io::Result<FamilyInspection> {
-    let active = artifacts
-        .active
-        .ok_or_else(|| invalid_artifact("sealed segment chain has no active artifact"))?;
+    let active = artifacts.active.ok_or_else(|| {
+        artifacts
+            .sealed
+            .values()
+            .next()
+            .cloned()
+            .map(invalid_artifact_at)
+            .unwrap_or_else(|| invalid_artifact("family has no active artifact"))
+    })?;
     for (expected, actual) in (0_u64..).zip(artifacts.sealed.keys().copied()) {
         if expected != actual {
-            return Err(invalid_artifact("sealed segment chain is not contiguous"));
+            let path = artifacts
+                .sealed
+                .get(&actual)
+                .cloned()
+                .unwrap_or_else(|| active.clone());
+            return Err(invalid_artifact_at(path));
         }
     }
     let (active_bytes, sealed_segment_bytes) =

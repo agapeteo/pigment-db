@@ -4,6 +4,7 @@ use pigment_db::key_map_store::DurableKeyMapStore;
 use pigment_db::key_set_store::DurableKeySetStore;
 use pigment_db::key_value_store::DurableKeyValueStore;
 use pigment_db::{inspect_storage, DurableStoreOptions, StoreFamily, WalSegmentSize};
+use std::io::Write as _;
 
 #[test]
 fn public_inspection_and_open_store_methods_report_exact_deterministic_totals() {
@@ -65,4 +66,29 @@ fn public_inspection_and_open_store_methods_report_exact_deterministic_totals() 
         );
         assert!(actual.sealed_segment_count() >= 1);
     }
+}
+
+#[test]
+fn public_inspection_measures_a_recoverable_tail_without_repair() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = DurableKeyValueStore::try_init_new(directory.path())
+        .unwrap()
+        .into_store();
+    store.put(b"stable".to_vec(), b"value".to_vec());
+    drop(store);
+    let path = directory.path().join("kv.wal.dat");
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    file.write_all(&[0xa7]).unwrap();
+    file.flush().unwrap();
+    drop(file);
+    let before = std::fs::read(&path).unwrap();
+
+    let stats = inspect_storage(directory.path()).unwrap();
+
+    assert_eq!(stats.families().len(), 1);
+    assert_eq!(stats.total_bytes(), u64::try_from(before.len()).unwrap());
+    assert_eq!(std::fs::read(path).unwrap(), before);
 }

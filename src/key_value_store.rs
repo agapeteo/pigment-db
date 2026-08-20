@@ -37,6 +37,14 @@ pub struct DurableKeyValueStore<W: Write> {
 
 impl DurableKeyValueStore<File> {
     /// Returns exact storage usage for this open key/value generation.
+    ///
+    /// Vector-backed stores intentionally do not expose filesystem maintenance:
+    ///
+    /// ```compile_fail
+    /// use pigment_db::key_value_store::DurableKeyValueStore;
+    /// let store = DurableKeyValueStore::new_vec_based();
+    /// let _ = store.storage_stats();
+    /// ```
     pub fn storage_stats(&self) -> Result<crate::FamilyStorageStats, crate::CompactionError> {
         crate::maintenance::public_file_family_storage_stats(
             self.file_backing

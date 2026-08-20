@@ -43,6 +43,14 @@ pub struct DurableKeyMapStore<W: Write> {
 #[allow(unused)]
 impl DurableKeyMapStore<File> {
     /// Returns exact storage usage for this open key/sorted-map generation.
+    ///
+    /// Vector-backed stores intentionally do not expose filesystem maintenance:
+    ///
+    /// ```compile_fail
+    /// use pigment_db::key_map_store::DurableKeyMapStore;
+    /// let store = DurableKeyMapStore::new_vec_based();
+    /// let _ = store.storage_stats();
+    /// ```
     pub fn storage_stats(&self) -> Result<crate::FamilyStorageStats, crate::CompactionError> {
         crate::maintenance::public_file_family_storage_stats(
             self.file_backing
