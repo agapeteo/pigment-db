@@ -17,6 +17,7 @@ use super::replay::{
     replay_key_map, replay_key_set, replay_key_value, KeyMapSnapshot, KeySetSnapshot,
     KeyValueSnapshot,
 };
+use super::ComputeAction;
 use super::{
     checked_current_v2_group_encoded_len, DeltaRecordResult, DeltaRecorder, RecordedFrame,
     RecordedMutation, WalStorage,
@@ -194,6 +195,85 @@ fn successful_single_actions_record_after_physical_acceptance_in_wal_order() {
         StoredAction::prepare_put(&0, &KeyValueData::new(b"second".to_vec(), b"two".to_vec()));
     assert_eq!(recorder.groups[0].frames[0].payload, first_payload.data());
     assert_eq!(recorder.groups[1].frames[0].payload, second_payload.data());
+    let exact_used = checked_current_v2_group_encoded_len(
+        recorder
+            .groups
+            .iter()
+            .flat_map(|group| group.frames.iter().map(|frame| frame.payload.len())),
+    )
+    .unwrap();
+    assert_eq!(recorder.used_bytes, exact_used);
+}
+
+#[test]
+fn accepted_compute_batches_are_atomic_delta_groups_with_one_timestamp() {
+    const ACCEPTED_BUCKET: u64 = 7 * 60_000_000_000;
+
+    fn fixed_clock() -> u64 {
+        ACCEPTED_BUCKET
+    }
+
+    let header = V2CodecProbe::encode_header(super::format::V2HeaderProbeFields {
+        kind: 2,
+        granularity_nanos: 60_000_000_000,
+        base_bucket: 0,
+        segment_id: 0,
+        segment_base: 0,
+    });
+    let (writer, _handle) = ScriptedWriter::scripted_with_bytes(None, false, None, header.to_vec());
+    let wal = WalStorage::new_v2_with_physical_probe(writer, rollback_scripted, sync_data_scripted);
+    {
+        let mut state = wal.wal_state.write().unwrap();
+        state.clock = fixed_clock;
+        state.activate_delta(202, u64::MAX).unwrap();
+    }
+
+    wal.commit_set_compute_batch(vec![
+        ComputeAction::SetAppend {
+            key: b"set".to_vec(),
+            value: b"added".to_vec(),
+        },
+        ComputeAction::SetRemove {
+            key: b"set".to_vec(),
+            value: b"removed".to_vec(),
+        },
+    ])
+    .unwrap();
+    wal.commit_map_compute_batch(vec![
+        ComputeAction::MapPut {
+            key: b"map".to_vec(),
+            search_key: SearchKey::from(1),
+            value: b"mapped".to_vec(),
+        },
+        ComputeAction::MapRemove {
+            key: b"map".to_vec(),
+            search_key: SearchKey::from(2),
+        },
+    ])
+    .unwrap();
+
+    let recorder = wal.wal_state.write().unwrap().detach_delta(202).unwrap();
+    assert_eq!(recorder.groups.len(), 2);
+    assert_eq!(recorder.groups[0].timestamp_bucket, ACCEPTED_BUCKET);
+    assert_eq!(recorder.groups[1].timestamp_bucket, ACCEPTED_BUCKET);
+    assert_eq!(
+        recorder.groups[0]
+            .frames
+            .iter()
+            .map(|frame| frame.action)
+            .collect::<Vec<_>>(),
+        vec![SET_APPEND_ACT, SET_REMOVE_ACT]
+    );
+    assert_eq!(
+        recorder.groups[1]
+            .frames
+            .iter()
+            .map(|frame| frame.action)
+            .collect::<Vec<_>>(),
+        vec![MAP_PUT_V2_ACT, MAP_REMOVE_V2_ACT]
+    );
+    assert_eq!(recorder.groups[0].frames.len(), 2);
+    assert_eq!(recorder.groups[1].frames.len(), 2);
     let exact_used = checked_current_v2_group_encoded_len(
         recorder
             .groups

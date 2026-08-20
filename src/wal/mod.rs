@@ -935,6 +935,7 @@ impl<W: Write> WalStorage<W> {
             state.last_bucket = timestamp_bucket;
             state.offset = offset;
             state.active_len = physical_checkpoint + encoded_len;
+            record_compute_delta_if_active(&mut state, timestamp_bucket, &stored);
             return Ok(());
         }
         let checkpoint = u32::try_from(state.offset).map_err(|_| {
@@ -1313,6 +1314,29 @@ fn record_single_delta_if_active<W: Write>(
             action: action_kind,
             payload: payload.to_vec(),
         }],
+    });
+}
+
+#[inline]
+fn record_compute_delta_if_active<W: Write>(
+    state: &mut WalState<W>,
+    timestamp_bucket: u64,
+    actions: &[StoredAction],
+) {
+    let Some(recorder) = state.delta_recorder.as_mut() else {
+        return;
+    };
+    let _ = recorder.record_group(actions.iter().map(|action| action.data().len()), || {
+        RecordedMutation {
+            timestamp_bucket,
+            frames: actions
+                .iter()
+                .map(|action| RecordedFrame {
+                    action: action.v2_act_type(),
+                    payload: action.data().to_vec(),
+                })
+                .collect(),
+        }
     });
 }
 
