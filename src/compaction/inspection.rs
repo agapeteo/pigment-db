@@ -4,6 +4,7 @@ use std::collections::{btree_map::Entry, BTreeMap};
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::compaction::recovery::classify_untrusted_directory_generations;
 use crate::recovery::{classify_runtime_envelope, RuntimeEnvelopeClassification};
 use crate::wal::recovery::canonical_sealed_segment_id;
 use crate::wal::replay::{
@@ -142,7 +143,7 @@ fn validate_current_chain(
     Ok((active_byte_len, sealed_segment_bytes))
 }
 
-pub(crate) fn inspect_directory(store_dir: &Path) -> io::Result<DirectoryInspection> {
+fn inspect_generation(store_dir: &Path) -> io::Result<DirectoryInspection> {
     let mut artifacts = BTreeMap::<InspectedFamily, FamilyArtifacts>::new();
     for entry in std::fs::read_dir(store_dir)? {
         let entry = entry?;
@@ -201,6 +202,32 @@ pub(crate) fn inspect_directory(store_dir: &Path) -> io::Result<DirectoryInspect
         families: families.into_values().collect(),
         total_bytes,
     })
+}
+
+pub(crate) fn inspect_directory(store_dir: &Path) -> io::Result<DirectoryInspection> {
+    let inspection = inspect_generation(store_dir)?;
+    let evidence = classify_untrusted_directory_generations(store_dir, |path| {
+        inspect_generation(path).is_ok_and(|generation| !generation.families.is_empty())
+    })?;
+    if !evidence.complete_generations.is_empty() {
+        let mut paths = vec![store_dir.to_path_buf()];
+        paths.extend(evidence.complete_generations);
+        paths.extend(evidence.invalid_generations);
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("compaction authority is undetermined among {paths:?}"),
+        ));
+    }
+    if let Some(path) = evidence.invalid_generations.into_iter().next() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "invalid non-competing maintenance artifact: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(inspection)
 }
 
 #[cfg(test)]

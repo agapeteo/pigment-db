@@ -299,3 +299,59 @@ fn recognized_older_envelopes_require_external_migration_without_mutation() {
         );
     }
 }
+
+fn sibling_maintenance_path(store_dir: &std::path::Path, suffix: &str) -> std::path::PathBuf {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(store_dir.file_name().unwrap());
+    name.push(".pigment-compact.");
+    name.push(suffix);
+    store_dir.parent().unwrap().join(name)
+}
+
+#[test]
+fn complete_competing_generations_are_ambiguous_but_non_competing_debris_is_invalid() {
+    for suffix in ["previous", "next"] {
+        let root = tempfile::tempdir().unwrap();
+        let store_dir = root.path().join("store");
+        std::fs::create_dir(&store_dir).unwrap();
+        create_current_v2(&store_dir, FixtureFamily::KeyValue);
+        let competitor = sibling_maintenance_path(&store_dir, suffix);
+        std::fs::create_dir(&competitor).unwrap();
+        create_current_v2(&competitor, FixtureFamily::KeyValue);
+        let before = snapshot_directory(root.path()).unwrap();
+
+        let error = inspect_directory(&store_dir).unwrap_err();
+        let message = error.to_string();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists, "{suffix}");
+        assert!(
+            message.contains(store_dir.to_str().unwrap()),
+            "{suffix}: {message}"
+        );
+        assert!(
+            message.contains(competitor.to_str().unwrap()),
+            "{suffix}: {message}"
+        );
+        assert_eq!(snapshot_directory(root.path()).unwrap(), before, "{suffix}");
+    }
+
+    for suffix in ["previous", "next"] {
+        let root = tempfile::tempdir().unwrap();
+        let store_dir = root.path().join("store");
+        std::fs::create_dir(&store_dir).unwrap();
+        create_current_v2(&store_dir, FixtureFamily::KeyValue);
+        let debris = sibling_maintenance_path(&store_dir, suffix);
+        std::fs::write(&debris, b"incomplete maintenance debris").unwrap();
+        let before = snapshot_directory(root.path()).unwrap();
+
+        let error = inspect_directory(&store_dir).unwrap_err();
+        let message = error.to_string();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{suffix}");
+        assert!(
+            message.contains(debris.to_str().unwrap()),
+            "{suffix}: {message}"
+        );
+        assert_eq!(snapshot_directory(root.path()).unwrap(), before, "{suffix}");
+    }
+}
