@@ -15,6 +15,7 @@ mod compaction;
 mod config;
 mod durability;
 mod maintenance;
+mod maintenance_coordination;
 pub use config::{
     DurabilityPolicy, DurableStoreOptions, TimestampGranularity, TimestampGranularityError,
     WalSegmentSize, WalSegmentSizeError,

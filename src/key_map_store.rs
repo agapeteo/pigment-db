@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use std::fs::File;
 
+use crate::maintenance_coordination::OpenDirectoryLease;
 use crate::model::{Key, SearchKey};
 use crate::wal::format::V1CodecProbe;
 use crate::wal::recovery::{
@@ -36,6 +37,7 @@ pub struct DurableKeyMapStore<W: Write> {
     store: DashMap<Vec<u8>, BTreeMap<SearchKey, Vec<u8>>>,
     wal: WalStorage<W>,
     file_backing: Option<PathBuf>,
+    _open_lease: Option<OpenDirectoryLease>,
     #[cfg(test)]
     mutation_observer: MutationObserver,
 }
@@ -106,6 +108,14 @@ impl DurableKeyMapStore<File> {
         options: Option<DurableStoreOptions>,
     ) -> Result<RecoveryOutcome<Self>, RecoveryError> {
         let store_dir = store_dir.as_ref();
+        let open_lease =
+            crate::maintenance_coordination::acquire_open_lease(store_dir).map_err(|source| {
+                RecoveryError::Io {
+                    operation: crate::RecoveryOperation::Inspect,
+                    path: store_dir.to_path_buf(),
+                    source,
+                }
+            })?;
         let paths = ArtifactPaths::new(store_dir, StoreKind::Map);
         let durability_policy = options
             .map(DurableStoreOptions::durability_policy)
@@ -150,6 +160,7 @@ impl DurableKeyMapStore<File> {
                 store,
                 wal: initialized.wal,
                 file_backing: Some(file_backing),
+                _open_lease: Some(open_lease),
                 #[cfg(test)]
                 mutation_observer: MutationObserver::default(),
             },
@@ -178,6 +189,7 @@ impl DurableKeyMapStore<Vec<u8>> {
             store: DashMap::new(),
             wal: WalStorage::new_vec_based(),
             file_backing: None,
+            _open_lease: None,
             #[cfg(test)]
             mutation_observer: MutationObserver::default(),
         }
@@ -203,6 +215,7 @@ impl DurableKeyMapStore<Vec<u8>> {
             store: DashMap::new(),
             wal: WalStorage::new_vec_based_v1(&header),
             file_backing: None,
+            _open_lease: None,
             #[cfg(test)]
             mutation_observer: MutationObserver::default(),
         })
@@ -227,6 +240,7 @@ impl<W: Write> DurableKeyMapStore<W> {
         Self {
             store: initial.into_iter().collect(),
             file_backing: None,
+            _open_lease: None,
             wal,
             mutation_observer,
         }
@@ -1154,6 +1168,7 @@ mod tests {
             store: DashMap::new(),
             wal: WalStorage::new_with_rollback(writer, rollback),
             file_backing: None,
+            _open_lease: None,
             mutation_observer: MutationObserver::default(),
         };
         (store, state)
