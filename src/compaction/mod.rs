@@ -93,6 +93,13 @@ pub(crate) fn prepare_closed_staging(
         path: paths.staging.clone(),
         source,
     })?;
+    #[cfg(test)]
+    crate::test_support::fault_checkpoint::exit_at_maintenance_fault(
+        crate::test_support::fault_checkpoint::MaintenanceFaultPoint {
+            phase: crate::test_support::fault_checkpoint::MaintenancePhase::Prepared,
+            cut: crate::test_support::fault_checkpoint::MaintenanceCut::StagingCreate,
+        },
+    );
     let replacement_inventory =
         match write_staging_families(&paths, &capture.families, options.durability_policy()) {
             Ok(inventory) => inventory,
@@ -101,6 +108,20 @@ pub(crate) fn prepare_closed_staging(
                 return Err(error);
             }
         };
+    #[cfg(test)]
+    crate::test_support::fault_checkpoint::exit_at_maintenance_fault(
+        crate::test_support::fault_checkpoint::MaintenanceFaultPoint {
+            phase: crate::test_support::fault_checkpoint::MaintenancePhase::Prepared,
+            cut: crate::test_support::fault_checkpoint::MaintenanceCut::StagingWrite,
+        },
+    );
+    #[cfg(test)]
+    crate::test_support::fault_checkpoint::exit_at_maintenance_fault(
+        crate::test_support::fault_checkpoint::MaintenanceFaultPoint {
+            phase: crate::test_support::fault_checkpoint::MaintenancePhase::Prepared,
+            cut: crate::test_support::fault_checkpoint::MaintenanceCut::StagingSync,
+        },
+    );
     Ok(PreparedClosedStaging {
         capture,
         paths,
@@ -636,6 +657,13 @@ pub(crate) fn compact_closed_directory(
     }
     let prepared = prepare_closed_staging(store_dir, options)?;
     validate_closed_staging(&prepared)?;
+    #[cfg(test)]
+    crate::test_support::fault_checkpoint::exit_at_maintenance_fault(
+        crate::test_support::fault_checkpoint::MaintenanceFaultPoint {
+            phase: crate::test_support::fault_checkpoint::MaintenancePhase::Prepared,
+            cut: crate::test_support::fault_checkpoint::MaintenanceCut::StagingValidate,
+        },
+    );
     let mut manifest = publish_closed_prepared(&prepared, options.durability_policy())?;
     publish_closed_previous_with_checkpoint(&prepared, &mut manifest, |_| Ok(()))?;
     publish_closed_replacement_with_checkpoint(&prepared, &mut manifest, |_| Ok(()))?;

@@ -49,6 +49,7 @@ pub(crate) enum MaintenanceCut {
     StagingValidate,
     ManifestWrite,
     ManifestSync,
+    ManifestPublish,
     PreviousPublish,
     ReplacementPublish,
     ReopenValidation,
@@ -64,6 +65,7 @@ impl MaintenanceCut {
             Self::StagingValidate => "staging-validate",
             Self::ManifestWrite => "manifest-write",
             Self::ManifestSync => "manifest-sync",
+            Self::ManifestPublish => "manifest-publish",
             Self::PreviousPublish => "previous-publish",
             Self::ReplacementPublish => "replacement-publish",
             Self::ReopenValidation => "reopen-validation",
@@ -119,7 +121,21 @@ pub(crate) fn run_maintenance_checkpoint_child(
     store_dir: &Path,
     point: MaintenanceFaultPoint,
 ) -> MaintenanceChildEvidence {
-    let before = snapshot_directory(store_dir).expect("snapshot evidence before child");
+    run_maintenance_checkpoint_child_with_evidence_root(
+        exact_test_name,
+        store_dir,
+        store_dir,
+        point,
+    )
+}
+
+pub(crate) fn run_maintenance_checkpoint_child_with_evidence_root(
+    exact_test_name: &str,
+    store_dir: &Path,
+    evidence_root: &Path,
+    point: MaintenanceFaultPoint,
+) -> MaintenanceChildEvidence {
+    let before = snapshot_directory(evidence_root).expect("snapshot evidence before child");
     let executable = std::env::current_exe().expect("locate unit-test executable");
     let mut child = std::process::Command::new(executable)
         .arg(exact_test_name)
@@ -148,7 +164,7 @@ pub(crate) fn run_maintenance_checkpoint_child(
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let after = snapshot_directory(store_dir).expect("snapshot evidence after child");
+    let after = snapshot_directory(evidence_root).expect("snapshot evidence after child");
     MaintenanceChildEvidence { before, after }
 }
 
@@ -199,12 +215,13 @@ mod tests {
             MaintenanceCut::StagingValidate,
             MaintenanceCut::ManifestWrite,
             MaintenanceCut::ManifestSync,
+            MaintenanceCut::ManifestPublish,
             MaintenanceCut::PreviousPublish,
             MaintenanceCut::ReplacementPublish,
             MaintenanceCut::ReopenValidation,
             MaintenanceCut::Cleanup,
         ];
         assert_eq!(phases.map(MaintenancePhase::name).len(), 4);
-        assert_eq!(cuts.map(MaintenanceCut::name).len(), 10);
+        assert_eq!(cuts.map(MaintenanceCut::name).len(), 11);
     }
 }

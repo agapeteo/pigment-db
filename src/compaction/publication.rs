@@ -72,6 +72,13 @@ pub(crate) fn cleanup_closed_with_checkpoint(
     next.phase = ManifestPhase::CleanupPending;
     publish_manifest_for_policy(&prepared.paths, &next, manifest.durability)?;
     *manifest = next;
+    #[cfg(test)]
+    crate::test_support::fault_checkpoint::exit_at_maintenance_fault(
+        crate::test_support::fault_checkpoint::MaintenanceFaultPoint {
+            phase: crate::test_support::fault_checkpoint::MaintenancePhase::CleanupPending,
+            cut: crate::test_support::fault_checkpoint::MaintenanceCut::Cleanup,
+        },
+    );
     if checkpoint(ClosedCleanupStage::CleanupPendingPublished).is_err() {
         return Ok(crate::CleanupStatus::Pending);
     }
@@ -182,12 +189,26 @@ pub(crate) fn publish_closed_replacement_with_checkpoint(
             source,
         }
     })?;
+    #[cfg(test)]
+    crate::test_support::fault_checkpoint::exit_at_maintenance_fault(
+        crate::test_support::fault_checkpoint::MaintenanceFaultPoint {
+            phase: crate::test_support::fault_checkpoint::MaintenancePhase::ReplacementPublished,
+            cut: crate::test_support::fault_checkpoint::MaintenanceCut::ReplacementPublish,
+        },
+    );
     checkpoint(ClosedReplacementStage::ReplacementMoved).map_err(|source| CompactionError::Io {
         operation: CompactionOperation::PublishReplacement,
         path: prepared.capture.source_dir.clone(),
         source,
     })?;
     validate_published_closed_replacement(prepared)?;
+    #[cfg(test)]
+    crate::test_support::fault_checkpoint::exit_at_maintenance_fault(
+        crate::test_support::fault_checkpoint::MaintenanceFaultPoint {
+            phase: crate::test_support::fault_checkpoint::MaintenancePhase::ReplacementPublished,
+            cut: crate::test_support::fault_checkpoint::MaintenanceCut::ReopenValidation,
+        },
+    );
     checkpoint(ClosedReplacementStage::ReplacementReopened).map_err(|source| {
         CompactionError::Io {
             operation: CompactionOperation::ReopenReplacement,
@@ -267,6 +288,13 @@ pub(crate) fn publish_closed_previous_with_checkpoint(
             source,
         }
     })?;
+    #[cfg(test)]
+    crate::test_support::fault_checkpoint::exit_at_maintenance_fault(
+        crate::test_support::fault_checkpoint::MaintenanceFaultPoint {
+            phase: crate::test_support::fault_checkpoint::MaintenancePhase::PreviousPublished,
+            cut: crate::test_support::fault_checkpoint::MaintenanceCut::PreviousPublish,
+        },
+    );
     checkpoint(ClosedPreviousStage::SourceMoved).map_err(|source| CompactionError::Io {
         operation: CompactionOperation::PublishPrevious,
         path: prepared.paths.previous.clone(),
@@ -389,12 +417,45 @@ pub(crate) fn publish_manifest_buffered_with_checkpoint(
     checkpoint(ManifestPublishStage::Created)?;
     temporary.write_all(&encoded)?;
     checkpoint(ManifestPublishStage::Written)?;
+    #[cfg(test)]
+    exit_at_manifest_fault(
+        manifest,
+        crate::test_support::fault_checkpoint::MaintenanceCut::ManifestWrite,
+    );
     temporary.flush()?;
     checkpoint(ManifestPublishStage::Flushed)?;
+    #[cfg(test)]
+    exit_at_manifest_fault(
+        manifest,
+        crate::test_support::fault_checkpoint::MaintenanceCut::ManifestSync,
+    );
     drop(temporary);
     fs::rename(&paths.manifest_next, &paths.manifest)?;
     checkpoint(ManifestPublishStage::Renamed)?;
+    #[cfg(test)]
+    exit_at_manifest_fault(
+        manifest,
+        crate::test_support::fault_checkpoint::MaintenanceCut::ManifestPublish,
+    );
     Ok(())
+}
+
+#[cfg(test)]
+fn exit_at_manifest_fault(
+    manifest: &CompactionManifest,
+    cut: crate::test_support::fault_checkpoint::MaintenanceCut,
+) {
+    use crate::test_support::fault_checkpoint::{
+        exit_at_maintenance_fault, MaintenanceFaultPoint, MaintenancePhase,
+    };
+
+    let phase = match manifest.phase {
+        ManifestPhase::Prepared => MaintenancePhase::Prepared,
+        ManifestPhase::PreviousPublished => MaintenancePhase::PreviousPublished,
+        ManifestPhase::ReplacementPublished => MaintenancePhase::ReplacementPublished,
+        ManifestPhase::CleanupPending => MaintenancePhase::CleanupPending,
+    };
+    exit_at_maintenance_fault(MaintenanceFaultPoint { phase, cut });
 }
 
 pub(crate) fn read_published_manifest(

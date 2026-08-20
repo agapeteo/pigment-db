@@ -1027,3 +1027,150 @@ fn every_closed_fault_cut_retains_a_complete_authority_for_all_families_and_poli
         }
     }
 }
+
+#[test]
+fn closed_compaction_checkpoint_child() {
+    let Some(store_dir) = crate::test_support::fault_checkpoint::maintenance_child_store_dir()
+    else {
+        return;
+    };
+    crate::maintenance::compact_directory_in_place_internal(
+        &store_dir,
+        crate::ClosedCompactionOptions::default(),
+    )
+    .unwrap();
+    panic!("checkpoint child completed without reaching the requested cut");
+}
+
+fn reopen_after_checkpoint(
+    store_dir: &std::path::Path,
+    family: FixtureFamily,
+) -> Result<crate::RecoveryStatus, crate::RecoveryError> {
+    match family {
+        FixtureFamily::KeyValue => {
+            crate::key_value_store::DurableKeyValueStore::try_init_new(store_dir)
+                .map(|outcome| outcome.status())
+        }
+        FixtureFamily::KeySet => crate::key_set_store::DurableKeySetStore::try_init_new(store_dir)
+            .map(|outcome| outcome.status()),
+        FixtureFamily::KeyMap => crate::key_map_store::DurableKeyMapStore::try_init_new(store_dir)
+            .map(|outcome| outcome.status()),
+    }
+}
+
+#[test]
+fn every_closed_checkpoint_process_exit_reopens_exact_state_or_preserves_explicit_evidence() {
+    use crate::test_support::fault_checkpoint::{
+        run_maintenance_checkpoint_child_with_evidence_root, MaintenanceCut, MaintenanceFaultPoint,
+        MaintenancePhase,
+    };
+
+    let points = [
+        (MaintenancePhase::Prepared, MaintenanceCut::StagingCreate),
+        (MaintenancePhase::Prepared, MaintenanceCut::StagingWrite),
+        (MaintenancePhase::Prepared, MaintenanceCut::StagingSync),
+        (MaintenancePhase::Prepared, MaintenanceCut::StagingValidate),
+        (MaintenancePhase::Prepared, MaintenanceCut::ManifestWrite),
+        (MaintenancePhase::Prepared, MaintenanceCut::ManifestSync),
+        (MaintenancePhase::Prepared, MaintenanceCut::ManifestPublish),
+        (
+            MaintenancePhase::PreviousPublished,
+            MaintenanceCut::PreviousPublish,
+        ),
+        (
+            MaintenancePhase::PreviousPublished,
+            MaintenanceCut::ManifestWrite,
+        ),
+        (
+            MaintenancePhase::PreviousPublished,
+            MaintenanceCut::ManifestSync,
+        ),
+        (
+            MaintenancePhase::PreviousPublished,
+            MaintenanceCut::ManifestPublish,
+        ),
+        (
+            MaintenancePhase::ReplacementPublished,
+            MaintenanceCut::ReplacementPublish,
+        ),
+        (
+            MaintenancePhase::ReplacementPublished,
+            MaintenanceCut::ReopenValidation,
+        ),
+        (
+            MaintenancePhase::ReplacementPublished,
+            MaintenanceCut::ManifestWrite,
+        ),
+        (
+            MaintenancePhase::ReplacementPublished,
+            MaintenanceCut::ManifestSync,
+        ),
+        (
+            MaintenancePhase::ReplacementPublished,
+            MaintenanceCut::ManifestPublish,
+        ),
+        (
+            MaintenancePhase::CleanupPending,
+            MaintenanceCut::ManifestWrite,
+        ),
+        (
+            MaintenancePhase::CleanupPending,
+            MaintenanceCut::ManifestSync,
+        ),
+        (
+            MaintenancePhase::CleanupPending,
+            MaintenanceCut::ManifestPublish,
+        ),
+        (MaintenancePhase::CleanupPending, MaintenanceCut::Cleanup),
+    ];
+
+    for family in [
+        FixtureFamily::KeyValue,
+        FixtureFamily::KeySet,
+        FixtureFamily::KeyMap,
+    ] {
+        for (phase, cut) in points {
+            let root = tempfile::tempdir().unwrap();
+            let store_dir = root.path().join("store");
+            std::fs::create_dir(&store_dir).unwrap();
+            create_segmented_v2(&store_dir, family);
+            let point = MaintenanceFaultPoint { phase, cut };
+            let evidence = run_maintenance_checkpoint_child_with_evidence_root(
+                "compaction::recovery_tests::closed_compaction_checkpoint_child",
+                &store_dir,
+                root.path(),
+                point,
+            );
+            let paths =
+                crate::compaction::publication::directory_artifact_paths(&store_dir).unwrap();
+            assert!(
+                paths.staging.exists()
+                    || paths.previous.exists()
+                    || paths.manifest.exists()
+                    || paths.manifest_next.exists(),
+                "{family:?} {phase:?} {cut:?} must leave maintenance evidence"
+            );
+            let _ = evidence;
+            let before_reopen = snapshot_directory(root.path()).unwrap();
+            match reopen_after_checkpoint(&store_dir, family) {
+                Ok(status) => {
+                    assert_eq!(status, crate::RecoveryStatus::Recovered);
+                    crate::test_support::maintenance_fixtures::assert_three_reopens(
+                        &store_dir, family,
+                    );
+                }
+                Err(error) => {
+                    assert!(
+                        matches!(
+                            error,
+                            crate::RecoveryError::AuthorityUndetermined { .. }
+                                | crate::RecoveryError::InvalidArtifact { .. }
+                        ),
+                        "{family:?} {phase:?} {cut:?} returned unexpected {error:?}"
+                    );
+                    assert_eq!(snapshot_directory(root.path()).unwrap(), before_reopen);
+                }
+            }
+        }
+    }
+}
