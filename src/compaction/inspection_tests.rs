@@ -2,8 +2,8 @@
 
 use super::inspection::{inspect_directory, InspectedFamily};
 use crate::test_support::maintenance_fixtures::{
-    active_name, create_current_v2, create_segmented_v2, sealed_name, snapshot_directory,
-    FixtureFamily,
+    active_name, create_current_v2, create_safe_tail_v2, create_segmented_v2, sealed_name,
+    snapshot_directory, FixtureFamily,
 };
 
 #[test]
@@ -183,5 +183,35 @@ fn invalid_artifacts_are_rejected_without_mutation() {
             before,
             "{name} must remain byte-identical"
         );
+    }
+}
+
+#[test]
+fn recoverable_terminal_tail_is_measured_without_repair() {
+    for family in [
+        FixtureFamily::KeyValue,
+        FixtureFamily::KeySet,
+        FixtureFamily::KeyMap,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        create_safe_tail_v2(directory.path(), family);
+        let before = snapshot_directory(directory.path()).unwrap();
+        let active_bytes = u64::try_from(
+            before
+                .get(std::path::Path::new(active_name(family)))
+                .unwrap()
+                .len(),
+        )
+        .unwrap();
+
+        let inspected = inspect_directory(directory.path()).unwrap();
+
+        assert_eq!(inspected.families.len(), 1);
+        assert_eq!(inspected.families[0].active_bytes, active_bytes);
+        assert_eq!(inspected.families[0].sealed_segment_bytes, 0);
+        assert_eq!(inspected.families[0].sealed_segment_count, 0);
+        assert_eq!(inspected.families[0].total_bytes, active_bytes);
+        assert_eq!(inspected.total_bytes, active_bytes);
+        assert_eq!(snapshot_directory(directory.path()).unwrap(), before);
     }
 }

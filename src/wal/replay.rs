@@ -559,6 +559,40 @@ pub(crate) fn replay_key_map_tail(bytes: &[u8]) -> TailReplay<KeyMapSnapshot> {
     replay_v1_tail(bytes, 3, replay_key_map)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReadOnlyReplayClassification {
+    Complete,
+    RecoverableTail,
+}
+
+fn classify_read_only<S>(
+    replayed: TailReplay<S>,
+) -> Result<ReadOnlyReplayClassification, ValidationError> {
+    match replayed {
+        TailReplay::Complete(_) => Ok(ReadOnlyReplayClassification::Complete),
+        TailReplay::RecoverableTail { .. } => Ok(ReadOnlyReplayClassification::RecoverableTail),
+        TailReplay::Invalid(error) => Err(error),
+    }
+}
+
+pub(crate) fn classify_key_value_read_only(
+    bytes: &[u8],
+) -> Result<ReadOnlyReplayClassification, ValidationError> {
+    classify_read_only(replay_key_value_tail(bytes))
+}
+
+pub(crate) fn classify_key_set_read_only(
+    bytes: &[u8],
+) -> Result<ReadOnlyReplayClassification, ValidationError> {
+    classify_read_only(replay_key_set_tail(bytes))
+}
+
+pub(crate) fn classify_key_map_read_only(
+    bytes: &[u8],
+) -> Result<ReadOnlyReplayClassification, ValidationError> {
+    classify_read_only(replay_key_map_tail(bytes))
+}
+
 fn replay_v1_tail<S>(
     bytes: &[u8],
     expected_kind: u8,

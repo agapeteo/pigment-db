@@ -5,7 +5,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::wal::recovery::canonical_sealed_segment_id;
-use crate::wal::replay::{replay_key_map, replay_key_set, replay_key_value};
+use crate::wal::replay::{
+    classify_key_map_read_only, classify_key_set_read_only, classify_key_value_read_only,
+};
 
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct DirectoryInspection {
@@ -103,9 +105,9 @@ fn validate_current_chain(
         ));
     }
     let replayed = match family {
-        InspectedFamily::KeyValue => replay_key_value(&chain).map(|_| ()),
-        InspectedFamily::KeySet => replay_key_set(&chain).map(|_| ()),
-        InspectedFamily::KeyMap => replay_key_map(&chain).map(|_| ()),
+        InspectedFamily::KeyValue => classify_key_value_read_only(&chain).map(|_| ()),
+        InspectedFamily::KeySet => classify_key_set_read_only(&chain).map(|_| ()),
+        InspectedFamily::KeyMap => classify_key_map_read_only(&chain).map(|_| ()),
     };
     replayed.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
     Ok((active_byte_len, sealed_segment_bytes))
