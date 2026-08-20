@@ -203,6 +203,13 @@ impl DirectoryCompactionOutcome {
     pub fn families(&self) -> &[FamilyCompactionOutcome] {
         &self.families
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn empty() -> Self {
+        Self {
+            families: Vec::new(),
+        }
+    }
 }
 
 /// Identifies the maintenance stage associated with a filesystem error.
@@ -380,6 +387,14 @@ pub fn inspect_storage(
     inspect_directory(store_dir)
         .map(Into::into)
         .map_err(|error| map_inspection_error(store_dir.to_path_buf(), error))
+}
+
+#[allow(dead_code)]
+pub(crate) fn compact_directory_in_place_internal(
+    store_dir: &Path,
+    options: ClosedCompactionOptions,
+) -> Result<DirectoryCompactionOutcome, CompactionError> {
+    crate::compaction::compact_closed_directory(store_dir, options)
 }
 
 pub(crate) fn file_family_storage_stats(

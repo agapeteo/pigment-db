@@ -102,8 +102,8 @@
 
 - [X] T041 [US2] Write and run a runtime RED proving a same-process open store or racing open attempt causes the private closed seam to fail before any artifact creation while another directory remains independent in `src/compaction/closed_tests.rs`
 - [X] T042 [US2] Implement canonical directory identities, RAII open leases, and atomic exclusive closed claims in `src/maintenance_coordination.rs` and all file constructors in `src/key_value_store.rs`, `src/key_set_store.rs`, and `src/key_map_store.rs`, then run T041 GREEN
-- [ ] T043 [US2] Write and run a runtime RED proving private closed compaction of an empty directory is a zero-outcome, artifact-free no-op in `src/compaction/closed_tests.rs`
-- [ ] T044 [US2] Implement only the private closed-compaction entry, ownership check, prior-authority inspection, and empty no-op in `src/maintenance.rs` and `src/compaction/mod.rs`, then run T043 GREEN
+- [X] T043 [US2] Write and run a runtime RED proving private closed compaction of an empty directory is a zero-outcome, artifact-free no-op in `src/compaction/closed_tests.rs`
+- [X] T044 [US2] Implement only the private closed-compaction entry, ownership check, prior-authority inspection, and empty no-op in `src/maintenance.rs` and `src/compaction/mod.rs`, then run T043 GREEN
 
 ### Current-V2 replacement encoding
 

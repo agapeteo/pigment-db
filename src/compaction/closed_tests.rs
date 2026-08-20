@@ -41,3 +41,20 @@ fn open_or_opening_directory_blocks_closed_claim_without_cross_directory_coordin
     drop(opening_lease);
     assert!(try_claim_closed(&open_dir).is_ok());
 }
+
+#[test]
+fn empty_closed_compaction_is_an_artifact_free_no_op() {
+    let root = tempfile::tempdir().unwrap();
+    let store_dir = root.path().join("empty-store");
+    std::fs::create_dir(&store_dir).unwrap();
+    let before = snapshot_directory(root.path()).unwrap();
+
+    let outcome = crate::maintenance::compact_directory_in_place_internal(
+        &store_dir,
+        crate::ClosedCompactionOptions::default(),
+    )
+    .unwrap();
+
+    assert!(outcome.families().is_empty());
+    assert_eq!(snapshot_directory(root.path()).unwrap(), before);
+}
