@@ -151,6 +151,68 @@ pub(crate) fn validate_closed_staging(
     Ok(ValidatedClosedStaging { staging })
 }
 
+#[allow(dead_code)]
+pub(crate) fn revalidate_closed_source_inventory(
+    prepared: &PreparedClosedStaging,
+) -> Result<(), CompactionError> {
+    let source_name = prepared
+        .capture
+        .source_dir
+        .file_name()
+        .ok_or_else(|| source_revalidation_error("directory has no native file name"))?;
+    let mut current = BTreeMap::new();
+    let entries =
+        fs::read_dir(&prepared.capture.source_dir).map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::Capture,
+            path: prepared.capture.source_dir.clone(),
+            source,
+        })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::Capture,
+            path: prepared.capture.source_dir.clone(),
+            source,
+        })?;
+        let file_type = entry.file_type().map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::Capture,
+            path: entry.path(),
+            source,
+        })?;
+        if !file_type.is_file() {
+            return Err(source_revalidation_error(
+                "source contains a non-file artifact",
+            ));
+        }
+        let length = entry
+            .metadata()
+            .map_err(|source| CompactionError::Io {
+                operation: CompactionOperation::Capture,
+                path: entry.path(),
+                source,
+            })?
+            .len();
+        current.insert(PathBuf::from(source_name).join(entry.file_name()), length);
+    }
+    let expected = prepared
+        .capture
+        .inventory
+        .iter()
+        .map(|descriptor| (descriptor.relative_path.clone(), descriptor.length))
+        .collect::<BTreeMap<_, _>>();
+    if current != expected {
+        return Err(source_revalidation_error(
+            "native inventory or artifact length changed after capture",
+        ));
+    }
+    Ok(())
+}
+
+fn source_revalidation_error(detail: &str) -> CompactionError {
+    CompactionError::FailedClosed {
+        detail: format!("closed source changed before publication: {detail}"),
+    }
+}
+
 fn staging_mismatch(field: &str) -> CompactionError {
     CompactionError::FailedClosed {
         detail: format!("validated staging {field} does not match captured source"),
