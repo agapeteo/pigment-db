@@ -109,8 +109,8 @@
 
 - [X] T045 [US2] Write and run a runtime RED for deterministic key/value current-V2 snapshot encoding with one active segment and exact replayed state in `src/wal/maintenance_tests.rs`
 - [X] T046 [US2] Implement the minimum sorted key/value current-V2 snapshot encoder in `src/wal/replay.rs`, then run T045 GREEN
-- [ ] T047 [US2] Write and run a runtime RED for deterministic key/set current-V2 snapshot encoding with exact set membership in `src/wal/maintenance_tests.rs`
-- [ ] T048 [US2] Extend the GREEN current-V2 encoder for key/set groups in `src/wal/replay.rs`, then run T047 GREEN and T045
+- [X] T047 [US2] Write and run a runtime RED for deterministic key/set current-V2 snapshot encoding with exact set membership in `src/wal/maintenance_tests.rs`
+- [X] T048 [US2] Extend the GREEN current-V2 encoder for key/set groups in `src/wal/replay.rs`, then run T047 GREEN and T045
 - [ ] T049 [US2] Write and run a runtime RED for deterministic key/map current-V2 snapshot encoding with exact sorted-map keys/values in `src/wal/maintenance_tests.rs`
 - [ ] T050 [US2] Extend the GREEN current-V2 encoder for key/map groups without historical encoders in `src/wal/replay.rs`, then run T049 GREEN and T045–T048
 - [ ] T051 [US2] Write and run a runtime RED proving all snapshot encoders preserve family identity, timestamp granularity, last accepted bucket, checked offsets, and current V2 framing in `src/wal/maintenance_tests.rs`
