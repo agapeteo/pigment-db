@@ -6,7 +6,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::compaction::inspection::{
-    exact_artifact_bytes_match, inspect_directory, FamilyInspection, InspectedFamily,
+    exact_artifact_bytes_match, inspect_directory, inspect_generation, FamilyInspection,
+    InspectedFamily,
 };
 use crate::compaction::manifest::{verify_descriptor, ArtifactDescriptor, ArtifactRole};
 use crate::compaction::publication::{directory_artifact_paths, MaintenanceArtifactPaths};
@@ -133,10 +134,64 @@ pub(crate) fn validate_closed_staging(
             },
             error => error,
         })?;
-    if staging.families.len() != prepared.capture.families.len() {
+    compare_captured_families(&prepared.capture.families, &staging.families)?;
+    reopen_and_compare_public_state(&prepared.paths.staging, &prepared.capture.families)?;
+    Ok(ValidatedClosedStaging { staging })
+}
+
+pub(crate) fn validate_published_closed_replacement(
+    prepared: &PreparedClosedStaging,
+) -> Result<CapturedGeneration, CompactionError> {
+    let anchor = prepared
+        .capture
+        .source_dir
+        .parent()
+        .ok_or_else(|| CompactionError::Io {
+            operation: CompactionOperation::ReopenReplacement,
+            path: prepared.capture.source_dir.clone(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "published replacement has no parent anchor",
+            ),
+        })?;
+    let source_name =
+        prepared
+            .capture
+            .source_dir
+            .file_name()
+            .ok_or_else(|| CompactionError::Io {
+                operation: CompactionOperation::ReopenReplacement,
+                path: prepared.capture.source_dir.clone(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "published replacement has no native file name",
+                ),
+            })?;
+    for descriptor in &prepared.replacement_inventory {
+        let active_name = descriptor.relative_path.file_name().ok_or_else(|| {
+            CompactionError::InvalidArtifact {
+                path: descriptor.relative_path.clone(),
+            }
+        })?;
+        let mut canonical = descriptor.clone();
+        canonical.relative_path = PathBuf::from(source_name).join(active_name);
+        verify_descriptor(anchor, &canonical).map_err(|_| CompactionError::InvalidArtifact {
+            path: anchor.join(&canonical.relative_path),
+        })?;
+    }
+    let replacement = capture_closed_generation_trusted(&prepared.capture.source_dir)?;
+    compare_captured_families(&prepared.capture.families, &replacement.families)?;
+    Ok(replacement)
+}
+
+fn compare_captured_families(
+    source: &[CapturedFamily],
+    replacement: &[CapturedFamily],
+) -> Result<(), CompactionError> {
+    if replacement.len() != source.len() {
         return Err(staging_mismatch("family count"));
     }
-    for (source, replacement) in prepared.capture.families.iter().zip(&staging.families) {
+    for (source, replacement) in source.iter().zip(replacement) {
         if source.family != replacement.family || replacement.sealed_segment_count != 0 {
             return Err(staging_mismatch("family identity"));
         }
@@ -149,8 +204,7 @@ pub(crate) fn validate_closed_staging(
             return Err(staging_mismatch("timestamp metadata"));
         }
     }
-    reopen_and_compare_public_state(&prepared.paths.staging, &prepared.capture.families)?;
-    Ok(ValidatedClosedStaging { staging })
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -296,6 +350,24 @@ fn capture_closed_generation(store_dir: &Path) -> Result<CapturedGeneration, Com
     let inspection = inspect_directory(store_dir).map_err(|error| {
         crate::maintenance::map_inspection_error(store_dir.to_path_buf(), error)
     })?;
+    capture_inspected_generation(store_dir, inspection)
+}
+
+fn capture_closed_generation_trusted(
+    store_dir: &Path,
+) -> Result<CapturedGeneration, CompactionError> {
+    let inspection = inspect_generation(store_dir).map_err(|source| CompactionError::Io {
+        operation: CompactionOperation::ReopenReplacement,
+        path: store_dir.to_path_buf(),
+        source,
+    })?;
+    capture_inspected_generation(store_dir, inspection)
+}
+
+fn capture_inspected_generation(
+    store_dir: &Path,
+    inspection: crate::compaction::inspection::DirectoryInspection,
+) -> Result<CapturedGeneration, CompactionError> {
     let source_name = store_dir.file_name().ok_or_else(|| CompactionError::Io {
         operation: CompactionOperation::Capture,
         path: store_dir.to_path_buf(),

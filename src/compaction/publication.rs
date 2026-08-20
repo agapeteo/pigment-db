@@ -13,7 +13,10 @@ use super::manifest::{
     decode_manifest, encode_manifest, CompactionManifest, ManifestMode, ManifestPhase,
     ManifestScope,
 };
-use super::{revalidate_closed_source_inventory, validate_closed_staging, PreparedClosedStaging};
+use super::{
+    revalidate_closed_source_inventory, validate_closed_staging,
+    validate_published_closed_replacement, PreparedClosedStaging,
+};
 use crate::{CompactionError, CompactionOperation, DurabilityPolicy};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,6 +39,76 @@ pub(crate) enum ManifestPublishStage {
 pub(crate) enum ClosedPreviousStage {
     SourceMoved,
     PhasePublished,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClosedReplacementStage {
+    ReplacementMoved,
+    ReplacementReopened,
+    PhasePublished,
+}
+
+pub(crate) fn publish_closed_replacement_with_checkpoint(
+    prepared: &PreparedClosedStaging,
+    manifest: &mut CompactionManifest,
+    mut checkpoint: impl FnMut(ClosedReplacementStage) -> io::Result<()>,
+) -> Result<(), CompactionError> {
+    if manifest.phase != ManifestPhase::PreviousPublished {
+        return Err(CompactionError::FailedClosed {
+            detail: "replacement publication requires PreviousPublished authority".to_owned(),
+        });
+    }
+    validate_closed_staging(prepared)?;
+    match fs::symlink_metadata(&prepared.capture.source_dir) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(CompactionError::Io {
+                operation: CompactionOperation::PublishReplacement,
+                path: prepared.capture.source_dir.clone(),
+                source,
+            });
+        }
+        Ok(_) => {
+            return Err(CompactionError::Io {
+                operation: CompactionOperation::PublishReplacement,
+                path: prepared.capture.source_dir.clone(),
+                source: io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "canonical replacement path already exists",
+                ),
+            });
+        }
+    }
+    fs::rename(&prepared.paths.staging, &prepared.capture.source_dir).map_err(|source| {
+        CompactionError::Io {
+            operation: CompactionOperation::PublishReplacement,
+            path: prepared.capture.source_dir.clone(),
+            source,
+        }
+    })?;
+    checkpoint(ClosedReplacementStage::ReplacementMoved).map_err(|source| CompactionError::Io {
+        operation: CompactionOperation::PublishReplacement,
+        path: prepared.capture.source_dir.clone(),
+        source,
+    })?;
+    validate_published_closed_replacement(prepared)?;
+    checkpoint(ClosedReplacementStage::ReplacementReopened).map_err(|source| {
+        CompactionError::Io {
+            operation: CompactionOperation::ReopenReplacement,
+            path: prepared.capture.source_dir.clone(),
+            source,
+        }
+    })?;
+    let mut next = manifest.clone();
+    next.phase = ManifestPhase::ReplacementPublished;
+    publish_manifest_for_policy(&prepared.paths, &next, manifest.durability)?;
+    *manifest = next;
+    checkpoint(ClosedReplacementStage::PhasePublished).map_err(|source| CompactionError::Io {
+        operation: CompactionOperation::WriteManifest,
+        path: prepared.paths.manifest.clone(),
+        source,
+    })?;
+    Ok(())
 }
 
 pub(crate) fn publish_closed_prepared(

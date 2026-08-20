@@ -2,8 +2,9 @@
 
 use crate::compaction::manifest::ManifestPhase;
 use crate::compaction::publication::{
-    publish_closed_prepared, publish_closed_previous_with_checkpoint, read_published_manifest,
-    ClosedPreviousStage,
+    publish_closed_prepared, publish_closed_previous_with_checkpoint,
+    publish_closed_replacement_with_checkpoint, read_published_manifest, ClosedPreviousStage,
+    ClosedReplacementStage,
 };
 use crate::test_support::maintenance_fixtures::{
     create_segmented_v2, snapshot_directory, FixtureFamily,
@@ -95,4 +96,84 @@ fn prepared_retains_old_authority_and_previous_move_precedes_phase_advance() {
         ManifestPhase::PreviousPublished
     );
     assert!(prepared.paths.staging.is_dir());
+}
+
+#[test]
+fn only_validated_replacement_becomes_canonical_before_replacement_phase() {
+    let (_root, store_dir, prepared) = prepared_fixture();
+    let old = snapshot_directory(&store_dir).unwrap();
+    let mut manifest =
+        publish_closed_prepared(&prepared, crate::DurabilityPolicy::Buffered).unwrap();
+    publish_closed_previous_with_checkpoint(&prepared, &mut manifest, |_| Ok(())).unwrap();
+    let active = prepared.paths.staging.join("kv.wal.dat");
+    let mut corrupt = std::fs::read(&active).unwrap();
+    *corrupt.last_mut().unwrap() ^= 0xff;
+    std::fs::write(&active, corrupt).unwrap();
+    let before_rejection = snapshot_directory(_root.path()).unwrap();
+    assert!(
+        publish_closed_replacement_with_checkpoint(&prepared, &mut manifest, |_| Ok(())).is_err()
+    );
+    assert_eq!(snapshot_directory(_root.path()).unwrap(), before_rejection);
+    assert!(!store_dir.exists());
+    assert_eq!(snapshot_directory(&prepared.paths.previous).unwrap(), old);
+    assert_eq!(manifest.phase, ManifestPhase::PreviousPublished);
+
+    let (_root, store_dir, prepared) = prepared_fixture();
+    let old = snapshot_directory(&store_dir).unwrap();
+    let staged = snapshot_directory(&prepared.paths.staging).unwrap();
+    let mut manifest =
+        publish_closed_prepared(&prepared, crate::DurabilityPolicy::Buffered).unwrap();
+    publish_closed_previous_with_checkpoint(&prepared, &mut manifest, |_| Ok(())).unwrap();
+    let interrupted =
+        publish_closed_replacement_with_checkpoint(&prepared, &mut manifest, |stage| {
+            if stage == ClosedReplacementStage::ReplacementMoved {
+                Err(std::io::Error::other("injected after replacement move"))
+            } else {
+                Ok(())
+            }
+        });
+    assert!(interrupted.is_err());
+    assert_eq!(snapshot_directory(&store_dir).unwrap(), staged);
+    assert_eq!(snapshot_directory(&prepared.paths.previous).unwrap(), old);
+    assert!(!prepared.paths.staging.exists());
+    assert_eq!(manifest.phase, ManifestPhase::PreviousPublished);
+    assert_eq!(
+        read_published_manifest(&prepared.paths)
+            .unwrap()
+            .unwrap()
+            .phase,
+        ManifestPhase::PreviousPublished
+    );
+
+    let (_root, store_dir, prepared) = prepared_fixture();
+    let old = snapshot_directory(&store_dir).unwrap();
+    let staged = snapshot_directory(&prepared.paths.staging).unwrap();
+    let mut manifest =
+        publish_closed_prepared(&prepared, crate::DurabilityPolicy::Buffered).unwrap();
+    publish_closed_previous_with_checkpoint(&prepared, &mut manifest, |_| Ok(())).unwrap();
+    let mut stages = Vec::new();
+    publish_closed_replacement_with_checkpoint(&prepared, &mut manifest, |stage| {
+        stages.push(stage);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        stages,
+        [
+            ClosedReplacementStage::ReplacementMoved,
+            ClosedReplacementStage::ReplacementReopened,
+            ClosedReplacementStage::PhasePublished,
+        ]
+    );
+    assert_eq!(snapshot_directory(&store_dir).unwrap(), staged);
+    assert_eq!(snapshot_directory(&prepared.paths.previous).unwrap(), old);
+    assert!(!prepared.paths.staging.exists());
+    assert_eq!(manifest.phase, ManifestPhase::ReplacementPublished);
+    assert_eq!(
+        read_published_manifest(&prepared.paths)
+            .unwrap()
+            .unwrap()
+            .phase,
+        ManifestPhase::ReplacementPublished
+    );
 }

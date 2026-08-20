@@ -140,8 +140,8 @@
 
 - [X] T067 [US2] Write and run a runtime RED proving `Prepared` retains old authority and old-to-previous publication completes before `PreviousPublished` without deleting source evidence in `src/compaction/recovery_tests.rs`
 - [X] T068 [US2] Implement `Prepared` and old-to-previous transitions with the last complete authority retained in `src/compaction/publication.rs`, then run T067 GREEN
-- [ ] T069 [US2] Write and run a runtime RED proving only a validated staging generation becomes canonical before `ReplacementPublished` and canonical replacement reopens before authority confirmation in `src/compaction/recovery_tests.rs`
-- [ ] T070 [US2] Implement replacement publication, canonical reopen, and `ReplacementPublished` transition in `src/compaction/publication.rs`, then run T069 GREEN
+- [X] T069 [US2] Write and run a runtime RED proving only a validated staging generation becomes canonical before `ReplacementPublished` and canonical replacement reopens before authority confirmation in `src/compaction/recovery_tests.rs`
+- [X] T070 [US2] Implement replacement publication, canonical reopen, and `ReplacementPublished` transition in `src/compaction/publication.rs`, then run T069 GREEN
 - [ ] T071 [US2] Write and run a runtime RED proving cleanup starts only after `CleanupPending`, deletes exact owned matches, removes the manifest last, and reports `Pending` on any cleanup fault in `src/compaction/recovery_tests.rs`
 - [ ] T072 [US2] Implement phase-ordered exact cleanup and pending outcomes in `src/compaction/publication.rs` and `src/compaction/recovery.rs`, then run T071 GREEN
 

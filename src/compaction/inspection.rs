@@ -263,7 +263,7 @@ fn inspect_family_artifacts(
     })
 }
 
-fn inspect_generation(store_dir: &Path) -> io::Result<DirectoryInspection> {
+pub(crate) fn inspect_generation(store_dir: &Path) -> io::Result<DirectoryInspection> {
     let mut artifacts = BTreeMap::<InspectedFamily, FamilyArtifacts>::new();
     for entry in std::fs::read_dir(store_dir)? {
         let entry = entry?;
