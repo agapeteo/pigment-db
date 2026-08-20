@@ -149,8 +149,8 @@
 
 - [X] T073 [US2] Write and run a runtime RED for `Prepared` recovery restoring split old artifacts, accepting online-prefix advancement rules only in online mode, and discarding only provably incomplete owned staging in `src/compaction/recovery_tests.rs`
 - [X] T074 [US2] Implement idempotent `Prepared` recovery in `src/compaction/recovery.rs`, then run T073 GREEN
-- [ ] T075 [US2] Write and run a runtime RED for `PreviousPublished` preferring a fully validated replacement, otherwise restoring verified previous, otherwise preserving evidence with `AuthorityUndetermined` in `src/compaction/recovery_tests.rs`
-- [ ] T076 [US2] Implement the evidence-driven `PreviousPublished` decision in `src/compaction/recovery.rs`, then run T075 GREEN
+- [X] T075 [US2] Write and run a runtime RED for `PreviousPublished` preferring a fully validated replacement, otherwise restoring verified previous, otherwise preserving evidence with `AuthorityUndetermined` in `src/compaction/recovery_tests.rs`
+- [X] T076 [US2] Implement the evidence-driven `PreviousPublished` decision in `src/compaction/recovery.rs`, then run T075 GREEN
 - [ ] T077 [US2] Write and run a runtime RED for `ReplacementPublished` selecting only a validated canonical replacement while retaining previous evidence until confirmation in `src/compaction/recovery_tests.rs`
 - [ ] T078 [US2] Implement `ReplacementPublished` validation and authority confirmation in `src/compaction/recovery.rs`, then run T077 GREEN
 - [ ] T079 [US2] Write and run a runtime RED for `CleanupPending` replacement-prefix validation, missing-target idempotence, mismatching-target preservation, and safe repeated retry in `src/compaction/recovery_tests.rs`

@@ -12,11 +12,125 @@ use super::manifest::{
     verify_descriptor, ArtifactDescriptor, CompactionManifest, ManifestMode, ManifestPhase,
     ManifestScope,
 };
-use super::publication::MaintenanceArtifactPaths;
+use super::publication::{publish_manifest_for_policy, MaintenanceArtifactPaths};
 use crate::wal::replay::{
     classify_key_map_read_only, classify_key_set_read_only, classify_key_value_read_only,
 };
 use crate::{CompactionError, CompactionOperation, StoreFamily};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RecoveredAuthority {
+    Previous,
+    Replacement,
+}
+
+pub(crate) fn recover_previous_published_closed(
+    store_dir: &Path,
+    paths: &MaintenanceArtifactPaths,
+    manifest: &mut CompactionManifest,
+) -> Result<RecoveredAuthority, CompactionError> {
+    if manifest.phase != ManifestPhase::PreviousPublished
+        || manifest.mode != ManifestMode::ClosedDirectory
+        || manifest.scope != ManifestScope::Directory
+        || !manifest.source_finalized
+    {
+        return Err(CompactionError::FailedClosed {
+            detail: "closed PreviousPublished recovery received contradictory manifest state"
+                .to_owned(),
+        });
+    }
+    let canonical_exists = path_exists(store_dir)?;
+    let staging_exists = path_exists(&paths.staging)?;
+    let previous_exists = path_exists(&paths.previous)?;
+    let canonical_replacement =
+        canonical_exists && generation_matches(store_dir, &manifest.replacement_inventory);
+    let staged_replacement =
+        staging_exists && generation_matches(&paths.staging, &manifest.replacement_inventory);
+    let verified_previous =
+        previous_exists && generation_matches(&paths.previous, &manifest.source_inventory);
+
+    if canonical_replacement && !staging_exists {
+        establish_replacement_phase(paths, manifest)?;
+        return Ok(RecoveredAuthority::Replacement);
+    }
+    if !canonical_exists && staged_replacement {
+        fs::rename(&paths.staging, store_dir).map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::PublishReplacement,
+            path: store_dir.to_path_buf(),
+            source,
+        })?;
+        if !generation_matches(store_dir, &manifest.replacement_inventory) {
+            return Err(authority_undetermined(store_dir, paths));
+        }
+        establish_replacement_phase(paths, manifest)?;
+        return Ok(RecoveredAuthority::Replacement);
+    }
+    if verified_previous {
+        if canonical_exists {
+            if staging_exists {
+                return Err(authority_undetermined(store_dir, paths));
+            }
+            fs::rename(store_dir, &paths.staging).map_err(|source| CompactionError::Io {
+                operation: CompactionOperation::PublishReplacement,
+                path: paths.staging.clone(),
+                source,
+            })?;
+        }
+        fs::rename(&paths.previous, store_dir).map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::PublishPrevious,
+            path: store_dir.to_path_buf(),
+            source,
+        })?;
+        if !generation_matches(store_dir, &manifest.source_inventory) {
+            return Err(authority_undetermined(store_dir, paths));
+        }
+        if path_exists(&paths.staging)? {
+            let metadata =
+                fs::symlink_metadata(&paths.staging).map_err(|source| CompactionError::Io {
+                    operation: CompactionOperation::Cleanup,
+                    path: paths.staging.clone(),
+                    source,
+                })?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(authority_undetermined(store_dir, paths));
+            }
+            fs::remove_dir_all(&paths.staging).map_err(|source| CompactionError::Io {
+                operation: CompactionOperation::Cleanup,
+                path: paths.staging.clone(),
+                source,
+            })?;
+        }
+        fs::remove_file(&paths.manifest).map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::Cleanup,
+            path: paths.manifest.clone(),
+            source,
+        })?;
+        return Ok(RecoveredAuthority::Previous);
+    }
+    Err(authority_undetermined(store_dir, paths))
+}
+
+fn establish_replacement_phase(
+    paths: &MaintenanceArtifactPaths,
+    manifest: &mut CompactionManifest,
+) -> Result<(), CompactionError> {
+    let mut next = manifest.clone();
+    next.phase = ManifestPhase::ReplacementPublished;
+    publish_manifest_for_policy(paths, &next, manifest.durability)?;
+    *manifest = next;
+    Ok(())
+}
+
+fn authority_undetermined(store_dir: &Path, paths: &MaintenanceArtifactPaths) -> CompactionError {
+    CompactionError::AuthorityUndetermined {
+        paths: vec![
+            store_dir.to_path_buf(),
+            paths.staging.clone(),
+            paths.previous.clone(),
+            paths.manifest.clone(),
+        ],
+    }
+}
 
 pub(crate) fn recover_prepared_closed(
     store_dir: &Path,

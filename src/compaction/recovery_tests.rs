@@ -380,3 +380,95 @@ fn only_unfinalized_online_prepared_accepts_valid_source_prefix_advancement() {
         &manifest
     ));
 }
+
+#[test]
+fn previous_published_prefers_valid_replacement_then_previous_else_preserves_ambiguity() {
+    for replacement_already_canonical in [false, true] {
+        let (_root, store_dir, prepared) = prepared_fixture();
+        let old = snapshot_directory(&store_dir).unwrap();
+        let staged = snapshot_directory(&prepared.paths.staging).unwrap();
+        let mut manifest =
+            publish_closed_prepared(&prepared, crate::DurabilityPolicy::Buffered).unwrap();
+        publish_closed_previous_with_checkpoint(&prepared, &mut manifest, |_| Ok(())).unwrap();
+        if replacement_already_canonical {
+            assert!(publish_closed_replacement_with_checkpoint(
+                &prepared,
+                &mut manifest,
+                |stage| if stage == ClosedReplacementStage::ReplacementMoved {
+                    Err(std::io::Error::other("injected moved candidate"))
+                } else {
+                    Ok(())
+                }
+            )
+            .is_err());
+        }
+        let selected = crate::compaction::recovery::recover_previous_published_closed(
+            &store_dir,
+            &prepared.paths,
+            &mut manifest,
+        )
+        .unwrap();
+        assert_eq!(
+            selected,
+            crate::compaction::recovery::RecoveredAuthority::Replacement
+        );
+        assert_eq!(snapshot_directory(&store_dir).unwrap(), staged);
+        assert_eq!(snapshot_directory(&prepared.paths.previous).unwrap(), old);
+        assert!(!prepared.paths.staging.exists());
+        assert_eq!(manifest.phase, ManifestPhase::ReplacementPublished);
+    }
+
+    let (_root, store_dir, prepared) = prepared_fixture();
+    let old = snapshot_directory(&store_dir).unwrap();
+    let mut manifest =
+        publish_closed_prepared(&prepared, crate::DurabilityPolicy::Buffered).unwrap();
+    publish_closed_previous_with_checkpoint(&prepared, &mut manifest, |_| Ok(())).unwrap();
+    std::fs::write(
+        prepared.paths.staging.join("kv.wal.dat"),
+        b"invalid replacement",
+    )
+    .unwrap();
+    let selected = crate::compaction::recovery::recover_previous_published_closed(
+        &store_dir,
+        &prepared.paths,
+        &mut manifest,
+    )
+    .unwrap();
+    assert_eq!(
+        selected,
+        crate::compaction::recovery::RecoveredAuthority::Previous
+    );
+    assert_eq!(snapshot_directory(&store_dir).unwrap(), old);
+    assert!(!prepared.paths.previous.exists());
+    assert!(!prepared.paths.staging.exists());
+    assert!(!prepared.paths.manifest.exists());
+
+    let (_root, store_dir, prepared) = prepared_fixture();
+    let mut manifest =
+        publish_closed_prepared(&prepared, crate::DurabilityPolicy::Buffered).unwrap();
+    publish_closed_previous_with_checkpoint(&prepared, &mut manifest, |_| Ok(())).unwrap();
+    std::fs::write(
+        prepared.paths.staging.join("kv.wal.dat"),
+        b"invalid replacement",
+    )
+    .unwrap();
+    let previous_file = std::fs::read_dir(&prepared.paths.previous)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::write(previous_file, b"invalid previous").unwrap();
+    let evidence = snapshot_directory(_root.path()).unwrap();
+    let error = crate::compaction::recovery::recover_previous_published_closed(
+        &store_dir,
+        &prepared.paths,
+        &mut manifest,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::CompactionError::AuthorityUndetermined { .. }
+    ));
+    assert_eq!(snapshot_directory(_root.path()).unwrap(), evidence);
+}

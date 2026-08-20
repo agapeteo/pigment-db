@@ -312,7 +312,7 @@ fn native_leaf(path: &Path) -> Result<PathBuf, CompactionError> {
         })
 }
 
-fn publish_manifest_for_policy(
+pub(crate) fn publish_manifest_for_policy(
     paths: &MaintenanceArtifactPaths,
     manifest: &CompactionManifest,
     durability: DurabilityPolicy,
