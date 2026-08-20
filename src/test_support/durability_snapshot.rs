@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 pub(crate) enum NamespaceOperation {
     Write,
     Rename,
+    WriteThroughMove,
     Remove,
+    ExactCleanup,
     FileBarrier,
     DirectoryBarrier,
 }
@@ -45,7 +47,9 @@ pub(crate) struct DurabilitySnapshot {
 enum NamespaceOperationKey {
     Write,
     Rename,
+    WriteThroughMove,
     Remove,
+    ExactCleanup,
     FileBarrier,
     DirectoryBarrier,
 }
@@ -55,7 +59,9 @@ impl From<NamespaceOperation> for NamespaceOperationKey {
         match operation {
             NamespaceOperation::Write => Self::Write,
             NamespaceOperation::Rename => Self::Rename,
+            NamespaceOperation::WriteThroughMove => Self::WriteThroughMove,
             NamespaceOperation::Remove => Self::Remove,
+            NamespaceOperation::ExactCleanup => Self::ExactCleanup,
             NamespaceOperation::FileBarrier => Self::FileBarrier,
             NamespaceOperation::DirectoryBarrier => Self::DirectoryBarrier,
         }
@@ -83,21 +89,51 @@ impl DurabilitySnapshot {
         source: impl Into<PathBuf>,
         destination: impl Into<PathBuf>,
     ) -> io::Result<()> {
-        let source = source.into();
-        let destination = destination.into();
-        self.record(
+        self.move_namespace(
+            source.into(),
+            destination.into(),
             NamespaceOperation::Rename,
-            source.clone(),
-            Some(destination.clone()),
-        )?;
-        let bytes = self.volatile.remove(&source).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "snapshot rename source is absent")
-        })?;
-        self.volatile.insert(destination.clone(), bytes);
-        if let Some(bytes) = self.synchronized_contents.remove(&source) {
-            self.synchronized_contents.insert(destination, bytes);
-        }
-        Ok(())
+            false,
+        )
+    }
+
+    pub(crate) fn rename_replace(
+        &mut self,
+        source: impl Into<PathBuf>,
+        destination: impl Into<PathBuf>,
+    ) -> io::Result<()> {
+        self.move_namespace(
+            source.into(),
+            destination.into(),
+            NamespaceOperation::Rename,
+            true,
+        )
+    }
+
+    pub(crate) fn write_through_move(
+        &mut self,
+        source: impl Into<PathBuf>,
+        destination: impl Into<PathBuf>,
+    ) -> io::Result<()> {
+        self.move_namespace(
+            source.into(),
+            destination.into(),
+            NamespaceOperation::WriteThroughMove,
+            false,
+        )
+    }
+
+    pub(crate) fn write_through_replace(
+        &mut self,
+        source: impl Into<PathBuf>,
+        destination: impl Into<PathBuf>,
+    ) -> io::Result<()> {
+        self.move_namespace(
+            source.into(),
+            destination.into(),
+            NamespaceOperation::WriteThroughMove,
+            true,
+        )
     }
 
     pub(crate) fn remove(&mut self, path: impl Into<PathBuf>) -> io::Result<()> {
@@ -106,6 +142,32 @@ impl DurabilitySnapshot {
         self.volatile.remove(&path);
         self.synchronized_contents.remove(&path);
         Ok(())
+    }
+
+    pub(crate) fn remove_exact(
+        &mut self,
+        path: impl Into<PathBuf>,
+        expected: &DurableNamespaceImage,
+    ) -> io::Result<()> {
+        let path = path.into();
+        self.record(NamespaceOperation::ExactCleanup, path.clone(), None)?;
+        let actual = self.subtree(&path, &self.volatile);
+        if actual != expected.files {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "exact cleanup evidence does not match the current namespace",
+            ));
+        }
+        self.volatile.retain(|entry, _| !is_within(entry, &path));
+        self.synchronized_contents
+            .retain(|entry, _| !is_within(entry, &path));
+        Ok(())
+    }
+
+    pub(crate) fn image_below(&self, path: impl AsRef<Path>) -> DurableNamespaceImage {
+        DurableNamespaceImage {
+            files: self.subtree(path.as_ref(), &self.volatile),
+        }
     }
 
     pub(crate) fn sync_file(&mut self, path: impl Into<PathBuf>) -> io::Result<()> {
@@ -174,6 +236,88 @@ impl DurabilitySnapshot {
         &self.events
     }
 
+    fn move_namespace(
+        &mut self,
+        source: PathBuf,
+        destination: PathBuf,
+        operation: NamespaceOperation,
+        replace: bool,
+    ) -> io::Result<()> {
+        self.record(operation, source.clone(), Some(destination.clone()))?;
+        let moved: Vec<_> = self
+            .volatile
+            .iter()
+            .filter(|(path, _)| is_within(path, &source))
+            .map(|(path, bytes)| {
+                let relative = path.strip_prefix(&source).expect("matched source prefix");
+                (path.clone(), destination.join(relative), bytes.clone())
+            })
+            .collect();
+        if moved.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "snapshot namespace move source is absent",
+            ));
+        }
+        let destination_exists = self
+            .volatile
+            .keys()
+            .any(|path| is_within(path, &destination));
+        if destination_exists && !replace {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "snapshot namespace move destination exists",
+            ));
+        }
+        if operation == NamespaceOperation::WriteThroughMove
+            && moved
+                .iter()
+                .any(|(old, _, bytes)| self.synchronized_contents.get(old) != Some(bytes))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "write-through move requires synchronized source contents",
+            ));
+        }
+
+        if replace {
+            self.volatile
+                .retain(|path, _| !is_within(path, &destination));
+            self.synchronized_contents
+                .retain(|path, _| !is_within(path, &destination));
+            if operation == NamespaceOperation::WriteThroughMove {
+                self.durable
+                    .retain(|path, _| !is_within(path, &destination));
+            }
+        }
+        for (old, new, bytes) in &moved {
+            self.volatile.remove(old);
+            self.volatile.insert(new.clone(), bytes.clone());
+            if let Some(synchronized) = self.synchronized_contents.remove(old) {
+                self.synchronized_contents.insert(new.clone(), synchronized);
+            }
+        }
+        if operation == NamespaceOperation::WriteThroughMove {
+            self.durable.retain(|path, _| !is_within(path, &source));
+            for (_, new, bytes) in moved {
+                self.durable.insert(new, bytes);
+            }
+        }
+        Ok(())
+    }
+
+    fn subtree(
+        &self,
+        root: &Path,
+        image: &BTreeMap<PathBuf, Vec<u8>>,
+    ) -> BTreeMap<PathBuf, Vec<u8>> {
+        image
+            .iter()
+            .filter(|(path, _)| is_within(path, root))
+            .map(|(path, bytes)| (path.clone(), bytes.clone()))
+            .collect()
+    }
+
     fn record(
         &mut self,
         operation: NamespaceOperation,
@@ -200,6 +344,10 @@ impl DurabilitySnapshot {
         }
         Ok(())
     }
+}
+
+fn is_within(path: &Path, root: &Path) -> bool {
+    path == root || path.starts_with(root)
 }
 
 pub(crate) fn restore_image(root: &Path, image: &DurableNamespaceImage) -> io::Result<()> {
@@ -270,7 +418,9 @@ mod tests {
         for operation in [
             NamespaceOperation::Write,
             NamespaceOperation::Rename,
+            NamespaceOperation::WriteThroughMove,
             NamespaceOperation::Remove,
+            NamespaceOperation::ExactCleanup,
             NamespaceOperation::FileBarrier,
             NamespaceOperation::DirectoryBarrier,
         ] {
@@ -284,7 +434,14 @@ mod tests {
             let result = match operation {
                 NamespaceOperation::Write => snapshot.write(&source, b"bytes"),
                 NamespaceOperation::Rename => snapshot.rename(&source, &destination),
+                NamespaceOperation::WriteThroughMove => {
+                    snapshot.write_through_move(&source, &destination)
+                }
                 NamespaceOperation::Remove => snapshot.remove(&source),
+                NamespaceOperation::ExactCleanup => {
+                    let expected = snapshot.image_below(&source);
+                    snapshot.remove_exact(&source, &expected)
+                }
                 NamespaceOperation::FileBarrier => snapshot.sync_file(&source),
                 NamespaceOperation::DirectoryBarrier => snapshot.sync_directory(&root),
             };
@@ -292,5 +449,220 @@ mod tests {
             assert_eq!(snapshot.calls(operation), 1);
             assert_eq!(snapshot.events().len(), 1);
         }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ModeledCompactionPhase {
+        Prepared,
+        PreviousPublished,
+        ReplacementPublished,
+        CleanupPending,
+    }
+
+    struct CompactionPaths {
+        parent: PathBuf,
+        source: PathBuf,
+        staging: PathBuf,
+        previous: PathBuf,
+        manifest: PathBuf,
+        manifest_next: PathBuf,
+    }
+
+    fn modeled_paths() -> CompactionPaths {
+        let parent = PathBuf::from("/model");
+        CompactionPaths {
+            source: parent.join("store"),
+            staging: parent.join("store.compaction-staging"),
+            previous: parent.join("store.compaction-previous"),
+            manifest: parent.join("compaction.manifest"),
+            manifest_next: parent.join("compaction.manifest.next"),
+            parent,
+        }
+    }
+
+    fn persist_manifest(
+        snapshot: &mut DurabilitySnapshot,
+        paths: &CompactionPaths,
+        phase: ModeledCompactionPhase,
+    ) {
+        snapshot
+            .write(&paths.manifest_next, format!("{phase:?}").as_bytes())
+            .unwrap();
+        snapshot.sync_file(&paths.manifest_next).unwrap();
+        snapshot
+            .rename_replace(&paths.manifest_next, &paths.manifest)
+            .unwrap();
+        snapshot.sync_directory(&paths.parent).unwrap();
+    }
+
+    fn crash_image_at(phase: ModeledCompactionPhase) -> DurableNamespaceImage {
+        let paths = modeled_paths();
+        let mut snapshot = DurabilitySnapshot::new(None);
+        let source_file = paths.source.join("active.wal");
+        let staging_file = paths.staging.join("active.wal");
+        snapshot.write(&source_file, b"old-complete").unwrap();
+        snapshot.sync_file(&source_file).unwrap();
+        snapshot.sync_directory(&paths.parent).unwrap();
+
+        snapshot.write(&staging_file, b"new-complete").unwrap();
+        snapshot.sync_file(&staging_file).unwrap();
+        persist_manifest(&mut snapshot, &paths, ModeledCompactionPhase::Prepared);
+        if phase == ModeledCompactionPhase::Prepared {
+            return snapshot.simulate_power_loss();
+        }
+
+        snapshot.rename(&paths.source, &paths.previous).unwrap();
+        snapshot.sync_directory(&paths.parent).unwrap();
+        persist_manifest(
+            &mut snapshot,
+            &paths,
+            ModeledCompactionPhase::PreviousPublished,
+        );
+        if phase == ModeledCompactionPhase::PreviousPublished {
+            return snapshot.simulate_power_loss();
+        }
+
+        snapshot.rename(&paths.staging, &paths.source).unwrap();
+        snapshot.sync_directory(&paths.parent).unwrap();
+        persist_manifest(
+            &mut snapshot,
+            &paths,
+            ModeledCompactionPhase::ReplacementPublished,
+        );
+        if phase == ModeledCompactionPhase::ReplacementPublished {
+            return snapshot.simulate_power_loss();
+        }
+
+        persist_manifest(
+            &mut snapshot,
+            &paths,
+            ModeledCompactionPhase::CleanupPending,
+        );
+        snapshot.simulate_power_loss()
+    }
+
+    #[test]
+    fn every_manifest_phase_power_loss_retains_a_complete_authority() {
+        let paths = modeled_paths();
+        for phase in [
+            ModeledCompactionPhase::Prepared,
+            ModeledCompactionPhase::PreviousPublished,
+            ModeledCompactionPhase::ReplacementPublished,
+            ModeledCompactionPhase::CleanupPending,
+        ] {
+            let image = crash_image_at(phase);
+            let source = image.files.get(&paths.source.join("active.wal"));
+            let previous = image.files.get(&paths.previous.join("active.wal"));
+            let staging = image.files.get(&paths.staging.join("active.wal"));
+            match phase {
+                ModeledCompactionPhase::Prepared => {
+                    assert_eq!(source, Some(&b"old-complete".to_vec()));
+                    assert_eq!(staging, Some(&b"new-complete".to_vec()));
+                    assert!(previous.is_none());
+                }
+                ModeledCompactionPhase::PreviousPublished => {
+                    assert!(source.is_none());
+                    assert_eq!(previous, Some(&b"old-complete".to_vec()));
+                    assert_eq!(staging, Some(&b"new-complete".to_vec()));
+                }
+                ModeledCompactionPhase::ReplacementPublished
+                | ModeledCompactionPhase::CleanupPending => {
+                    assert_eq!(source, Some(&b"new-complete".to_vec()));
+                    assert_eq!(previous, Some(&b"old-complete".to_vec()));
+                    assert!(staging.is_none());
+                }
+            }
+            assert_eq!(
+                image.files.get(&paths.manifest),
+                Some(&format!("{phase:?}").into_bytes())
+            );
+            assert!(!image.files.contains_key(&paths.manifest_next));
+        }
+    }
+
+    #[test]
+    fn write_through_family_and_directory_moves_survive_without_a_later_barrier() {
+        let root = PathBuf::from("/model");
+        let mut snapshot = DurabilitySnapshot::new(None);
+        let family_staging = root.join("family.staging");
+        let family_active = root.join("family.active");
+        snapshot.write(&family_active, b"old").unwrap();
+        snapshot.sync_file(&family_active).unwrap();
+        snapshot.sync_directory(&root).unwrap();
+        snapshot.write(&family_staging, b"new").unwrap();
+        snapshot.sync_file(&family_staging).unwrap();
+        snapshot
+            .write_through_replace(&family_staging, &family_active)
+            .unwrap();
+        assert_eq!(
+            snapshot.simulate_power_loss().files.get(&family_active),
+            Some(&b"new".to_vec())
+        );
+
+        let directory_staging = root.join("directory.staging");
+        let directory_active = root.join("directory.active");
+        let staged_file = directory_staging.join("active.wal");
+        snapshot.write(&staged_file, b"directory").unwrap();
+        snapshot.sync_file(&staged_file).unwrap();
+        snapshot
+            .write_through_move(&directory_staging, &directory_active)
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .simulate_power_loss()
+                .files
+                .get(&directory_active.join("active.wal")),
+            Some(&b"directory".to_vec())
+        );
+    }
+
+    #[test]
+    fn exact_cleanup_rejects_changed_evidence_and_preserves_every_artifact() {
+        let paths = modeled_paths();
+        let mut snapshot = DurabilitySnapshot::new(None);
+        let previous_file = paths.previous.join("active.wal");
+        snapshot.write(&previous_file, b"old").unwrap();
+        snapshot.sync_file(&previous_file).unwrap();
+        snapshot.sync_directory(&paths.parent).unwrap();
+        let before = snapshot.volatile_image();
+        let mut wrong = snapshot.image_below(&paths.previous);
+        wrong
+            .files
+            .insert(previous_file.clone(), b"changed".to_vec());
+
+        assert!(snapshot.remove_exact(&paths.previous, &wrong).is_err());
+        assert_eq!(snapshot.volatile_image(), before);
+
+        let exact = snapshot.image_below(&paths.previous);
+        snapshot.remove_exact(&paths.previous, &exact).unwrap();
+        snapshot.sync_directory(&paths.parent).unwrap();
+        assert!(!snapshot
+            .simulate_power_loss()
+            .files
+            .contains_key(&previous_file));
+    }
+
+    #[test]
+    fn corrupt_or_contradictory_evidence_is_preserved_across_power_loss() {
+        let paths = modeled_paths();
+        let mut snapshot = DurabilitySnapshot::new(None);
+        let source = paths.source.join("active.wal");
+        let previous = paths.previous.join("active.wal");
+        snapshot.write(&source, b"source").unwrap();
+        snapshot.sync_file(&source).unwrap();
+        snapshot.write(&previous, b"competing").unwrap();
+        snapshot.sync_file(&previous).unwrap();
+        snapshot.write(&paths.manifest, b"corrupt").unwrap();
+        snapshot.sync_file(&paths.manifest).unwrap();
+        snapshot.sync_directory(&paths.parent).unwrap();
+
+        let before = snapshot.durable_image();
+        assert_eq!(snapshot.simulate_power_loss(), before);
+        assert_eq!(before.files.get(&source), Some(&b"source".to_vec()));
+        assert_eq!(before.files.get(&previous), Some(&b"competing".to_vec()));
+        assert_eq!(
+            before.files.get(&paths.manifest),
+            Some(&b"corrupt".to_vec())
+        );
     }
 }

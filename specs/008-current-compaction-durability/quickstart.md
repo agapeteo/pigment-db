@@ -104,6 +104,15 @@ feature-only test/specification scaffolding:
 Release-only and historical performance tests remained intentionally ignored.
 The feature matrix was exercised separately in result-free smoke mode.
 
+### Foundational infrastructure GREEN checkpoint (2026-08-20)
+
+After T009–T017, `cargo test --all-targets --all-features --
+--test-threads=1` completed with zero failures. This checkpoint includes the
+maintenance scheduling, durability namespace, current-V2 fixture, subprocess
+crash, lock-rank/watchdog, recovery, durability, mutation-ordering, migration,
+and 104-row requirement-manifest tests. Normal builds still expose no
+maintenance API or test hook.
+
 ## 7. Expected caller usage
 
 Callers inspect and choose when to compact; Pigment DB schedules nothing. Closed callers drop every same-process store before `compact_directory_in_place`. Online callers invoke `try_compact_online` on exactly one file-backed store and may choose a delta bound; policy is inherited. `CleanupStatus::Pending` means replacement publication succeeded and ordinary use may continue, with cleanup retried at reopen or a later explicit compaction. `MigrationRequired` means the caller must run `pigment-db-migrate` separately.

@@ -42,13 +42,13 @@
 - [X] T009 Create private maintenance module skeletons, empty registered `cfg(test)` modules, and test-only sentinel entry points without crate-root exports in `src/maintenance.rs`, `src/compaction/{mod,inspection,manifest,publication,recovery,inspection_tests,closed_tests,recovery_tests,online_tests}.rs`, `src/wal/{mod,maintenance_tests}.rs`, and `src/lib.rs`, then prove by source/API scan in `tests/ci_workflow.rs` that a normal build exposes no maintenance symbols
 - [X] T010 Add semantic pause/release checkpoints for snapshot capture, recorder activation, staging encode, staging validation, cutover, writer handoff, manifest phases, and cleanup in `src/test_support/maintenance_schedule.rs` and register them only under `cfg(test)` in `src/test_support/mod.rs`
 - [X] T011 Add and run checkpoint self-tests proving deterministic block/release, event order, panic unwinding, and zero normal-build hooks in `src/test_support/maintenance_schedule.rs`
-- [ ] T012 [P] Extend the volatile/durable filesystem model with manifest `.next`, staging, previous, directory/family publication, write-through move, exact cleanup, and power-loss states in `src/test_support/durability_snapshot.rs`
-- [ ] T013 Add and run filesystem-model self-tests for every `Prepared`, `PreviousPublished`, `ReplacementPublished`, and `CleanupPending` cut plus corrupt/contradictory evidence in `src/test_support/durability_snapshot.rs`
-- [ ] T014 [P] Add exact native-name, byte snapshot, current-V2 family fixture, segmented fixture, safe-tail fixture, and three-reopen helpers for unit/public tests in `src/test_support/maintenance_fixtures.rs`, `src/test_support/mod.rs`, and `tests/maintenance_support/mod.rs`
-- [ ] T015 Extend subprocess crash checkpoints with maintenance phase/cut identifiers, child exit verification, and artifact preservation in `src/test_support/fault_checkpoint.rs` and `tests/maintenance_support/mod.rs`
-- [ ] T016 Add a test-only lock-rank checker for `Maintenance < Shard < WAL` and watchdog diagnostics in `src/test_support/mutation_schedule.rs` and `src/test_support/mod.rs`
-- [ ] T017 Create an executable FR-001–FR-094 and SC-001–SC-010 test-name coverage manifest in `tests/maintenance_api.rs` without adding public production symbols
-- [ ] T018 Run all foundational harness self-tests and the existing recovery, durability, mutation-ordering, and migration suites and record the GREEN checkpoint in `specs/008-current-compaction-durability/quickstart.md`
+- [X] T012 [P] Extend the volatile/durable filesystem model with manifest `.next`, staging, previous, directory/family publication, write-through move, exact cleanup, and power-loss states in `src/test_support/durability_snapshot.rs`
+- [X] T013 Add and run filesystem-model self-tests for every `Prepared`, `PreviousPublished`, `ReplacementPublished`, and `CleanupPending` cut plus corrupt/contradictory evidence in `src/test_support/durability_snapshot.rs`
+- [X] T014 [P] Add exact native-name, byte snapshot, current-V2 family fixture, segmented fixture, safe-tail fixture, and three-reopen helpers for unit/public tests in `src/test_support/maintenance_fixtures.rs`, `src/test_support/mod.rs`, and `tests/maintenance_support/mod.rs`
+- [X] T015 Extend subprocess crash checkpoints with maintenance phase/cut identifiers, child exit verification, and artifact preservation in `src/test_support/fault_checkpoint.rs` and `tests/maintenance_support/mod.rs`
+- [X] T016 Add a test-only lock-rank checker for `Maintenance < Shard < WAL` and watchdog diagnostics in `src/test_support/mutation_schedule.rs` and `src/test_support/mod.rs`
+- [X] T017 Create an executable FR-001–FR-094 and SC-001–SC-010 test-name coverage manifest in `tests/maintenance_api.rs` without adding public production symbols
+- [X] T018 Run all foundational harness self-tests and the existing recovery, durability, mutation-ordering, and migration suites and record the GREEN checkpoint in `specs/008-current-compaction-durability/quickstart.md`
 
 **Checkpoint**: Deterministic infrastructure is ready; public maintenance behavior remains absent.
 

@@ -1,5 +1,6 @@
 //! Semantic mutation scheduling primitives used by crate unit tests.
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
@@ -9,6 +10,77 @@ pub(crate) const PROCESS_CHECKPOINT_ENV: &str = "PIGMENT_DB_MUTATION_CHECKPOINT"
 pub(crate) const PROCESS_CHECKPOINT_EXIT_CODE: i32 = 86;
 pub(crate) const PROCESS_CHILD_MODE_ENV: &str = "PIGMENT_DB_MUTATION_CHILD_MODE";
 pub(crate) const PROCESS_STORE_DIR_ENV: &str = "PIGMENT_DB_MUTATION_STORE_DIR";
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum LockRank {
+    Maintenance,
+    Shard,
+    Wal,
+}
+
+thread_local! {
+    static HELD_LOCK_RANKS: RefCell<Vec<(LockRank, &'static str)>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(crate) struct LockRankGuard {
+    rank: LockRank,
+    label: &'static str,
+}
+
+pub(crate) struct LockRankWatchdog {
+    started: std::time::Instant,
+    timeout: Duration,
+    context: &'static str,
+}
+
+impl LockRankGuard {
+    pub(crate) fn enter(rank: LockRank, label: &'static str) -> Self {
+        HELD_LOCK_RANKS.with(|held| {
+            let mut held = held.borrow_mut();
+            if let Some((current, current_label)) = held.last().copied() {
+                assert!(
+                    rank >= current,
+                    "lock-rank inversion: attempted {rank:?} ({label}) while holding {current:?} ({current_label}); required Maintenance < Shard < WAL"
+                );
+            }
+            held.push((rank, label));
+        });
+        Self { rank, label }
+    }
+}
+
+impl Drop for LockRankGuard {
+    fn drop(&mut self) {
+        HELD_LOCK_RANKS.with(|held| {
+            let popped = held.borrow_mut().pop();
+            assert_eq!(
+                popped,
+                Some((self.rank, self.label)),
+                "lock-rank guards must drop in LIFO order"
+            );
+        });
+    }
+}
+
+impl LockRankWatchdog {
+    pub(crate) fn new(timeout: Duration, context: &'static str) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            timeout,
+            context,
+        }
+    }
+
+    pub(crate) fn assert_progress(&self) {
+        if self.started.elapsed() >= self.timeout {
+            let held = HELD_LOCK_RANKS.with(|held| held.borrow().clone());
+            panic!(
+                "lock-order watchdog expired in {} after {:?}; held ranks: {held:?}",
+                self.context, self.timeout
+            );
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MutationPhase {
@@ -210,5 +282,53 @@ mod tests {
         controller.wait_until_reached();
         controller.release();
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn maintenance_shard_wal_rank_order_is_accepted() {
+        let _maintenance = LockRankGuard::enter(LockRank::Maintenance, "maintenance");
+        let _shard = LockRankGuard::enter(LockRank::Shard, "shard");
+        let _wal = LockRankGuard::enter(LockRank::Wal, "wal");
+    }
+
+    #[test]
+    fn reverse_lock_rank_panics_with_actionable_diagnostics() {
+        let result = std::panic::catch_unwind(|| {
+            let _wal = LockRankGuard::enter(LockRank::Wal, "wal");
+            let _maintenance = LockRankGuard::enter(LockRank::Maintenance, "maintenance");
+        });
+        let panic = result.expect_err("reverse lock order must panic");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(message.contains("required Maintenance < Shard < WAL"));
+    }
+
+    #[test]
+    fn panic_unwinding_clears_the_thread_lock_rank_stack() {
+        let _ = std::panic::catch_unwind(|| {
+            let _maintenance = LockRankGuard::enter(LockRank::Maintenance, "maintenance");
+            panic!("injected callback panic");
+        });
+        let _maintenance = LockRankGuard::enter(LockRank::Maintenance, "next-maintenance");
+    }
+
+    #[test]
+    fn watchdog_diagnostic_lists_the_current_lock_path() {
+        let _maintenance = LockRankGuard::enter(LockRank::Maintenance, "maintenance-gate");
+        let result = std::panic::catch_unwind(|| {
+            LockRankWatchdog::new(Duration::ZERO, "cutover").assert_progress();
+        });
+        let panic = result.expect_err("zero-duration watchdog must expire");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(message.contains("cutover"));
+        assert!(message.contains("Maintenance"));
+        assert!(message.contains("maintenance-gate"));
     }
 }
