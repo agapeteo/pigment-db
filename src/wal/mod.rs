@@ -103,6 +103,26 @@ enum DeltaRecordResult {
     AlreadyOverflowed,
 }
 
+#[cfg(test)]
+thread_local! {
+    static DELTA_GROUP_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_delta_group_build() {
+    DELTA_GROUP_BUILD_COUNT.set(DELTA_GROUP_BUILD_COUNT.get() + 1);
+}
+
+#[cfg(test)]
+fn reset_delta_group_build_count() {
+    DELTA_GROUP_BUILD_COUNT.set(0);
+}
+
+#[cfg(test)]
+fn delta_group_build_count() -> usize {
+    DELTA_GROUP_BUILD_COUNT.get()
+}
+
 #[derive(Debug)]
 pub(crate) struct DeltaRecorder {
     token: u64,
@@ -1656,12 +1676,16 @@ fn record_single_delta_if_active<W: Write>(
     };
     let action_kind = action.v2_act_type();
     let payload = action.data();
-    let _ = recorder.record_group([payload.len()], || RecordedMutation {
-        timestamp_bucket,
-        frames: vec![RecordedFrame {
-            action: action_kind,
-            payload: payload.to_vec(),
-        }],
+    let _ = recorder.record_group([payload.len()], || {
+        #[cfg(test)]
+        note_delta_group_build();
+        RecordedMutation {
+            timestamp_bucket,
+            frames: vec![RecordedFrame {
+                action: action_kind,
+                payload: payload.to_vec(),
+            }],
+        }
     });
 }
 
@@ -1675,6 +1699,8 @@ fn record_compute_delta_if_active<W: Write>(
         return;
     };
     let _ = recorder.record_group(actions.iter().map(|action| action.data().len()), || {
+        #[cfg(test)]
+        note_delta_group_build();
         RecordedMutation {
             timestamp_bucket,
             frames: actions

@@ -21,8 +21,9 @@ use super::replay::{
 };
 use super::ComputeAction;
 use super::{
-    checked_current_v2_group_encoded_len, DeltaRecordResult, DeltaRecorder, RecordedFrame,
-    RecordedMutation, WalStorage,
+    checked_current_v2_group_encoded_len, delta_group_build_count, record_compute_delta_if_active,
+    record_single_delta_if_active, reset_delta_group_build_count, DeltaRecordResult, DeltaRecorder,
+    RecordedFrame, RecordedMutation, WalStorage,
 };
 use crate::model::{Key, SearchKey};
 use crate::test_support::fault_writer::{
@@ -186,6 +187,31 @@ fn delta_recorder_is_token_bound_exactly_bounded_and_terminal_on_overflow() {
     assert!(!first_build_ran.get());
     assert!(first_group_over.groups.is_empty());
     assert_eq!(first_group_over.groups.capacity(), 0);
+}
+
+#[test]
+fn inactive_recorder_builds_no_delta_groups_or_payload_copies() {
+    reset_delta_group_build_count();
+    let wal = WalStorage::new_vec_based();
+    let put = StoredAction::prepare_put(&0, &KeyValueData::new(b"value".to_vec(), b"one".to_vec()));
+    let compute_put = StoredAction::prepare_put(
+        &0,
+        &KeyValueData::new(b"computed".to_vec(), b"member".to_vec()),
+    );
+    let delete = StoredAction::prepare_delete(&0, b"deleted");
+    let mut state = wal.wal_state.write().unwrap();
+    record_single_delta_if_active(&mut state, 1, &put);
+    record_compute_delta_if_active(&mut state, 2, &[compute_put, delete]);
+
+    assert_eq!(
+        delta_group_build_count(),
+        0,
+        "inactive recording must return before constructing delta-owned vectors"
+    );
+
+    state.activate_delta(77, u64::MAX).unwrap();
+    record_single_delta_if_active(&mut state, 3, &put);
+    assert_eq!(delta_group_build_count(), 1);
 }
 
 #[test]
