@@ -269,7 +269,7 @@ fn checked_current_v2_group_encoded_len(
 struct RotationSupport<W: Write> {
     state: FileRotationState,
     rotate: fn(
-        &mut W,
+        &mut Option<W>,
         &mut FileRotationState,
         u64,
         u64,
@@ -810,13 +810,17 @@ fn rotation_staging_path(active_path: &Path) -> std::io::Result<PathBuf> {
 }
 
 fn rotate_file_segment(
-    writer: &mut File,
+    writer: &mut Option<File>,
     rotation: &mut FileRotationState,
     granularity_nanos: u64,
     last_bucket: u64,
     durability_policy: crate::config::DurabilityPolicy,
 ) -> std::io::Result<()> {
-    let active_len = writer.metadata()?.len();
+    let active_len = writer
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("rotation has no active writer"))?
+        .metadata()?
+        .len();
     let next_segment_id = rotation.segment_id.checked_add(1).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "V2 segment id overflow")
     })?;
@@ -847,6 +851,9 @@ fn rotate_file_segment(
         if durability_policy == crate::config::DurabilityPolicy::Physical {
             staging.sync_all()?;
         }
+        let writer = writer
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("rotation has no active writer"))?;
         writer.flush()?;
         if durability_policy == crate::config::DurabilityPolicy::Physical {
             writer.sync_data()?;
@@ -860,11 +867,41 @@ fn rotate_file_segment(
     }
     drop(staging);
 
-    std::fs::rename(&rotation.active_path, &sealed_path)?;
-    if let Err(publish_error) = std::fs::rename(&staging_path, &rotation.active_path) {
-        let restore_result = std::fs::rename(&sealed_path, &rotation.active_path);
+    drop(writer.take());
+    if let Err(seal_error) =
+        publish_rotation_move(&rotation.active_path, &sealed_path, durability_policy)
+    {
+        return match OpenOptions::new().append(true).open(&rotation.active_path) {
+            Ok(reopened) => {
+                *writer = Some(reopened);
+                Err(seal_error)
+            }
+            Err(reopen_error) => {
+                rotation.failed_closed = true;
+                Err(std::io::Error::other(format!(
+                    "V2 rotation seal failed ({seal_error}); active reopen failed ({reopen_error})"
+                )))
+            }
+        };
+    }
+    if let Err(publish_error) =
+        publish_rotation_move(&staging_path, &rotation.active_path, durability_policy)
+    {
+        let restore_result =
+            publish_rotation_move(&sealed_path, &rotation.active_path, durability_policy);
         return match restore_result {
-            Ok(()) => Err(publish_error),
+            Ok(()) => match OpenOptions::new().append(true).open(&rotation.active_path) {
+                Ok(reopened) => {
+                    *writer = Some(reopened);
+                    Err(publish_error)
+                }
+                Err(reopen_error) => {
+                    rotation.failed_closed = true;
+                    Err(std::io::Error::other(format!(
+                        "V2 rotation publication failed ({publish_error}); restored active reopen failed ({reopen_error})"
+                    )))
+                }
+            },
             Err(restore_error) => {
                 rotation.failed_closed = true;
                 Err(std::io::Error::other(format!(
@@ -881,18 +918,38 @@ fn rotate_file_segment(
         .inspect_err(|_| {
             rotation.failed_closed = true;
         })?;
-    *writer = reopened;
+    *writer = Some(reopened);
     if durability_policy == crate::config::DurabilityPolicy::Physical {
-        let parent = rotation
-            .active_path
-            .parent()
-            .ok_or_else(|| std::io::Error::other("active WAL path has no parent"))?;
-        if let Err(error) = crate::durability::synchronize_directory(parent) {
-            rotation.failed_closed = true;
-            return Err(error);
+        #[cfg(not(target_os = "windows"))]
+        {
+            let parent = rotation
+                .active_path
+                .parent()
+                .ok_or_else(|| std::io::Error::other("active WAL path has no parent"))?;
+            if let Err(error) = crate::durability::synchronize_directory(parent) {
+                rotation.failed_closed = true;
+                return Err(error);
+            }
         }
     }
     Ok(())
+}
+
+fn publish_rotation_move(
+    source: &Path,
+    destination: &Path,
+    durability_policy: crate::config::DurabilityPolicy,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "windows")]
+    if durability_policy == crate::config::DurabilityPolicy::Physical {
+        return crate::durability::move_windows_namespace_write_through(
+            source,
+            destination,
+            crate::durability::WindowsNamespaceMoveMode::NoReplace,
+        );
+    }
+    let _ = durability_policy;
+    std::fs::rename(source, destination)
 }
 
 impl WalStorage<Vec<u8>> {
@@ -1736,7 +1793,7 @@ fn maybe_rotate_before<W: Write>(
     let last_bucket = state.last_bucket;
     let durability_policy = state.durability_policy;
     let result = (rotation.rotate)(
-        attached_writer_mut(state),
+        &mut state.writer,
         &mut rotation.state,
         granularity_nanos,
         last_bucket,
