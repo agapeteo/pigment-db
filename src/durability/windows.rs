@@ -7,8 +7,10 @@
 #![allow(dead_code, unsafe_code)]
 
 use std::io;
+use std::io::{Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use windows_sys::core::PCWSTR;
 use windows_sys::Win32::Storage::FileSystem::{
     MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MOVE_FILE_FLAGS,
@@ -57,6 +59,141 @@ fn move_flags(mode: NamespaceMoveMode) -> MOVE_FILE_FLAGS {
     match mode {
         NamespaceMoveMode::NoReplace => MOVEFILE_WRITE_THROUGH,
         NamespaceMoveMode::ReplaceExisting => MOVEFILE_WRITE_THROUGH | MOVEFILE_REPLACE_EXISTING,
+    }
+}
+
+static NEXT_PREFLIGHT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn create_disposable(
+    directory: &Path,
+    role: &str,
+) -> io::Result<(std::path::PathBuf, std::fs::File, Vec<u8>)> {
+    for _ in 0..1_024 {
+        let id = NEXT_PREFLIGHT_ID.fetch_add(1, Ordering::Relaxed);
+        let token = format!("pigment-db-preflight-{}-{id}", std::process::id()).into_bytes();
+        let path = directory.join(format!(
+            ".pigment-db-preflight-{}-{id}-{role}",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file, token)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique Windows durability preflight artifact",
+    ))
+}
+
+pub(super) fn preflight_file_content(directory: &Path) -> io::Result<()> {
+    let (path, mut file, token) = create_disposable(directory, "content")?;
+    let operation = (|| {
+        file.write_all(&token)?;
+        file.flush()?;
+        file.sync_all()?;
+        drop(file);
+        let mut reopened = std::fs::File::open(&path)?;
+        let mut persisted = Vec::new();
+        reopened.read_to_end(&mut persisted)?;
+        if persisted != token {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Windows file-content preflight reopened different bytes",
+            ));
+        }
+        Ok(())
+    })();
+    let cleanup = std::fs::remove_file(&path);
+    match (operation, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn synchronize_disposable(mut file: std::fs::File, token: &[u8]) -> io::Result<()> {
+    file.write_all(token)?;
+    file.flush()?;
+    file.sync_all()
+}
+
+fn validate_disposable(path: &Path, token: &[u8]) -> io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::other(
+            "Windows durability preflight artifact changed file type",
+        ));
+    }
+    if std::fs::read(path)? != token {
+        return Err(io::Error::other(
+            "Windows durability preflight artifact changed identity",
+        ));
+    }
+    Ok(())
+}
+
+fn cleanup_disposable(path: &Path, accepted_tokens: &[&[u8]]) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+        Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+            return Err(io::Error::other(
+                "refusing to remove a replaced Windows preflight artifact",
+            ));
+        }
+        Ok(_) => {}
+    }
+    let bytes = std::fs::read(path)?;
+    if !accepted_tokens.iter().any(|token| *token == bytes) {
+        return Err(io::Error::other(
+            "refusing to remove a Windows preflight artifact with changed identity",
+        ));
+    }
+    std::fs::remove_file(path)
+}
+
+pub(super) fn preflight_namespace(directory: &Path) -> io::Result<()> {
+    let (source, source_file, source_token) = create_disposable(directory, "move-source")?;
+    let destination = source.with_extension("move-destination");
+    let mut replacement_source = None;
+    let mut replacement_token = Vec::new();
+    let operation = (|| {
+        synchronize_disposable(source_file, &source_token)?;
+        move_file_write_through(&source, &destination, NamespaceMoveMode::NoReplace)?;
+        validate_disposable(&destination, &source_token)?;
+
+        let (path, file, token) = create_disposable(directory, "replace-source")?;
+        replacement_source = Some(path.clone());
+        replacement_token = token;
+        synchronize_disposable(file, &replacement_token)?;
+        move_file_write_through(&path, &destination, NamespaceMoveMode::ReplaceExisting)?;
+        validate_disposable(&destination, &replacement_token)?;
+        Ok(())
+    })();
+
+    let mut cleanup_error = cleanup_disposable(&source, &[&source_token]).err();
+    if let Some(path) = &replacement_source {
+        cleanup_error = cleanup_error
+            .or_else(|| cleanup_disposable(path, &[replacement_token.as_slice()]).err());
+    }
+    cleanup_error = cleanup_error.or_else(|| {
+        cleanup_disposable(
+            &destination,
+            &[source_token.as_slice(), replacement_token.as_slice()],
+        )
+        .err()
+    });
+    match (operation, cleanup_error) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Some(error)) => Err(error),
+        (Ok(()), None) => Ok(()),
     }
 }
 

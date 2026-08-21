@@ -101,7 +101,7 @@ pub(crate) fn validate_memory_backing(
 
 fn validate_compile_target_name(platform: &'static str) -> Result<(), DurabilitySupportError> {
     match platform {
-        "linux" | "macos" => Ok(()),
+        "linux" | "macos" | "windows" => Ok(()),
         _ => Err(DurabilitySupportError::UnsupportedPlatform { platform }),
     }
 }
@@ -120,6 +120,40 @@ fn unavailable(
         path: Some(path.to_path_buf()),
         source,
     }
+}
+
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
+pub(crate) fn preflight_windows_file_content(
+    directory: &Path,
+) -> Result<(), DurabilitySupportError> {
+    #[cfg(test)]
+    if let Some(source) = injected_preflight_failure(DurabilityCapability::FileContent, directory) {
+        return Err(unavailable(
+            DurabilityCapability::FileContent,
+            directory,
+            source,
+        ));
+    }
+    windows::preflight_file_content(directory)
+        .map_err(|source| unavailable(DurabilityCapability::FileContent, directory, source))
+}
+
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
+pub(crate) fn preflight_windows_namespace(directory: &Path) -> Result<(), DurabilitySupportError> {
+    #[cfg(test)]
+    if let Some(source) =
+        injected_preflight_failure(DurabilityCapability::DirectoryEntry, directory)
+    {
+        return Err(unavailable(
+            DurabilityCapability::DirectoryEntry,
+            directory,
+            source,
+        ));
+    }
+    windows::preflight_namespace(directory)
+        .map_err(|source| unavailable(DurabilityCapability::DirectoryEntry, directory, source))
 }
 
 #[cfg(test)]
@@ -217,19 +251,28 @@ fn injected_preflight_failure(operation: DurabilityCapability, path: &Path) -> O
 }
 
 pub(crate) fn preflight_directory(path: &Path) -> Result<(), DurabilitySupportError> {
-    #[cfg(test)]
-    if let Some(source) = injected_preflight_failure(DurabilityCapability::DirectoryEntry, path) {
-        return Err(unavailable(
-            DurabilityCapability::DirectoryEntry,
-            path,
-            source,
-        ));
+    #[cfg(target_os = "windows")]
+    {
+        preflight_windows_file_content(path)?;
+        preflight_windows_namespace(path)
     }
-    let directory = File::open(path)
-        .map_err(|source| unavailable(DurabilityCapability::DirectoryEntry, path, source))?;
-    directory
-        .sync_all()
-        .map_err(|source| unavailable(DurabilityCapability::DirectoryEntry, path, source))
+    #[cfg(not(target_os = "windows"))]
+    {
+        #[cfg(test)]
+        if let Some(source) = injected_preflight_failure(DurabilityCapability::DirectoryEntry, path)
+        {
+            return Err(unavailable(
+                DurabilityCapability::DirectoryEntry,
+                path,
+                source,
+            ));
+        }
+        let directory = File::open(path)
+            .map_err(|source| unavailable(DurabilityCapability::DirectoryEntry, path, source))?;
+        directory
+            .sync_all()
+            .map_err(|source| unavailable(DurabilityCapability::DirectoryEntry, path, source))
+    }
 }
 
 pub(crate) fn preflight_file(path: &Path) -> Result<(), DurabilitySupportError> {

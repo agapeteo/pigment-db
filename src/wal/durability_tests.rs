@@ -163,13 +163,14 @@ fn private_key_map_physical_memory_construction_routes_to_backing_rejection() {
 }
 
 #[test]
-fn unsupported_target_is_rejected_before_filesystem_work() {
+fn windows_is_supported_while_unknown_targets_are_rejected_before_filesystem_work() {
     let namespace = DurabilitySnapshot::new(None);
 
+    assert!(validate_compile_target_probe("windows").is_ok());
     assert!(matches!(
-        validate_compile_target_probe("windows"),
+        validate_compile_target_probe("unsupported-test-target"),
         Err(DurabilitySupportError::UnsupportedPlatform {
-            platform: "windows"
+            platform: "unsupported-test-target"
         })
     ));
     assert!(namespace.events().is_empty());
@@ -193,6 +194,48 @@ fn parent_directory_preflight_maps_every_open_failure_to_support_error() {
         }
         other => panic!("unexpected support error: {other:?}"),
     }
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn windows_preflight_maps_content_before_namespace_without_authority_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let content_fault = fail_preflight_for(
+        DurabilityCapability::FileContent,
+        directory.path().to_path_buf(),
+        std::io::ErrorKind::PermissionDenied,
+    );
+    let namespace_fault = fail_preflight_for(
+        DurabilityCapability::DirectoryEntry,
+        directory.path().to_path_buf(),
+        std::io::ErrorKind::CrossesDevices,
+    );
+
+    let content_error = preflight_directory(directory.path()).unwrap_err();
+    assert!(matches!(
+        content_error,
+        DurabilitySupportError::RequiredBarrierUnavailable {
+            operation: DurabilityCapability::FileContent,
+            ref path,
+            ref source,
+        } if path.as_deref() == Some(directory.path())
+            && source.kind() == std::io::ErrorKind::PermissionDenied
+    ));
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+
+    drop(content_fault);
+    let namespace_error = preflight_directory(directory.path()).unwrap_err();
+    assert!(matches!(
+        namespace_error,
+        DurabilitySupportError::RequiredBarrierUnavailable {
+            operation: DurabilityCapability::DirectoryEntry,
+            ref path,
+            ref source,
+        } if path.as_deref() == Some(directory.path())
+            && source.kind() == std::io::ErrorKind::CrossesDevices
+    ));
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    drop(namespace_fault);
 }
 
 #[test]
