@@ -1240,6 +1240,11 @@ fn fresh_header_publish_failure_leaves_active_absent() {
 
         assert_eq!(failure.operation, crate::RecoveryOperation::Publish);
         assert_eq!(failure.path, paths.active);
+        assert_eq!(failure.source.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            failure.source.to_string(),
+            "injected fresh-header publish failure"
+        );
         assert_eq!(
             failure.cleanup_path,
             inject_cleanup_failure.then(|| paths.staging.clone())

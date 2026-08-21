@@ -411,11 +411,12 @@ pub(crate) fn create_fresh_staging(
     Ok(handle)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct FreshPublicationFailure {
     pub(crate) operation: RecoveryOperation,
     pub(crate) path: PathBuf,
     pub(crate) cleanup_path: Option<PathBuf>,
+    pub(crate) source: io::Error,
 }
 
 pub(crate) fn write_fresh_header_prefix(
@@ -425,11 +426,18 @@ pub(crate) fn write_fresh_header_prefix(
     registry: &mut FreshCleanupRegistry,
 ) -> Result<std::fs::File, FreshPublicationFailure> {
     let written_len = written_len.min(header.len());
-    if staging.write_all(&header[..written_len]).is_err() || written_len != header.len() {
+    let write_result = staging.write_all(&header[..written_len]);
+    if write_result.is_err() || written_len != header.len() {
         drop(staging);
         return Err(fail_fresh_before_publish(
             RecoveryOperation::WriteStaging,
             registry,
+            write_result.err().unwrap_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "fresh header write was incomplete",
+                )
+            }),
         ));
     }
     Ok(staging)
@@ -440,11 +448,17 @@ pub(crate) fn flush_fresh_header(
     inject_failure: bool,
     registry: &mut FreshCleanupRegistry,
 ) -> Result<std::fs::File, FreshPublicationFailure> {
-    if inject_failure || staging.flush().is_err() {
+    let flush_result = if inject_failure {
+        Err(io::Error::other("injected fresh-header flush failure"))
+    } else {
+        staging.flush()
+    };
+    if let Err(source) = flush_result {
         drop(staging);
         return Err(fail_fresh_before_publish(
             RecoveryOperation::WriteStaging,
             registry,
+            source,
         ));
     }
     Ok(staging)
@@ -473,9 +487,24 @@ pub(crate) fn readback_fresh_header(
         {
             Ok((staging, bytes))
         }
-        Ok(_) | Err(_) => {
+        Ok(_) => {
             drop(staging);
-            Err(fail_fresh_before_publish(RecoveryOperation::Open, registry))
+            Err(fail_fresh_before_publish(
+                RecoveryOperation::Open,
+                registry,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fresh staging has an invalid header length",
+                ),
+            ))
+        }
+        Err(source) => {
+            drop(staging);
+            Err(fail_fresh_before_publish(
+                RecoveryOperation::Open,
+                registry,
+                source,
+            ))
         }
     }
 }
@@ -504,6 +533,10 @@ pub(crate) fn validate_fresh_header(
         Err(fail_fresh_before_publish(
             RecoveryOperation::WriteStaging,
             registry,
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "fresh staging header validation failed",
+            ),
         ))
     }
 }
@@ -513,11 +546,17 @@ pub(crate) fn sync_fresh_header(
     inject_failure: bool,
     registry: &mut FreshCleanupRegistry,
 ) -> Result<std::fs::File, FreshPublicationFailure> {
-    if inject_failure || staging.sync_all().is_err() {
+    let sync_result = if inject_failure {
+        Err(io::Error::other("injected fresh-header sync failure"))
+    } else {
+        staging.sync_all()
+    };
+    if let Err(source) = sync_result {
         drop(staging);
         Err(fail_fresh_before_publish(
             RecoveryOperation::WriteStaging,
             registry,
+            source,
         ))
     } else {
         Ok(staging)
@@ -557,11 +596,12 @@ fn prepare_fresh_append_at(
                     .ok_or_else(|| io::Error::other("unexpected append offset"))
             })
     };
-    if positioned.is_err() {
+    if let Err(source) = positioned {
         drop(staging);
         Err(fail_fresh_before_publish(
             RecoveryOperation::WriteStaging,
             registry,
+            source,
         ))
     } else {
         Ok(staging)
@@ -610,28 +650,43 @@ fn publish_fresh_header_with_policy(
     registry: &mut FreshCleanupRegistry,
     durability_policy: DurabilityPolicy,
 ) -> Result<PublishedFresh, FreshPublicationFailure> {
+    #[cfg(target_os = "windows")]
+    if durability_policy == DurabilityPolicy::Physical && !inject_failure {
+        drop(staging);
+        if let Err(source) = crate::durability::move_windows_namespace_write_through(
+            &paths.staging,
+            &paths.active,
+            crate::durability::NamespaceMoveMode::NoReplace,
+        ) {
+            return Err(fail_fresh_before_publish_at(
+                RecoveryOperation::Publish,
+                paths.active.clone(),
+                registry,
+                source,
+            ));
+        }
+        registry.commit_staging(&paths.staging);
+        let handle = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(&paths.active)
+            .map_err(|source| FreshPublicationFailure {
+                operation: RecoveryOperation::Open,
+                path: paths.active.clone(),
+                cleanup_path: None,
+                source,
+            })?;
+        return Ok(PublishedFresh { handle });
+    }
+
     let publish_result = if inject_failure {
         drop(staging);
         Err(io::Error::other("injected fresh-header publish failure"))
     } else {
         #[cfg(target_os = "windows")]
         {
-            if durability_policy == DurabilityPolicy::Physical {
-                drop(staging);
-                crate::durability::move_windows_namespace_write_through(
-                    &paths.staging,
-                    &paths.active,
-                    crate::durability::NamespaceMoveMode::NoReplace,
-                )
-                .and_then(|()| {
-                    OpenOptions::new()
-                        .read(true)
-                        .append(true)
-                        .open(&paths.active)
-                })
-            } else {
-                publish_fresh_buffered(staging, paths)
-            }
+            let _ = durability_policy;
+            publish_fresh_buffered(staging, paths)
         }
         #[cfg(not(target_os = "windows"))]
         {
@@ -641,10 +696,11 @@ fn publish_fresh_header_with_policy(
     };
 
     match publish_result {
-        Err(_) => Err(fail_fresh_before_publish_at(
+        Err(source) => Err(fail_fresh_before_publish_at(
             RecoveryOperation::Publish,
             paths.active.clone(),
             registry,
+            source,
         )),
         Ok(handle) => {
             registry.commit_staging(&paths.staging);
@@ -1070,15 +1126,6 @@ pub(crate) fn publish_repair_snapshot(
     paths: &ArtifactPaths,
     inject_failure: bool,
 ) -> Result<u64, RepairPublicationFailure> {
-    publish_repair_snapshot_with_policy(staging, paths, inject_failure, DurabilityPolicy::Buffered)
-}
-
-fn publish_repair_snapshot_with_policy(
-    staging: std::fs::File,
-    paths: &ArtifactPaths,
-    inject_failure: bool,
-    durability_policy: DurabilityPolicy,
-) -> Result<u64, RepairPublicationFailure> {
     let expected_len = staging
         .metadata()
         .map(|metadata| metadata.len())
@@ -1090,12 +1137,25 @@ fn publish_repair_snapshot_with_policy(
             path: paths.active.clone(),
         });
     }
-    publish_namespace_no_replace(&paths.staging, &paths.active, durability_policy).map_err(
-        |_| RepairPublicationFailure {
-            operation: RecoveryOperation::Publish,
-            path: paths.active.clone(),
-        },
-    )?;
+    fs::rename(&paths.staging, &paths.active).map_err(|_| RepairPublicationFailure {
+        operation: RecoveryOperation::Publish,
+        path: paths.active.clone(),
+    })?;
+    Ok(expected_len)
+}
+
+fn publish_repair_snapshot_with_policy(
+    staging: std::fs::File,
+    paths: &ArtifactPaths,
+    durability_policy: DurabilityPolicy,
+) -> Result<u64, RecoveryError> {
+    let expected_len = staging
+        .metadata()
+        .map(|metadata| metadata.len())
+        .map_err(|source| io_failure(RecoveryOperation::Publish, &paths.staging, source))?;
+    drop(staging);
+    publish_namespace_no_replace(&paths.staging, &paths.active, durability_policy)
+        .map_err(|source| io_failure(RecoveryOperation::Publish, &paths.active, source))?;
     Ok(expected_len)
 }
 
@@ -1276,9 +1336,7 @@ pub(crate) fn publish_validated_repair_with_policy(
         }
     }
 
-    let expected_len =
-        publish_repair_snapshot_with_policy(staging, paths, false, durability_policy)
-            .map_err(repair_publication_error)?;
+    let expected_len = publish_repair_snapshot_with_policy(staging, paths, durability_policy)?;
     synchronize_published_namespace(parent, durability_policy)
         .map_err(|source| io_failure(RecoveryOperation::Publish, parent, source))?;
     let validated =
@@ -1331,10 +1389,11 @@ fn repair_publication_error(failure: RepairPublicationFailure) -> RecoveryError 
 fn fresh_publication_error(failure: FreshPublicationFailure) -> RecoveryError {
     let source = match failure.cleanup_path {
         Some(cleanup_path) => io::Error::other(format!(
-            "fresh publication failed; cleanup also failed for {}",
-            cleanup_path.display()
+            "fresh publication failed ({}); cleanup also failed for {}",
+            failure.source,
+            cleanup_path.display(),
         )),
-        None => io::Error::other("fresh publication failed"),
+        None => failure.source,
     };
     io_failure(failure.operation, &failure.path, source)
 }
@@ -1342,19 +1401,21 @@ fn fresh_publication_error(failure: FreshPublicationFailure) -> RecoveryError {
 fn fail_fresh_before_publish(
     operation: RecoveryOperation,
     registry: &mut FreshCleanupRegistry,
+    source: io::Error,
 ) -> FreshPublicationFailure {
     let path = registry
         .registered()
         .first()
         .cloned()
         .expect("pre-publication failure requires registered staging");
-    fail_fresh_before_publish_at(operation, path, registry)
+    fail_fresh_before_publish_at(operation, path, registry, source)
 }
 
 fn fail_fresh_before_publish_at(
     operation: RecoveryOperation,
     path: PathBuf,
     registry: &mut FreshCleanupRegistry,
+    source: io::Error,
 ) -> FreshPublicationFailure {
     let cleanup_path = match registry.cleanup() {
         Ok(()) => None,
@@ -1365,6 +1426,7 @@ fn fail_fresh_before_publish_at(
         operation,
         path,
         cleanup_path,
+        source,
     }
 }
 

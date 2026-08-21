@@ -228,3 +228,32 @@ fn physical_online_cutover_closes_moves_reopens_and_installs_before_writes_resum
         );
     }
 }
+
+#[test]
+fn physical_rotation_conflict_preserves_original_os_error_and_writable_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    let options = DurableStoreOptions::default()
+        .with_durability_policy(DurabilityPolicy::Physical)
+        .with_wal_segment_size(WalSegmentSize::try_from(170_u64).unwrap());
+    let store = DurableKeyValueStore::try_init_new_with_options(directory.path(), options)
+        .unwrap()
+        .into_store();
+    store.put(b"first".to_vec(), vec![1; 100]);
+    let sealed = directory
+        .path()
+        .join("kv.wal.dat.segment-00000000000000000000");
+    std::fs::write(&sealed, b"conflicting destination").unwrap();
+
+    let error = store
+        .try_put(b"blocked".to_vec(), vec![2; 100])
+        .expect_err("no-replace rotation must reject an existing destination");
+
+    assert_eq!(error.raw_os_error(), Some(183));
+    assert_eq!(store.get(b"first"), Some(vec![1; 100]));
+    assert_eq!(store.get(b"blocked"), None);
+    assert!(!directory.path().join(".kv.wal.dat.next").exists());
+    std::fs::remove_file(sealed).unwrap();
+    store
+        .try_put(b"after-failure".to_vec(), b"accepted".to_vec())
+        .expect("recoverable publication conflict must leave the old writer usable");
+}

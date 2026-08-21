@@ -871,6 +871,13 @@ fn rotate_file_segment(
     if let Err(seal_error) =
         publish_rotation_move(&rotation.active_path, &sealed_path, durability_policy)
     {
+        if let Err(cleanup_error) = std::fs::remove_file(&staging_path) {
+            log::warn!(
+                "failed to remove unpublished rotation staging {} after seal failure: {}",
+                staging_path.display(),
+                cleanup_error
+            );
+        }
         return match OpenOptions::new().append(true).open(&rotation.active_path) {
             Ok(reopened) => {
                 *writer = Some(reopened);
@@ -890,18 +897,27 @@ fn rotate_file_segment(
         let restore_result =
             publish_rotation_move(&sealed_path, &rotation.active_path, durability_policy);
         return match restore_result {
-            Ok(()) => match OpenOptions::new().append(true).open(&rotation.active_path) {
-                Ok(reopened) => {
-                    *writer = Some(reopened);
-                    Err(publish_error)
+            Ok(()) => {
+                if let Err(cleanup_error) = std::fs::remove_file(&staging_path) {
+                    log::warn!(
+                        "failed to remove unpublished rotation staging {} after active restoration: {}",
+                        staging_path.display(),
+                        cleanup_error
+                    );
                 }
-                Err(reopen_error) => {
-                    rotation.failed_closed = true;
-                    Err(std::io::Error::other(format!(
-                        "V2 rotation publication failed ({publish_error}); restored active reopen failed ({reopen_error})"
-                    )))
+                match OpenOptions::new().append(true).open(&rotation.active_path) {
+                    Ok(reopened) => {
+                        *writer = Some(reopened);
+                        Err(publish_error)
+                    }
+                    Err(reopen_error) => {
+                        rotation.failed_closed = true;
+                        Err(std::io::Error::other(format!(
+                            "V2 rotation publication failed ({publish_error}); restored active reopen failed ({reopen_error})"
+                        )))
+                    }
                 }
-            },
+            }
             Err(restore_error) => {
                 rotation.failed_closed = true;
                 Err(std::io::Error::other(format!(
