@@ -144,11 +144,13 @@ pub(crate) fn cleanup_closed_with_checkpoint(
         return Ok(crate::CleanupStatus::Pending);
     }
     if manifest.durability == DurabilityPolicy::Physical
-        && prepared
-            .paths
-            .previous
-            .parent()
-            .is_none_or(|parent| crate::durability::synchronize_directory(parent).is_err())
+        && prepared.paths.previous.parent().is_none_or(|_| {
+            crate::durability::synchronize_namespace_after_move(
+                &prepared.paths.previous,
+                manifest.durability,
+            )
+            .is_err()
+        })
     {
         return Ok(crate::CleanupStatus::Pending);
     }
@@ -158,11 +160,13 @@ pub(crate) fn cleanup_closed_with_checkpoint(
         return Ok(crate::CleanupStatus::Pending);
     }
     if manifest.durability == DurabilityPolicy::Physical
-        && prepared
-            .paths
-            .manifest
-            .parent()
-            .is_none_or(|parent| crate::durability::synchronize_directory(parent).is_err())
+        && prepared.paths.manifest.parent().is_none_or(|_| {
+            crate::durability::synchronize_namespace_after_move(
+                &prepared.paths.manifest,
+                manifest.durability,
+            )
+            .is_err()
+        })
     {
         return Ok(crate::CleanupStatus::Pending);
     }
@@ -200,12 +204,16 @@ pub(crate) fn publish_closed_replacement_with_checkpoint(
             });
         }
     }
-    fs::rename(&prepared.paths.staging, &prepared.capture.source_dir).map_err(|source| {
-        CompactionError::Io {
-            operation: CompactionOperation::PublishReplacement,
-            path: prepared.capture.source_dir.clone(),
-            source,
-        }
+    crate::durability::move_namespace(
+        &prepared.paths.staging,
+        &prepared.capture.source_dir,
+        manifest.durability,
+        crate::durability::NamespaceMoveMode::NoReplace,
+    )
+    .map_err(|source| CompactionError::Io {
+        operation: CompactionOperation::PublishReplacement,
+        path: prepared.capture.source_dir.clone(),
+        source,
     })?;
     synchronize_publication_parent(
         &prepared.capture.source_dir,
@@ -304,12 +312,16 @@ pub(crate) fn publish_closed_previous_with_checkpoint(
             });
         }
     }
-    fs::rename(&prepared.capture.source_dir, &prepared.paths.previous).map_err(|source| {
-        CompactionError::Io {
-            operation: CompactionOperation::PublishPrevious,
-            path: prepared.paths.previous.clone(),
-            source,
-        }
+    crate::durability::move_namespace(
+        &prepared.capture.source_dir,
+        &prepared.paths.previous,
+        manifest.durability,
+        crate::durability::NamespaceMoveMode::NoReplace,
+    )
+    .map_err(|source| CompactionError::Io {
+        operation: CompactionOperation::PublishPrevious,
+        path: prepared.paths.previous.clone(),
+        source,
     })?;
     synchronize_publication_parent(
         &prepared.paths.previous,
@@ -690,16 +702,15 @@ fn publish_manifest_with_checkpoint(
         crate::test_support::fault_checkpoint::MaintenanceCut::ManifestSync,
     );
     drop(temporary);
-    fs::rename(&paths.manifest_next, &paths.manifest)?;
-    if durability == DurabilityPolicy::Physical {
-        let parent = paths.manifest.parent().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "compaction manifest has no parent directory",
-            )
-        })?;
-        crate::durability::synchronize_directory(parent)?;
-    }
+    let mode = match fs::symlink_metadata(&paths.manifest) {
+        Ok(_) => crate::durability::NamespaceMoveMode::ReplaceExisting,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            crate::durability::NamespaceMoveMode::NoReplace
+        }
+        Err(error) => return Err(error),
+    };
+    crate::durability::move_namespace(&paths.manifest_next, &paths.manifest, durability, mode)?;
+    crate::durability::synchronize_namespace_after_move(&paths.manifest, durability)?;
     checkpoint(ManifestPublishStage::Renamed)?;
     #[cfg(test)]
     exit_at_manifest_fault(
@@ -725,10 +736,12 @@ fn synchronize_publication_parent(
             "published artifact has no parent directory",
         ),
     })?;
-    crate::durability::synchronize_directory(parent).map_err(|source| CompactionError::Io {
-        operation,
-        path: parent.to_path_buf(),
-        source,
+    crate::durability::synchronize_namespace_parent(parent, durability).map_err(|source| {
+        CompactionError::Io {
+            operation,
+            path: parent.to_path_buf(),
+            source,
+        }
     })
 }
 

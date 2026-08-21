@@ -945,7 +945,7 @@ fn publish_rotation_move(
         return crate::durability::move_windows_namespace_write_through(
             source,
             destination,
-            crate::durability::WindowsNamespaceMoveMode::NoReplace,
+            crate::durability::NamespaceMoveMode::NoReplace,
         );
     }
     let _ = durability_policy;

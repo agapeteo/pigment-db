@@ -6,6 +6,7 @@ use pigment_db::key_map_store::DurableKeyMapStore;
 use pigment_db::key_set_store::DurableKeySetStore;
 use pigment_db::key_value_store::DurableKeyValueStore;
 use pigment_db::model::SearchKey;
+use pigment_db::{compact_directory_in_place, CleanupStatus, ClosedCompactionOptions};
 use pigment_db::{DurabilityPolicy, DurableStoreOptions, RecoveryStatus, WalSegmentSize};
 
 #[test]
@@ -162,4 +163,34 @@ fn physical_recovery_promotes_complete_rotation_staging_write_through() {
     assert_eq!(reopened.store().get(b"second"), Some(b"two".to_vec()));
     assert!(active.is_file());
     assert!(!staging.exists());
+}
+
+#[test]
+fn physical_closed_compaction_publishes_manifest_previous_and_replacement_write_through() {
+    let directory = tempfile::tempdir().unwrap();
+    let options = DurableStoreOptions::default()
+        .with_durability_policy(DurabilityPolicy::Physical)
+        .with_wal_segment_size(WalSegmentSize::try_from(170_u64).unwrap());
+    let store = DurableKeyValueStore::try_init_new_with_options(directory.path(), options)
+        .unwrap()
+        .into_store();
+    store.put(b"first".to_vec(), vec![1; 100]);
+    store.put(b"second".to_vec(), vec![2; 100]);
+    drop(store);
+
+    let outcome = compact_directory_in_place(
+        directory.path(),
+        ClosedCompactionOptions::default().with_durability_policy(DurabilityPolicy::Physical),
+    )
+    .expect("physical compaction must durably publish each authority phase");
+
+    assert_eq!(outcome.families().len(), 1);
+    assert_eq!(outcome.families()[0].cleanup(), CleanupStatus::Complete);
+    assert_only_active(directory.path(), "kv.wal.dat");
+    for _ in 0..3 {
+        let reopened =
+            DurableKeyValueStore::try_init_new_with_options(directory.path(), options).unwrap();
+        assert_eq!(reopened.store().get(b"first"), Some(vec![1; 100]));
+        assert_eq!(reopened.store().get(b"second"), Some(vec![2; 100]));
+    }
 }

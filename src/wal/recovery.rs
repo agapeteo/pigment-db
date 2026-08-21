@@ -621,7 +621,7 @@ fn publish_fresh_header_with_policy(
                 crate::durability::move_windows_namespace_write_through(
                     &paths.staging,
                     &paths.active,
-                    crate::durability::WindowsNamespaceMoveMode::NoReplace,
+                    crate::durability::NamespaceMoveMode::NoReplace,
                 )
                 .and_then(|()| {
                     OpenOptions::new()
@@ -1386,7 +1386,7 @@ fn publish_namespace_no_replace(
         return crate::durability::move_windows_namespace_write_through(
             source,
             destination,
-            crate::durability::WindowsNamespaceMoveMode::NoReplace,
+            crate::durability::NamespaceMoveMode::NoReplace,
         );
     }
     let _ = durability_policy;
@@ -1403,7 +1403,7 @@ fn publish_namespace_replace_existing(
         return crate::durability::move_windows_namespace_write_through(
             source,
             destination,
-            crate::durability::WindowsNamespaceMoveMode::ReplaceExisting,
+            crate::durability::NamespaceMoveMode::ReplaceExisting,
         );
     }
     let _ = durability_policy;

@@ -1296,26 +1296,31 @@ fn write_staging_families(
         });
     }
     if durability == DurabilityPolicy::Physical {
-        crate::durability::synchronize_directory(&paths.staging).map_err(|source| {
-            CompactionError::Io {
+        #[cfg(not(target_os = "windows"))]
+        {
+            crate::durability::synchronize_directory(&paths.staging).map_err(|source| {
+                CompactionError::Io {
+                    operation: CompactionOperation::WriteStaging,
+                    path: paths.staging.clone(),
+                    source,
+                }
+            })?;
+            let parent = paths.staging.parent().ok_or_else(|| CompactionError::Io {
                 operation: CompactionOperation::WriteStaging,
                 path: paths.staging.clone(),
-                source,
-            }
-        })?;
-        let parent = paths.staging.parent().ok_or_else(|| CompactionError::Io {
-            operation: CompactionOperation::WriteStaging,
-            path: paths.staging.clone(),
-            source: io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "staging directory has no parent",
-            ),
-        })?;
-        crate::durability::synchronize_directory(parent).map_err(|source| CompactionError::Io {
-            operation: CompactionOperation::WriteStaging,
-            path: parent.to_path_buf(),
-            source,
-        })?;
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "staging directory has no parent",
+                ),
+            })?;
+            crate::durability::synchronize_directory(parent).map_err(|source| {
+                CompactionError::Io {
+                    operation: CompactionOperation::WriteStaging,
+                    path: parent.to_path_buf(),
+                    source,
+                }
+            })?;
+        }
     }
     Ok(inventory)
 }

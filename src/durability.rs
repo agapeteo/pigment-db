@@ -156,10 +156,8 @@ pub(crate) fn preflight_windows_namespace(directory: &Path) -> Result<(), Durabi
         .map_err(|source| unavailable(DurabilityCapability::DirectoryEntry, directory, source))
 }
 
-#[cfg(target_os = "windows")]
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum WindowsNamespaceMoveMode {
+pub(crate) enum NamespaceMoveMode {
     NoReplace,
     ReplaceExisting,
 }
@@ -168,13 +166,61 @@ pub(crate) enum WindowsNamespaceMoveMode {
 pub(crate) fn move_windows_namespace_write_through(
     source: &Path,
     destination: &Path,
-    mode: WindowsNamespaceMoveMode,
+    mode: NamespaceMoveMode,
 ) -> io::Result<()> {
     let mode = match mode {
-        WindowsNamespaceMoveMode::NoReplace => windows::NamespaceMoveMode::NoReplace,
-        WindowsNamespaceMoveMode::ReplaceExisting => windows::NamespaceMoveMode::ReplaceExisting,
+        NamespaceMoveMode::NoReplace => windows::NamespaceMoveMode::NoReplace,
+        NamespaceMoveMode::ReplaceExisting => windows::NamespaceMoveMode::ReplaceExisting,
     };
     windows::move_file_write_through(source, destination, mode)
+}
+
+pub(crate) fn move_namespace(
+    source: &Path,
+    destination: &Path,
+    durability: DurabilityPolicy,
+    mode: NamespaceMoveMode,
+) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    if durability == DurabilityPolicy::Physical {
+        return move_windows_namespace_write_through(source, destination, mode);
+    }
+    let _ = (durability, mode);
+    std::fs::rename(source, destination)
+}
+
+pub(crate) fn synchronize_namespace_after_move(
+    published: &Path,
+    durability: DurabilityPolicy,
+) -> io::Result<()> {
+    if durability != DurabilityPolicy::Physical {
+        return Ok(());
+    }
+    let parent = published.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "published artifact has no parent directory",
+        )
+    })?;
+    synchronize_namespace_parent(parent, durability)
+}
+
+pub(crate) fn synchronize_namespace_parent(
+    parent: &Path,
+    durability: DurabilityPolicy,
+) -> io::Result<()> {
+    if durability != DurabilityPolicy::Physical {
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = parent;
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        synchronize_directory(parent)
+    }
 }
 
 #[cfg(test)]
