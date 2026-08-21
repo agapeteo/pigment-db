@@ -10,6 +10,7 @@ use std::io;
 use std::io::{Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
+use std::path::{Component, Prefix};
 use std::sync::atomic::{AtomicU64, Ordering};
 use windows_sys::core::PCWSTR;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -31,6 +32,27 @@ impl TryFrom<&Path> for WidePath {
                 io::ErrorKind::InvalidInput,
                 "Windows paths passed to native durability operations cannot contain NUL",
             ));
+        }
+        if units.len() + 1 >= 260 && path.is_absolute() {
+            match path.components().next() {
+                Some(Component::Prefix(prefix)) => match prefix.kind() {
+                    Prefix::Disk(_) => {
+                        let mut verbatim = r"\\?\".encode_utf16().collect::<Vec<_>>();
+                        verbatim.extend_from_slice(&units);
+                        units = verbatim;
+                    }
+                    Prefix::UNC(_, _) => {
+                        let mut verbatim = r"\\?\UNC\".encode_utf16().collect::<Vec<_>>();
+                        verbatim.extend_from_slice(&units[2..]);
+                        units = verbatim;
+                    }
+                    Prefix::Verbatim(_)
+                    | Prefix::VerbatimUNC(_, _)
+                    | Prefix::VerbatimDisk(_)
+                    | Prefix::DeviceNS(_) => {}
+                },
+                _ => {}
+            }
         }
         units.push(0);
         Ok(Self { units })
@@ -249,6 +271,20 @@ mod tests {
     }
 
     #[test]
+    fn long_absolute_drive_paths_gain_the_required_verbatim_prefix() {
+        let path = PathBuf::from(format!(r"C:\pigment\{}\database", "a".repeat(300)));
+        let expected = format!(r"\\?\C:\pigment\{}\database", "a".repeat(300));
+
+        let encoded = WidePath::try_from(path.as_path()).unwrap();
+        let expected = OsString::from(expected)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+
+        assert_eq!(encoded.units(), expected);
+    }
+
+    #[test]
     fn native_pointer_is_owned_stable_and_exactly_nul_terminated() {
         let encoded = WidePath::try_from(Path::new(r"C:\pigment\database")).unwrap();
         let pointer = encoded.as_pcwstr();
@@ -335,5 +371,28 @@ mod tests {
             std::fs::read(&conflict_destination).unwrap(),
             b"replacement"
         );
+    }
+
+    #[test]
+    fn non_delete_sharing_handle_conflict_has_no_rename_fallback() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("held-source");
+        let destination = directory.path().join("held-destination");
+        std::fs::write(&source, b"authoritative").unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&source)
+            .unwrap();
+
+        let error = move_file_write_through(&source, &destination, NamespaceMoveMode::NoReplace)
+            .unwrap_err();
+
+        assert_eq!(error.raw_os_error(), Some(32));
+        assert_eq!(std::fs::read(&source).unwrap(), b"authoritative");
+        assert!(!destination.exists());
+        drop(held);
     }
 }
