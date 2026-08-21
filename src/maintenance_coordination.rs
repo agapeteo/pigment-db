@@ -118,6 +118,69 @@ impl<W: Write> Drop for OnlineAttemptGuard<'_, W> {
     }
 }
 
+pub(crate) struct StagingGenerationGuard {
+    paths: crate::compaction::publication::MaintenanceArtifactPaths,
+    operation_id: [u8; 16],
+    durability: crate::DurabilityPolicy,
+    owns_staging: bool,
+}
+
+impl StagingGenerationGuard {
+    pub(crate) fn new(
+        paths: crate::compaction::publication::MaintenanceArtifactPaths,
+        operation_id: [u8; 16],
+        durability: crate::DurabilityPolicy,
+    ) -> Self {
+        Self {
+            paths,
+            operation_id,
+            durability,
+            owns_staging: false,
+        }
+    }
+
+    pub(crate) fn mark_staging_owned(&mut self) {
+        self.owns_staging = true;
+    }
+}
+
+impl Drop for StagingGenerationGuard {
+    fn drop(&mut self) {
+        let owned_manifest = matches!(
+            crate::compaction::publication::read_published_manifest(&self.paths),
+            Ok(Some(manifest))
+                if manifest.operation_id == self.operation_id
+                    && manifest.mode == crate::compaction::manifest::ManifestMode::OnlineFamily
+                    && manifest.phase == crate::compaction::manifest::ManifestPhase::Prepared
+                    && !manifest.source_finalized
+        );
+        if !owned_manifest {
+            return;
+        }
+        if self.owns_staging {
+            match std::fs::symlink_metadata(&self.paths.staging) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    if std::fs::remove_file(&self.paths.staging).is_err() {
+                        return;
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                _ => return,
+            }
+        }
+        match std::fs::remove_file(&self.paths.manifest) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => return,
+        }
+        if self.durability == crate::DurabilityPolicy::Physical {
+            if let Some(parent) = self.paths.manifest.parent() {
+                let _ = crate::durability::synchronize_directory(parent);
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct OwnershipState {
     open_leases: usize,

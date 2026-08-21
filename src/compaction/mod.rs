@@ -46,6 +46,7 @@ pub(crate) struct ValidatedOnlineStaging<'a, W: Write> {
     pub(crate) prepared: PreparedOnlineCapture<'a, W>,
     pub(crate) staging: CapturedFamily,
     pub(crate) replacement_inventory: Vec<ArtifactDescriptor>,
+    pub(crate) generation_guard: crate::maintenance_coordination::StagingGenerationGuard,
 }
 
 #[allow(dead_code)]
@@ -74,20 +75,42 @@ pub(crate) struct CompletedOnlineCutover {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OnlineStagingStage {
     Encoding,
+    Create,
+    Write,
+    Synchronize,
     Validation,
+    Reopen,
 }
 
 pub(crate) fn prepare_online_staging<'a, W: Write>(
     prepared: PreparedOnlineCapture<'a, W>,
-    mut checkpoint: impl FnMut(OnlineStagingStage),
+    mut checkpoint: impl FnMut(OnlineStagingStage) -> io::Result<()>,
 ) -> Result<ValidatedOnlineStaging<'a, W>, CompactionError> {
-    checkpoint(OnlineStagingStage::Encoding);
+    let mut generation_guard = crate::maintenance_coordination::StagingGenerationGuard::new(
+        prepared.paths.clone(),
+        prepared.manifest.operation_id,
+        prepared.manifest.durability,
+    );
+    let checkpoint_error = |stage, source| CompactionError::Io {
+        operation: match stage {
+            OnlineStagingStage::Validation | OnlineStagingStage::Reopen => {
+                CompactionOperation::ValidateStaging
+            }
+            _ => CompactionOperation::WriteStaging,
+        },
+        path: prepared.paths.staging.clone(),
+        source,
+    };
+    checkpoint(OnlineStagingStage::Encoding)
+        .map_err(|source| checkpoint_error(OnlineStagingStage::Encoding, source))?;
     let encoded =
         encode_captured_family(&prepared.capture).map_err(|source| CompactionError::Io {
             operation: CompactionOperation::WriteStaging,
             path: prepared.paths.staging.clone(),
             source,
         })?;
+    checkpoint(OnlineStagingStage::Create)
+        .map_err(|source| checkpoint_error(OnlineStagingStage::Create, source))?;
     let mut staging_file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -97,21 +120,28 @@ pub(crate) fn prepare_online_staging<'a, W: Write>(
             path: prepared.paths.staging.clone(),
             source,
         })?;
+    generation_guard.mark_staging_owned();
+    checkpoint(OnlineStagingStage::Write)
+        .map_err(|source| checkpoint_error(OnlineStagingStage::Write, source))?;
     staging_file
         .write_all(&encoded)
         .and_then(|()| staging_file.flush())
-        .and_then(|()| {
-            if prepared.manifest.durability == DurabilityPolicy::Physical {
-                staging_file.sync_all()
-            } else {
-                Ok(())
-            }
-        })
         .map_err(|source| CompactionError::Io {
             operation: CompactionOperation::WriteStaging,
             path: prepared.paths.staging.clone(),
             source,
         })?;
+    checkpoint(OnlineStagingStage::Synchronize)
+        .map_err(|source| checkpoint_error(OnlineStagingStage::Synchronize, source))?;
+    if prepared.manifest.durability == DurabilityPolicy::Physical {
+        staging_file
+            .sync_all()
+            .map_err(|source| CompactionError::Io {
+                operation: CompactionOperation::WriteStaging,
+                path: prepared.paths.staging.clone(),
+                source,
+            })?;
+    }
     drop(staging_file);
     let staging_name = prepared
         .paths
@@ -136,7 +166,8 @@ pub(crate) fn prepare_online_staging<'a, W: Write>(
         checksum: crc32fast::hash(&encoded),
     }];
 
-    checkpoint(OnlineStagingStage::Validation);
+    checkpoint(OnlineStagingStage::Validation)
+        .map_err(|source| checkpoint_error(OnlineStagingStage::Validation, source))?;
     let anchor = prepared
         .paths
         .staging
@@ -154,6 +185,8 @@ pub(crate) fn prepare_online_staging<'a, W: Write>(
             path: prepared.paths.staging.clone(),
         }
     })?;
+    checkpoint(OnlineStagingStage::Reopen)
+        .map_err(|source| checkpoint_error(OnlineStagingStage::Reopen, source))?;
     let staging =
         capture_validated_online_staging(&prepared.paths.staging, prepared.capture.family)?;
     compare_captured_families(
@@ -164,6 +197,7 @@ pub(crate) fn prepare_online_staging<'a, W: Write>(
         prepared,
         staging,
         replacement_inventory,
+        generation_guard,
     })
 }
 

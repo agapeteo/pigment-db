@@ -508,10 +508,16 @@ fn staging_encode_and_validation_run_without_exclusive_maintenance() {
             .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
             .unwrap();
         let staged = super::prepare_online_staging(capture, |stage| {
-            observer.checkpoint(match stage {
-                super::OnlineStagingStage::Encoding => MaintenanceCheckpoint::StagingEncode,
-                super::OnlineStagingStage::Validation => MaintenanceCheckpoint::StagingValidation,
-            });
+            match stage {
+                super::OnlineStagingStage::Encoding => {
+                    observer.checkpoint(MaintenanceCheckpoint::StagingEncode)
+                }
+                super::OnlineStagingStage::Validation => {
+                    observer.checkpoint(MaintenanceCheckpoint::StagingValidation)
+                }
+                _ => {}
+            }
+            Ok(())
         })
         .unwrap();
         staged_tx
@@ -570,7 +576,7 @@ fn single_action_delta_replays_once_in_wal_acceptance_order() {
     let capture = store
         .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
         .unwrap();
-    let staged = super::prepare_online_staging(capture, |_| {}).unwrap();
+    let staged = super::prepare_online_staging(capture, |_| Ok(())).unwrap();
     let initial_staging_bytes = staged.replacement_inventory[0].length;
 
     store.put(b"same".to_vec(), b"first".to_vec());
@@ -626,7 +632,7 @@ fn compute_delta_groups_remain_atomic_and_preserve_accepted_timestamps() {
     let capture = store
         .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
         .unwrap();
-    let staged = super::prepare_online_staging(capture, |_| {}).unwrap();
+    let staged = super::prepare_online_staging(capture, |_| Ok(())).unwrap();
 
     ONLINE_TEST_CLOCK.store(200, Ordering::SeqCst);
     store.append(b"group".to_vec(), b"ordinary-before".to_vec());
@@ -678,9 +684,10 @@ fn cutover_rejects_exact_live_mismatch_before_namespace_publication() {
     let capture = store
         .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
         .unwrap();
-    let staged = super::prepare_online_staging(capture, |_| {}).unwrap();
+    let staged = super::prepare_online_staging(capture, |_| Ok(())).unwrap();
     let paths = staged.prepared.paths.clone();
     let initial_manifest = staged.prepared.manifest.clone();
+    assert!(!initial_manifest.source_finalized);
 
     store.put(b"recorded".to_vec(), b"accepted".to_vec());
     store.inject_live_value_probe(b"unrecorded".to_vec(), b"must-reject".to_vec());
@@ -690,14 +697,9 @@ fn cutover_rejects_exact_live_mismatch_before_namespace_publication() {
 
     assert_eq!(std::fs::read(&active).unwrap(), active_before_cutover);
     assert!(!paths.previous.exists());
-    assert!(paths.staging.is_file());
-    assert_eq!(
-        crate::compaction::publication::read_published_manifest(&paths)
-            .unwrap()
-            .unwrap(),
-        initial_manifest
-    );
-    assert!(!initial_manifest.source_finalized);
+    assert!(!paths.staging.exists());
+    assert!(!paths.manifest.exists());
+    assert!(!paths.manifest_next.exists());
     assert!(!store.has_delta_recorder_probe());
 }
 
@@ -741,7 +743,7 @@ fn bounded_delta_zero_exact_and_one_group_over_preserve_original_authority() {
         let capture = store
             .begin_online_capture_probe(case.limit, MaintenanceObserver::default())
             .unwrap();
-        let staged = super::prepare_online_staging(capture, |_| {}).unwrap();
+        let staged = super::prepare_online_staging(capture, |_| Ok(())).unwrap();
         let paths = staged.prepared.paths.clone();
 
         if case.mutations >= 1 {
@@ -827,7 +829,7 @@ fn successful_cutover_installs_fresh_writer_and_rotates_only_replacement() {
     let capture = store
         .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
         .unwrap();
-    let staged = super::prepare_online_staging(capture, |_| {}).unwrap();
+    let staged = super::prepare_online_staging(capture, |_| Ok(())).unwrap();
     let completed = store.complete_online_cutover_probe(staged).unwrap();
     assert_eq!(completed.replayed, 0);
     assert_eq!(
@@ -912,6 +914,7 @@ fn paused_first_attempt_keeps_progress_and_losing_second_call_artifact_free() {
             if stage == super::OnlineStagingStage::Encoding {
                 observer.checkpoint(MaintenanceCheckpoint::StagingEncode);
             }
+            Ok(())
         })
         .unwrap();
         drop_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -954,6 +957,96 @@ fn paused_first_attempt_keeps_progress_and_losing_second_call_artifact_free() {
     assert!(!store.has_delta_recorder_probe());
 }
 
+#[test]
+fn every_prepublication_staging_failure_cleans_only_owned_artifacts_and_restores_progress() {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Failure {
+        Create,
+        Write,
+        Synchronize,
+        Reopen,
+        Mismatch,
+        ExistingCollision,
+    }
+
+    for failure in [
+        Failure::Create,
+        Failure::Write,
+        Failure::Synchronize,
+        Failure::Reopen,
+        Failure::Mismatch,
+        Failure::ExistingCollision,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableKeyValueStore::try_init_new(directory.path())
+            .unwrap()
+            .into_store();
+        store.put(b"authority".to_vec(), b"old-writer".to_vec());
+        let active = directory.path().join("kv.wal.dat");
+        let authority_before = std::fs::read(&active).unwrap();
+        let capture = store
+            .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
+            .unwrap();
+        let paths = capture.paths.clone();
+        let granularity_nanos = capture.capture.granularity_nanos;
+        let last_bucket = capture.capture.last_bucket;
+        let collision = b"not-owned-by-this-attempt".to_vec();
+        if failure == Failure::ExistingCollision {
+            std::fs::write(&paths.staging, &collision).unwrap();
+        }
+        let staging_path = paths.staging.clone();
+        let result = super::prepare_online_staging(capture, move |stage| {
+            let injected = match failure {
+                Failure::Create => stage == super::OnlineStagingStage::Create,
+                Failure::Write => stage == super::OnlineStagingStage::Write,
+                Failure::Synchronize => stage == super::OnlineStagingStage::Synchronize,
+                Failure::Reopen => stage == super::OnlineStagingStage::Reopen,
+                Failure::Mismatch | Failure::ExistingCollision => false,
+            };
+            if injected {
+                return Err(std::io::Error::other(format!(
+                    "scripted {failure:?} failure"
+                )));
+            }
+            if failure == Failure::Mismatch && stage == super::OnlineStagingStage::Reopen {
+                let mismatch = std::collections::HashMap::from([(
+                    b"different".to_vec(),
+                    b"valid-current-state".to_vec(),
+                )]);
+                let encoded = crate::wal::replay::encode_current_key_value_snapshot_with_metadata(
+                    &mismatch,
+                    granularity_nanos,
+                    last_bucket,
+                )
+                .unwrap();
+                std::fs::write(&staging_path, encoded).unwrap();
+            }
+            Ok(())
+        });
+        assert!(result.is_err(), "{failure:?} unexpectedly succeeded");
+
+        assert_eq!(std::fs::read(&active).unwrap(), authority_before);
+        assert!(!paths.manifest.exists(), "{failure:?} manifest survived");
+        assert!(!paths.manifest_next.exists());
+        assert!(!paths.previous.exists());
+        if failure == Failure::ExistingCollision {
+            assert_eq!(std::fs::read(&paths.staging).unwrap(), collision);
+        } else {
+            assert!(!paths.staging.exists(), "{failure:?} staging survived");
+        }
+        assert!(!store.has_delta_recorder_probe());
+        let next_attempt = store.maintenance_probe().try_begin_online().unwrap();
+        drop(next_attempt);
+
+        store.put(b"after-failure".to_vec(), b"accepted".to_vec());
+        assert_eq!(
+            store.get(b"after-failure"),
+            Some(b"accepted".to_vec()),
+            "{failure:?} did not restore writer progress"
+        );
+    }
+}
+
 fn one_put_delta_encoded_len() -> u64 {
     let directory = tempfile::tempdir().unwrap();
     let store = DurableKeyValueStore::try_init_new(directory.path())
@@ -963,7 +1056,7 @@ fn one_put_delta_encoded_len() -> u64 {
     let capture = store
         .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
         .unwrap();
-    let staged = super::prepare_online_staging(capture, |_| {}).unwrap();
+    let staged = super::prepare_online_staging(capture, |_| Ok(())).unwrap();
     store.put(b"delta-a".to_vec(), b"value-a".to_vec());
     let exact = store.delta_used_bytes_probe();
     assert!(exact > 0);

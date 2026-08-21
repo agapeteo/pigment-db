@@ -231,8 +231,8 @@
 - [X] T129 [US3] Implement writer and rotation-state handoff after shared manifest publication in `src/wal/mod.rs`, `src/compaction/mod.rs`, and `src/compaction/publication.rs`, then run T128 GREEN
 - [X] T130 [US3] Write and run a runtime RED proving a paused first compaction permits reads/writes while a second same-instance private call fails immediately without artifacts or recorder replacement in `src/compaction/online_tests.rs`
 - [X] T131 [US3] Move attempt compare/exchange before artifact work and bind all recorder/artifact ownership to the winning token in `src/maintenance_coordination.rs` and `src/compaction/mod.rs`, then run T130 GREEN
-- [ ] T132 [US3] Write and run a runtime RED proving staging create/write/sync/reopen/mismatch failures leave the original writer authoritative and clear attempt/recorder state in `src/compaction/online_tests.rs`
-- [ ] T133 [US3] Implement pre-publication RAII cleanup for only invocation-owned staging in `src/maintenance_coordination.rs` and `src/compaction/mod.rs`, then run T132 GREEN
+- [X] T132 [US3] Write and run a runtime RED proving staging create/write/sync/reopen/mismatch failures leave the original writer authoritative and clear attempt/recorder state in `src/compaction/online_tests.rs`
+- [X] T133 [US3] Implement pre-publication RAII cleanup for only invocation-owned staging in `src/maintenance_coordination.rs` and `src/compaction/mod.rs`, then run T132 GREEN
 - [ ] T134 [US3] Write and run a runtime RED proving indeterminate namespace authority preserves readable live state/evidence and rejects every later mutation before I/O until reopen in `src/compaction/online_tests.rs`
 - [ ] T135 [US3] Extend internal WAL health for maintenance indeterminacy and replacement-reopen failure in `src/wal/mod.rs` and `src/compaction/mod.rs`, then run T134 GREEN
 - [ ] T136 [US3] Write and run a runtime RED proving post-publication cleanup failure reports pending while replacement stays readable/writable and cleanup converges on reopen or next explicit compaction in `src/compaction/online_tests.rs`
