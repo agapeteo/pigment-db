@@ -884,15 +884,13 @@ pub(crate) fn abandon_prepared_online(
             });
         }
     }
-    if manifest.durability == crate::DurabilityPolicy::Physical {
-        crate::durability::synchronize_directory(store_dir).map_err(|source| {
-            CompactionError::Io {
-                operation: CompactionOperation::Cleanup,
-                path: store_dir.to_path_buf(),
-                source,
-            }
-        })?;
-    }
+    crate::durability::synchronize_namespace_parent(store_dir, manifest.durability).map_err(
+        |source| CompactionError::Io {
+            operation: CompactionOperation::Cleanup,
+            path: store_dir.to_path_buf(),
+            source,
+        },
+    )?;
     Ok(())
 }
 
