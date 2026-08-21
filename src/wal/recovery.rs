@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::config::DurabilityPolicy;
+#[cfg(not(target_os = "windows"))]
+use crate::durability::synchronize_directory;
 use crate::durability::{
-    preflight_directory, preflight_file, preflight_file_handle, synchronize_directory,
-    validate_compile_target,
+    preflight_directory, preflight_file, preflight_file_handle, validate_compile_target,
 };
 use crate::recovery::{classify_runtime_envelope, RuntimeEnvelopeClassification};
 use crate::wal::format::{
@@ -1063,10 +1064,20 @@ pub(crate) fn sync_repair_snapshot(
     Ok(staging)
 }
 
+#[cfg(test)]
 pub(crate) fn publish_repair_snapshot(
     staging: std::fs::File,
     paths: &ArtifactPaths,
     inject_failure: bool,
+) -> Result<u64, RepairPublicationFailure> {
+    publish_repair_snapshot_with_policy(staging, paths, inject_failure, DurabilityPolicy::Buffered)
+}
+
+fn publish_repair_snapshot_with_policy(
+    staging: std::fs::File,
+    paths: &ArtifactPaths,
+    inject_failure: bool,
+    durability_policy: DurabilityPolicy,
 ) -> Result<u64, RepairPublicationFailure> {
     let expected_len = staging
         .metadata()
@@ -1079,10 +1090,12 @@ pub(crate) fn publish_repair_snapshot(
             path: paths.active.clone(),
         });
     }
-    fs::rename(&paths.staging, &paths.active).map_err(|_| RepairPublicationFailure {
-        operation: RecoveryOperation::Publish,
-        path: paths.active.clone(),
-    })?;
+    publish_namespace_no_replace(&paths.staging, &paths.active, durability_policy).map_err(
+        |_| RepairPublicationFailure {
+            operation: RecoveryOperation::Publish,
+            path: paths.active.clone(),
+        },
+    )?;
     Ok(expected_len)
 }
 
@@ -1244,12 +1257,10 @@ pub(crate) fn publish_validated_repair_with_policy(
                     })
                 })?;
             }
-            fs::rename(&paths.active, &paths.legacy)
+            publish_namespace_no_replace(&paths.active, &paths.legacy, durability_policy)
                 .map_err(|source| io_failure(RecoveryOperation::Publish, &paths.legacy, source))?;
-            if durability_policy == DurabilityPolicy::Physical {
-                synchronize_directory(parent)
-                    .map_err(|source| io_failure(RecoveryOperation::Publish, parent, source))?;
-            }
+            synchronize_published_namespace(parent, durability_policy)
+                .map_err(|source| io_failure(RecoveryOperation::Publish, parent, source))?;
         }
         RepairAuthority::Recovery { obsolete_active } => {
             if paths.active.exists() {
@@ -1266,11 +1277,10 @@ pub(crate) fn publish_validated_repair_with_policy(
     }
 
     let expected_len =
-        publish_repair_snapshot(staging, paths, false).map_err(repair_publication_error)?;
-    if durability_policy == DurabilityPolicy::Physical {
-        synchronize_directory(parent)
-            .map_err(|source| io_failure(RecoveryOperation::Publish, parent, source))?;
-    }
+        publish_repair_snapshot_with_policy(staging, paths, false, durability_policy)
+            .map_err(repair_publication_error)?;
+    synchronize_published_namespace(parent, durability_policy)
+        .map_err(|source| io_failure(RecoveryOperation::Publish, parent, source))?;
     let validated =
         reopen_repair_snapshot(paths, expected_len, &validate).map_err(repair_publication_error)?;
     if durability_policy == DurabilityPolicy::Buffered {
@@ -1288,7 +1298,7 @@ pub(crate) fn publish_validated_repair_with_policy(
                 );
                 true
             }
-            Ok(()) => match synchronize_directory(parent) {
+            Ok(()) => match synchronize_published_namespace(parent, durability_policy) {
                 Ok(()) => false,
                 Err(error) => {
                     log::warn!(
@@ -1366,6 +1376,58 @@ fn io_failure(operation: RecoveryOperation, path: &Path, source: io::Error) -> R
     }
 }
 
+fn publish_namespace_no_replace(
+    source: &Path,
+    destination: &Path,
+    durability_policy: DurabilityPolicy,
+) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    if durability_policy == DurabilityPolicy::Physical {
+        return crate::durability::move_windows_namespace_write_through(
+            source,
+            destination,
+            crate::durability::WindowsNamespaceMoveMode::NoReplace,
+        );
+    }
+    let _ = durability_policy;
+    fs::rename(source, destination)
+}
+
+fn publish_namespace_replace_existing(
+    source: &Path,
+    destination: &Path,
+    durability_policy: DurabilityPolicy,
+) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    if durability_policy == DurabilityPolicy::Physical {
+        return crate::durability::move_windows_namespace_write_through(
+            source,
+            destination,
+            crate::durability::WindowsNamespaceMoveMode::ReplaceExisting,
+        );
+    }
+    let _ = durability_policy;
+    fs::rename(source, destination)
+}
+
+fn synchronize_published_namespace(
+    parent: &Path,
+    durability_policy: DurabilityPolicy,
+) -> io::Result<()> {
+    if durability_policy != DurabilityPolicy::Physical {
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = parent;
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        synchronize_directory(parent)
+    }
+}
+
 pub(crate) fn artifact_exists(path: &Path) -> Result<bool, RecoveryError> {
     match fs::metadata(path) {
         Ok(_) => Ok(true),
@@ -1414,11 +1476,28 @@ pub(crate) fn fail_cleanup_for(path: PathBuf) -> CleanupFaultGuard {
     CleanupFaultGuard(path)
 }
 
+#[cfg(test)]
 pub(crate) fn publish_replacement(
     paths: &ArtifactPaths,
     replacement: &[u8],
     validate: impl Fn(&[u8]) -> bool,
     observer: &mut impl FnMut(PublicationCheckpoint) -> io::Result<()>,
+) -> Result<u64, RecoveryError> {
+    publish_replacement_with_policy(
+        paths,
+        replacement,
+        validate,
+        observer,
+        DurabilityPolicy::Buffered,
+    )
+}
+
+fn publish_replacement_with_policy(
+    paths: &ArtifactPaths,
+    replacement: &[u8],
+    validate: impl Fn(&[u8]) -> bool,
+    observer: &mut impl FnMut(PublicationCheckpoint) -> io::Result<()>,
+    durability_policy: DurabilityPolicy,
 ) -> Result<u64, RecoveryError> {
     let frames = if replacement.starts_with(b"PIGWAL\r\n") {
         let mut ranges = vec![(0, V1CodecProbe::HEADER_LEN)];
@@ -1500,8 +1579,14 @@ pub(crate) fn publish_replacement(
         .map_err(|source| io_failure(RecoveryOperation::WriteStaging, &paths.staging, source))?;
     drop(staging);
 
-    fs::rename(&paths.staging, &paths.active)
+    publish_namespace_replace_existing(&paths.staging, &paths.active, durability_policy)
         .map_err(|source| io_failure(RecoveryOperation::Publish, &paths.active, source))?;
+    let parent = paths
+        .active
+        .parent()
+        .expect("WAL artifact must have a parent directory");
+    synchronize_published_namespace(parent, durability_policy)
+        .map_err(|source| io_failure(RecoveryOperation::Publish, parent, source))?;
     observer(PublicationCheckpoint::Published)
         .map_err(|source| io_failure(RecoveryOperation::Publish, &paths.active, source))?;
 
@@ -1651,16 +1736,14 @@ fn initialize_snapshot_impl<S: Clone + Eq + Default>(
                         io_failure(RecoveryOperation::WriteStaging, &paths.staging, source)
                     })?;
             }
-            fs::rename(&paths.staging, &paths.active)
+            publish_namespace_no_replace(&paths.staging, &paths.active, durability_policy)
                 .map_err(|source| io_failure(RecoveryOperation::Publish, &paths.active, source))?;
-            if durability_policy == DurabilityPolicy::Physical {
-                let parent = paths
-                    .active
-                    .parent()
-                    .expect("WAL artifact must have a parent directory");
-                synchronize_directory(parent)
-                    .map_err(|source| io_failure(RecoveryOperation::Publish, parent, source))?;
-            }
+            let parent = paths
+                .active
+                .parent()
+                .expect("WAL artifact must have a parent directory");
+            synchronize_published_namespace(parent, durability_policy)
+                .map_err(|source| io_failure(RecoveryOperation::Publish, parent, source))?;
             active_exists = true;
             active_bytes = Some(staging_bytes);
         }
@@ -2204,11 +2287,12 @@ fn initialize_snapshot_impl<S: Clone + Eq + Default>(
             } else if staging_clean && legacy_clean {
                 let replacement = encode(&active.snapshot);
                 let expected = active.snapshot.clone();
-                publish_replacement(
+                publish_replacement_with_policy(
                     paths,
                     &replacement,
                     |bytes| replay(bytes).is_ok_and(|result| result.snapshot == expected),
                     &mut |_| Ok(()),
+                    durability_policy,
                 )?
             } else {
                 active.byte_len

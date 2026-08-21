@@ -6,7 +6,7 @@ use pigment_db::key_map_store::DurableKeyMapStore;
 use pigment_db::key_set_store::DurableKeySetStore;
 use pigment_db::key_value_store::DurableKeyValueStore;
 use pigment_db::model::SearchKey;
-use pigment_db::{DurabilityPolicy, DurableStoreOptions, WalSegmentSize};
+use pigment_db::{DurabilityPolicy, DurableStoreOptions, RecoveryStatus, WalSegmentSize};
 
 #[test]
 fn fresh_physical_publication_exposes_only_canonical_files_for_every_family() {
@@ -98,4 +98,68 @@ fn assert_rotated(directory: &std::path::Path, active_name: &str) {
     assert!(directory
         .join(format!("{active_name}.segment-{:020}", 0))
         .is_file());
+}
+
+#[test]
+fn physical_recovery_repairs_a_terminal_tail_before_exposing_the_store() {
+    let directory = tempfile::tempdir().unwrap();
+    let options = DurableStoreOptions::default().with_durability_policy(DurabilityPolicy::Physical);
+    let store = DurableKeyValueStore::try_init_new_with_options(directory.path(), options)
+        .unwrap()
+        .into_store();
+    store.put(b"stable".to_vec(), b"accepted".to_vec());
+    store.put(b"torn".to_vec(), b"unaccepted".to_vec());
+    drop(store);
+
+    let active = directory.path().join("kv.wal.dat");
+    let mut interrupted = std::fs::read(&active).unwrap();
+    interrupted.pop();
+    std::fs::write(&active, interrupted).unwrap();
+
+    let reopened = DurableKeyValueStore::try_init_new_with_options(directory.path(), options)
+        .expect("physical recovery must publish a synchronized repaired WAL");
+
+    assert_eq!(reopened.status(), RecoveryStatus::Recovered);
+    assert_eq!(reopened.store().get(b"stable"), Some(b"accepted".to_vec()));
+    assert_eq!(reopened.store().get(b"torn"), None);
+    assert_only_active(directory.path(), "kv.wal.dat");
+}
+
+#[test]
+fn physical_recovery_promotes_complete_rotation_staging_write_through() {
+    let directory = tempfile::tempdir().unwrap();
+    let options = DurableStoreOptions::default()
+        .with_durability_policy(DurabilityPolicy::Physical)
+        .with_wal_segment_size(WalSegmentSize::try_from(170_u64).unwrap());
+    let store = DurableKeyValueStore::try_init_new_with_options(directory.path(), options)
+        .unwrap()
+        .into_store();
+    store.put(b"first".to_vec(), b"one".to_vec());
+    store.put(b"second".to_vec(), b"two".to_vec());
+    drop(store);
+
+    let active = directory.path().join("kv.wal.dat");
+    let active_bytes = std::fs::read(&active).unwrap();
+    let sealed_one = directory
+        .path()
+        .join("kv.wal.dat.segment-00000000000000000001");
+    std::fs::rename(&active, sealed_one).unwrap();
+    let mut next_header: [u8; 64] = active_bytes[..64].try_into().unwrap();
+    next_header[32..40].copy_from_slice(&2_u64.to_le_bytes());
+    let next_base =
+        u64::from_le_bytes(active_bytes[40..48].try_into().unwrap()) + active_bytes.len() as u64;
+    next_header[40..48].copy_from_slice(&next_base.to_le_bytes());
+    let crc = crc32fast::hash(&next_header[..60]);
+    next_header[60..64].copy_from_slice(&crc.to_le_bytes());
+    let staging = directory.path().join(".kv.wal.dat.next");
+    std::fs::write(&staging, next_header).unwrap();
+
+    let reopened = DurableKeyValueStore::try_init_new_with_options(directory.path(), options)
+        .expect("physical recovery must promote synchronized rotation staging");
+
+    assert_eq!(reopened.status(), RecoveryStatus::Recovered);
+    assert_eq!(reopened.store().get(b"first"), Some(b"one".to_vec()));
+    assert_eq!(reopened.store().get(b"second"), Some(b"two".to_vec()));
+    assert!(active.is_file());
+    assert!(!staging.exists());
 }
