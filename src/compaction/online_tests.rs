@@ -825,7 +825,6 @@ fn successful_cutover_installs_fresh_writer_and_rotates_only_replacement() {
     store.put(b"snapshot".to_vec(), vec![b'x'; 256]);
 
     let active = directory.path().join("kv.wal.dat");
-    let old_active = std::fs::read(&active).unwrap();
     let capture = store
         .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
         .unwrap();
@@ -834,12 +833,12 @@ fn successful_cutover_installs_fresh_writer_and_rotates_only_replacement() {
     assert_eq!(completed.replayed, 0);
     assert_eq!(
         completed.manifest.phase,
-        crate::compaction::manifest::ManifestPhase::ReplacementPublished
+        crate::compaction::manifest::ManifestPhase::CleanupPending
     );
+    assert_eq!(completed.cleanup, crate::CleanupStatus::Complete);
     assert!(completed.manifest.source_finalized);
-    assert!(completed.paths.previous.is_dir());
-    let previous_active = completed.paths.previous.join("kv.wal.dat");
-    assert_eq!(std::fs::read(&previous_active).unwrap(), old_active);
+    assert!(!completed.paths.previous.exists());
+    assert!(!completed.paths.manifest.exists());
     assert!(!directory
         .path()
         .join("kv.wal.dat.segment-00000000000000000000")
@@ -868,7 +867,6 @@ fn successful_cutover_installs_fresh_writer_and_rotates_only_replacement() {
         std::fs::read(&sealed_replacement).unwrap(),
         replacement_before_mutation
     );
-    assert_eq!(std::fs::read(&previous_active).unwrap(), old_active);
     assert_eq!(store.get(b"after-cutover"), Some(b"accepted".to_vec()));
     let after = store.online_wal_state_probe();
     assert_eq!(after.granularity_nanos, 1);
@@ -946,6 +944,100 @@ fn replacement_reopen_failure_preserves_live_reads_and_fails_closed_before_io() 
     );
     assert!(!store.has_delta_recorder_probe());
     assert!(store.maintenance_probe().try_begin_online().is_ok());
+
+    drop(store);
+    let reopened = DurableKeyValueStore::try_init_new(directory.path())
+        .unwrap()
+        .into_store();
+    assert_eq!(reopened.get(b"snapshot"), Some(b"readable".to_vec()));
+    assert_eq!(reopened.get(b"delta"), Some(b"also-readable".to_vec()));
+    reopened
+        .try_put(b"after-recovery".to_vec(), b"writes-resumed".to_vec())
+        .unwrap();
+    assert!(!paths.previous.exists());
+    assert!(!paths.manifest.exists());
+}
+
+#[test]
+fn post_publication_cleanup_failure_is_pending_and_retries_only_in_foreground() {
+    #[derive(Clone, Copy, Debug)]
+    enum Retry {
+        Reopen,
+        NextCompaction,
+    }
+
+    for retry in [Retry::Reopen, Retry::NextCompaction] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableKeyValueStore::try_init_new(directory.path())
+            .unwrap()
+            .into_store();
+        store.put(b"snapshot".to_vec(), b"retained".to_vec());
+        let capture = store
+            .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
+            .unwrap();
+        let staged = super::prepare_online_staging(capture, |_| Ok(())).unwrap();
+        let paths = staged.prepared.paths.clone();
+        let completed = store
+            .complete_online_cutover_with_cleanup_probe(staged, |stage| {
+                if stage == super::OnlineCleanupStage::BeforePreviousArtifact(0) {
+                    Err(std::io::Error::other(
+                        "scripted old-generation cleanup failure",
+                    ))
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap();
+        assert_eq!(completed.cleanup, crate::CleanupStatus::Pending);
+        assert_eq!(
+            completed.manifest.phase,
+            crate::compaction::manifest::ManifestPhase::CleanupPending
+        );
+        assert!(paths.previous.is_dir());
+        assert!(paths.manifest.is_file());
+
+        store.put(b"after-publication".to_vec(), b"still-writable".to_vec());
+        assert_eq!(
+            store.get(b"after-publication"),
+            Some(b"still-writable".to_vec())
+        );
+        assert!(
+            paths.previous.is_dir(),
+            "cleanup must not run in background"
+        );
+
+        match retry {
+            Retry::Reopen => {
+                drop(store);
+                let reopened = DurableKeyValueStore::try_init_new(directory.path())
+                    .unwrap()
+                    .into_store();
+                assert_eq!(
+                    reopened.get(b"after-publication"),
+                    Some(b"still-writable".to_vec())
+                );
+                assert!(!paths.previous.exists());
+                assert!(!paths.manifest.exists());
+            }
+            Retry::NextCompaction => {
+                let next = store
+                    .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
+                    .unwrap();
+                assert_eq!(
+                    next.capture.state,
+                    crate::compaction::CapturedLogicalState::Value(
+                        std::collections::HashMap::from([
+                            (b"snapshot".to_vec(), b"retained".to_vec()),
+                            (b"after-publication".to_vec(), b"still-writable".to_vec()),
+                        ])
+                    )
+                );
+                assert!(!paths.previous.exists());
+                assert_ne!(next.manifest.operation_id, completed.manifest.operation_id);
+                drop(next);
+            }
+        }
+    }
 }
 
 #[test]

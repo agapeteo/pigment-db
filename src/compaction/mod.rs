@@ -70,6 +70,15 @@ pub(crate) struct CompletedOnlineCutover {
     pub(crate) replayed: usize,
     pub(crate) paths: MaintenanceArtifactPaths,
     pub(crate) manifest: crate::compaction::manifest::CompactionManifest,
+    pub(crate) cleanup: crate::CleanupStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OnlineCleanupStage {
+    CleanupPendingPublished,
+    BeforePreviousArtifact(usize),
+    BeforePreviousDirectory,
+    BeforeManifest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -396,6 +405,20 @@ pub(crate) fn fail_online_publication_closed<W: Write>(
         })
 }
 
+pub(crate) fn cleanup_online_publication(
+    paths: &MaintenanceArtifactPaths,
+    manifest: &mut crate::compaction::manifest::CompactionManifest,
+    checkpoint: impl FnMut(OnlineCleanupStage) -> io::Result<()>,
+) -> Result<crate::CleanupStatus, CompactionError> {
+    let store_dir = paths
+        .manifest
+        .parent()
+        .ok_or_else(|| CompactionError::InvalidArtifact {
+            path: paths.manifest.clone(),
+        })?;
+    recovery::recover_online_cleanup_with_checkpoint(store_dir, paths, manifest, checkpoint)
+}
+
 pub(crate) fn begin_online_capture<'a, W: Write>(
     coordinator: &'a crate::maintenance_coordination::MaintenanceCoordinator,
     wal: &'a crate::wal::WalStorage<W>,
@@ -409,6 +432,7 @@ pub(crate) fn begin_online_capture<'a, W: Write>(
         .map_err(|()| CompactionError::FailedClosed {
             detail: "online compaction is already active for this store instance".to_owned(),
         })?;
+    recovery::resolve_online_maintenance_for_compaction(store_dir, inspected_family)?;
     let (capture, source_inventory, paths, manifest) = {
         let _exclusive = coordinator.exclusive();
         let live_state = capture_live_state();

@@ -203,8 +203,10 @@ impl DurableKeySetStore<File> {
                     source,
                 }
             })?;
-        let maintenance_recovered =
-            crate::compaction::recovery::resolve_directory_maintenance(store_dir)?;
+        let maintenance_recovered = crate::compaction::recovery::resolve_store_maintenance(
+            store_dir,
+            crate::compaction::inspection::InspectedFamily::KeySet,
+        )?;
         let paths = ArtifactPaths::new(store_dir, StoreKind::Set);
         let durability_policy = options
             .map(DurableStoreOptions::durability_policy)

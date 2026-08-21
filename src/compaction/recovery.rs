@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use super::manifest::{
@@ -21,6 +21,196 @@ use crate::{CompactionError, CompactionOperation, RecoveryError, RecoveryOperati
 pub(crate) fn resolve_directory_maintenance(store_dir: &Path) -> Result<bool, RecoveryError> {
     resolve_directory_maintenance_for_compaction(store_dir)
         .map_err(|error| map_compaction_recovery_error(store_dir, error))
+}
+
+pub(crate) fn resolve_store_maintenance(
+    store_dir: &Path,
+    family: super::inspection::InspectedFamily,
+) -> Result<bool, RecoveryError> {
+    let directory_recovered = resolve_directory_maintenance(store_dir)?;
+    let online_recovered = resolve_online_maintenance_for_compaction(store_dir, family)
+        .map_err(|error| map_compaction_recovery_error(store_dir, error))?;
+    Ok(directory_recovered || online_recovered)
+}
+
+pub(crate) fn resolve_online_maintenance_for_compaction(
+    store_dir: &Path,
+    family: super::inspection::InspectedFamily,
+) -> Result<bool, CompactionError> {
+    let paths = super::publication::family_artifact_paths(&store_dir.join(family.active_name()))
+        .map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::Inspect,
+            path: store_dir.to_path_buf(),
+            source,
+        })?;
+    let mut manifest = match read_published_manifest(&paths) {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => {
+            if [&paths.manifest_next, &paths.staging, &paths.previous]
+                .into_iter()
+                .any(|path| path_exists(path).unwrap_or(true))
+            {
+                return Err(authority_undetermined(store_dir, &paths));
+            }
+            return Ok(false);
+        }
+        Err(_) => return Err(authority_undetermined(store_dir, &paths)),
+    };
+    remove_unpublished_manifest_temp(&paths)?;
+    validate_online_manifest_binding(store_dir, &paths, &manifest, family)?;
+    match manifest.phase {
+        ManifestPhase::Prepared => {
+            recover_prepared_online(store_dir, &paths, &manifest)?;
+        }
+        ManifestPhase::PreviousPublished => {
+            recover_previous_published_online(store_dir, &paths, &mut manifest)?;
+            if recover_online_cleanup_with_checkpoint(store_dir, &paths, &mut manifest, |_| Ok(()))?
+                == crate::CleanupStatus::Pending
+            {
+                return Err(CompactionError::FailedClosed {
+                    detail: "online cleanup remains pending; retry after the filesystem permits exact cleanup"
+                        .to_owned(),
+                });
+            }
+        }
+        ManifestPhase::ReplacementPublished | ManifestPhase::CleanupPending => {
+            if recover_online_cleanup_with_checkpoint(store_dir, &paths, &mut manifest, |_| Ok(()))?
+                == crate::CleanupStatus::Pending
+            {
+                return Err(CompactionError::FailedClosed {
+                    detail: "online cleanup remains pending; retry after the filesystem permits exact cleanup"
+                        .to_owned(),
+                });
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn recover_previous_published_online(
+    store_dir: &Path,
+    paths: &MaintenanceArtifactPaths,
+    manifest: &mut CompactionManifest,
+) -> Result<(), CompactionError> {
+    if manifest.phase != ManifestPhase::PreviousPublished
+        || manifest.mode != ManifestMode::OnlineFamily
+        || !manifest.source_finalized
+        || !complete_online_previous_matches(store_dir, paths, manifest)?
+    {
+        return Err(authority_undetermined(store_dir, paths));
+    }
+    let ManifestScope::Family { active_name, .. } = &manifest.scope else {
+        return Err(authority_undetermined(store_dir, paths));
+    };
+    let active_path = store_dir.join(active_name);
+    let staging_exists = path_exists(&paths.staging)?;
+    let active_exists = path_exists(&active_path)?;
+    match (staging_exists, active_exists) {
+        (true, false) if online_staging_matches(store_dir, paths, manifest) => {
+            fs::rename(&paths.staging, &active_path).map_err(|source| CompactionError::Io {
+                operation: CompactionOperation::PublishReplacement,
+                path: active_path.clone(),
+                source,
+            })?;
+            if manifest.durability == crate::DurabilityPolicy::Physical {
+                crate::durability::synchronize_directory(store_dir).map_err(|source| {
+                    CompactionError::Io {
+                        operation: CompactionOperation::PublishReplacement,
+                        path: store_dir.to_path_buf(),
+                        source,
+                    }
+                })?;
+            }
+        }
+        (false, true) => {}
+        _ => return Err(authority_undetermined(store_dir, paths)),
+    }
+    if !online_replacement_prefix_matches(store_dir, manifest) {
+        return Err(authority_undetermined(store_dir, paths));
+    }
+    let mut next = manifest.clone();
+    next.phase = ManifestPhase::ReplacementPublished;
+    super::publication::publish_manifest_for_policy(paths, &next, manifest.durability)?;
+    *manifest = next;
+    Ok(())
+}
+
+pub(crate) fn recover_online_cleanup_with_checkpoint(
+    store_dir: &Path,
+    paths: &MaintenanceArtifactPaths,
+    manifest: &mut CompactionManifest,
+    mut checkpoint: impl FnMut(super::OnlineCleanupStage) -> io::Result<()>,
+) -> Result<crate::CleanupStatus, CompactionError> {
+    if manifest.mode != ManifestMode::OnlineFamily
+        || !manifest.source_finalized
+        || !matches!(
+            manifest.phase,
+            ManifestPhase::ReplacementPublished | ManifestPhase::CleanupPending
+        )
+    {
+        return Err(CompactionError::FailedClosed {
+            detail: "online cleanup requires confirmed replacement authority".to_owned(),
+        });
+    }
+    if !online_replacement_prefix_matches(store_dir, manifest)
+        || path_exists(&paths.staging)?
+        || !remaining_online_previous_is_valid(store_dir, paths, manifest)?
+    {
+        return Err(authority_undetermined(store_dir, paths));
+    }
+    if manifest.phase == ManifestPhase::ReplacementPublished {
+        let mut next = manifest.clone();
+        next.phase = ManifestPhase::CleanupPending;
+        if super::publication::publish_manifest_for_policy(paths, &next, manifest.durability)
+            .is_err()
+        {
+            return Ok(crate::CleanupStatus::Pending);
+        }
+        *manifest = next;
+    }
+    if checkpoint(super::OnlineCleanupStage::CleanupPendingPublished).is_err() {
+        return Ok(crate::CleanupStatus::Pending);
+    }
+
+    for (index, source) in manifest.source_inventory.iter().enumerate() {
+        let Some(file_name) = source.relative_path.file_name() else {
+            return Err(authority_undetermined(store_dir, paths));
+        };
+        let previous_path = paths.previous.join(file_name);
+        if !path_exists(&previous_path)? {
+            continue;
+        }
+        if checkpoint(super::OnlineCleanupStage::BeforePreviousArtifact(index)).is_err()
+            || fs::remove_file(&previous_path).is_err()
+        {
+            return Ok(crate::CleanupStatus::Pending);
+        }
+    }
+    if path_exists(&paths.previous)?
+        && (checkpoint(super::OnlineCleanupStage::BeforePreviousDirectory).is_err()
+            || fs::remove_dir(&paths.previous).is_err())
+    {
+        return Ok(crate::CleanupStatus::Pending);
+    }
+    if manifest.durability == crate::DurabilityPolicy::Physical
+        && crate::durability::synchronize_directory(store_dir).is_err()
+    {
+        return Ok(crate::CleanupStatus::Pending);
+    }
+    if checkpoint(super::OnlineCleanupStage::BeforeManifest).is_err() {
+        return Ok(crate::CleanupStatus::Pending);
+    }
+    match fs::remove_file(&paths.manifest) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Ok(crate::CleanupStatus::Pending),
+    }
+    if manifest.durability == crate::DurabilityPolicy::Physical
+        && crate::durability::synchronize_directory(store_dir).is_err()
+    {
+        return Ok(crate::CleanupStatus::Pending);
+    }
+    Ok(crate::CleanupStatus::Complete)
 }
 
 pub(crate) fn resolve_directory_maintenance_for_compaction(
@@ -683,6 +873,30 @@ fn validate_online_prepared_binding(
     paths: &MaintenanceArtifactPaths,
     manifest: &CompactionManifest,
 ) -> Result<(), CompactionError> {
+    let family = match manifest.scope {
+        ManifestScope::Family { family, .. } => family,
+        ManifestScope::Directory => {
+            return Err(CompactionError::InvalidArtifact {
+                path: paths.manifest.clone(),
+            });
+        }
+    };
+    let inspected = inspected_family(family);
+    validate_online_manifest_binding(store_dir, paths, manifest, inspected)?;
+    if manifest.phase != ManifestPhase::Prepared {
+        return Err(CompactionError::InvalidArtifact {
+            path: paths.manifest.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_online_manifest_binding(
+    store_dir: &Path,
+    paths: &MaintenanceArtifactPaths,
+    manifest: &CompactionManifest,
+    expected_family: super::inspection::InspectedFamily,
+) -> Result<(), CompactionError> {
     let ManifestScope::Family {
         family,
         active_name,
@@ -707,7 +921,7 @@ fn validate_online_prepared_binding(
             && descriptor.relative_path.components().count() == 1
     });
     if manifest.mode != ManifestMode::OnlineFamily
-        || manifest.phase != ManifestPhase::Prepared
+        || inspected_family(*family) != expected_family
         || &expected_paths != paths
         || paths.staging.file_name().map(PathBuf::from) != Some(manifest.staging_location.clone())
         || paths.previous.file_name().map(PathBuf::from) != Some(manifest.previous_location.clone())
@@ -719,6 +933,206 @@ fn validate_online_prepared_binding(
         });
     }
     Ok(())
+}
+
+fn inspected_family(family: StoreFamily) -> super::inspection::InspectedFamily {
+    match family {
+        StoreFamily::KeyValue => super::inspection::InspectedFamily::KeyValue,
+        StoreFamily::KeySet => super::inspection::InspectedFamily::KeySet,
+        StoreFamily::KeyMap => super::inspection::InspectedFamily::KeyMap,
+    }
+}
+
+fn online_replacement_prefix_matches(store_dir: &Path, manifest: &CompactionManifest) -> bool {
+    let ManifestScope::Family {
+        family,
+        active_name,
+    } = &manifest.scope
+    else {
+        return false;
+    };
+    let [replacement] = manifest.replacement_inventory.as_slice() else {
+        return false;
+    };
+    if replacement.family != Some(*family)
+        || replacement.role != ArtifactRole::ReplacementPrefix
+        || replacement.relative_path != manifest.staging_location
+    {
+        return false;
+    }
+    let inspected = inspected_family(*family);
+    if active_name != Path::new(inspected.active_name()) {
+        return false;
+    }
+    let Ok(inspection) = super::inspection::inspect_open_family(store_dir, inspected) else {
+        return false;
+    };
+    let mut remaining = match usize::try_from(replacement.length) {
+        Ok(length) => length,
+        Err(_) => return false,
+    };
+    let mut hasher = crc32fast::Hasher::new();
+    for segment in 0..inspection.sealed_segment_count {
+        let path = store_dir.join(format!("{}.segment-{segment:020}", inspected.active_name()));
+        if !hash_prefix_part(&path, &mut remaining, &mut hasher) {
+            return false;
+        }
+        if remaining == 0 {
+            return hasher.finalize() == replacement.checksum;
+        }
+    }
+    if !hash_prefix_part(&store_dir.join(active_name), &mut remaining, &mut hasher)
+        || remaining != 0
+    {
+        return false;
+    }
+    hasher.finalize() == replacement.checksum
+}
+
+fn hash_prefix_part(path: &Path, remaining: &mut usize, hasher: &mut crc32fast::Hasher) -> bool {
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut buffer = [0_u8; 8192];
+    while *remaining > 0 {
+        let wanted = buffer.len().min(*remaining);
+        let Ok(count) = file.read(&mut buffer[..wanted]) else {
+            return false;
+        };
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        *remaining -= count;
+    }
+    true
+}
+
+fn remaining_online_previous_is_valid(
+    store_dir: &Path,
+    paths: &MaintenanceArtifactPaths,
+    manifest: &CompactionManifest,
+) -> Result<bool, CompactionError> {
+    let metadata = match fs::symlink_metadata(&paths.previous) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(source) => {
+            return Err(CompactionError::Io {
+                operation: CompactionOperation::Cleanup,
+                path: paths.previous.clone(),
+                source,
+            });
+        }
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    let Some(previous_name) = paths.previous.file_name() else {
+        return Ok(false);
+    };
+    let mut expected = std::collections::BTreeMap::new();
+    for source in &manifest.source_inventory {
+        let Some(file_name) = source.relative_path.file_name() else {
+            return Ok(false);
+        };
+        if expected.insert(OsString::from(file_name), source).is_some() {
+            return Ok(false);
+        }
+    }
+    for entry in fs::read_dir(&paths.previous).map_err(|source| CompactionError::Io {
+        operation: CompactionOperation::Cleanup,
+        path: paths.previous.clone(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::Cleanup,
+            path: paths.previous.clone(),
+            source,
+        })?;
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            return Ok(false);
+        }
+        let Some(source) = expected.get(&entry.file_name()) else {
+            return Ok(false);
+        };
+        let mut translated = (*source).clone();
+        translated.relative_path = PathBuf::from(previous_name).join(entry.file_name());
+        if verify_descriptor(store_dir, &translated).is_err() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn complete_online_previous_matches(
+    store_dir: &Path,
+    paths: &MaintenanceArtifactPaths,
+    manifest: &CompactionManifest,
+) -> Result<bool, CompactionError> {
+    let metadata = match fs::symlink_metadata(&paths.previous) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(CompactionError::Io {
+                operation: CompactionOperation::Inspect,
+                path: paths.previous.clone(),
+                source,
+            });
+        }
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    let Some(previous_name) = paths.previous.file_name() else {
+        return Ok(false);
+    };
+    let mut expected = BTreeSet::new();
+    for source in &manifest.source_inventory {
+        let Some(file_name) = source.relative_path.file_name() else {
+            return Ok(false);
+        };
+        if !expected.insert(OsString::from(file_name)) {
+            return Ok(false);
+        }
+        let mut translated = source.clone();
+        translated.relative_path = PathBuf::from(previous_name).join(file_name);
+        if verify_descriptor(store_dir, &translated).is_err() {
+            return Ok(false);
+        }
+    }
+    let mut actual = BTreeSet::new();
+    for entry in fs::read_dir(&paths.previous).map_err(|source| CompactionError::Io {
+        operation: CompactionOperation::Inspect,
+        path: paths.previous.clone(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::Inspect,
+            path: paths.previous.clone(),
+            source,
+        })?;
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            return Ok(false);
+        }
+        actual.insert(entry.file_name());
+    }
+    Ok(actual == expected)
+}
+
+fn online_staging_matches(
+    store_dir: &Path,
+    paths: &MaintenanceArtifactPaths,
+    manifest: &CompactionManifest,
+) -> bool {
+    let [replacement] = manifest.replacement_inventory.as_slice() else {
+        return false;
+    };
+    let mut staging = replacement.clone();
+    staging.relative_path = match paths.staging.file_name() {
+        Some(name) => PathBuf::from(name),
+        None => return false,
+    };
+    verify_descriptor(store_dir, &staging).is_ok()
 }
 
 fn online_source_prefix_matches(anchor: &Path, manifest: &CompactionManifest) -> bool {

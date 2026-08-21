@@ -134,18 +134,43 @@ impl DurableKeyValueStore<File> {
         &'a self,
         staged: crate::compaction::ValidatedOnlineStaging<'a, File>,
     ) -> Result<crate::compaction::CompletedOnlineCutover, crate::CompactionError> {
-        self.complete_online_cutover_with_reopen_probe(staged, |active_path| {
-            OpenOptions::new().append(true).open(active_path)
-        })
+        self.complete_online_cutover_with_probes(
+            staged,
+            |active_path| OpenOptions::new().append(true).open(active_path),
+            |_| Ok(()),
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn complete_online_cutover_with_reopen_probe<'a>(
         &'a self,
-        mut staged: crate::compaction::ValidatedOnlineStaging<'a, File>,
+        staged: crate::compaction::ValidatedOnlineStaging<'a, File>,
         reopen: impl FnOnce(&Path) -> std::io::Result<File>,
     ) -> Result<crate::compaction::CompletedOnlineCutover, crate::CompactionError> {
-        let completed = {
+        self.complete_online_cutover_with_probes(staged, reopen, |_| Ok(()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_online_cutover_with_cleanup_probe<'a>(
+        &'a self,
+        staged: crate::compaction::ValidatedOnlineStaging<'a, File>,
+        cleanup_checkpoint: impl FnMut(crate::compaction::OnlineCleanupStage) -> std::io::Result<()>,
+    ) -> Result<crate::compaction::CompletedOnlineCutover, crate::CompactionError> {
+        self.complete_online_cutover_with_probes(
+            staged,
+            |active_path| OpenOptions::new().append(true).open(active_path),
+            cleanup_checkpoint,
+        )
+    }
+
+    #[cfg(test)]
+    fn complete_online_cutover_with_probes<'a>(
+        &'a self,
+        mut staged: crate::compaction::ValidatedOnlineStaging<'a, File>,
+        reopen: impl FnOnce(&Path) -> std::io::Result<File>,
+        cleanup_checkpoint: impl FnMut(crate::compaction::OnlineCleanupStage) -> std::io::Result<()>,
+    ) -> Result<crate::compaction::CompletedOnlineCutover, crate::CompactionError> {
+        let mut completed = {
             let _exclusive = self.maintenance.exclusive();
             let delta = staged.prepared.attempt.detach_recorder().ok_or_else(|| {
                 crate::CompactionError::FailedClosed {
@@ -236,8 +261,14 @@ impl DurableKeyValueStore<File> {
                 replayed: applied.replayed,
                 paths: staged.prepared.paths.clone(),
                 manifest: staged.prepared.manifest.clone(),
+                cleanup: crate::CleanupStatus::Pending,
             }
         };
+        completed.cleanup = crate::compaction::cleanup_online_publication(
+            &completed.paths,
+            &mut completed.manifest,
+            cleanup_checkpoint,
+        )?;
         drop(staged);
         Ok(completed)
     }
@@ -319,8 +350,10 @@ impl DurableKeyValueStore<File> {
                     source,
                 }
             })?;
-        let maintenance_recovered =
-            crate::compaction::recovery::resolve_directory_maintenance(store_dir)?;
+        let maintenance_recovered = crate::compaction::recovery::resolve_store_maintenance(
+            store_dir,
+            crate::compaction::inspection::InspectedFamily::KeyValue,
+        )?;
         let paths = ArtifactPaths::new(store_dir, StoreKind::Value);
         let durability_policy = options
             .map(DurableStoreOptions::durability_policy)
