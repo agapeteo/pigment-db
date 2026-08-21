@@ -154,3 +154,33 @@ fn storage_stats_methods_are_exactly_file_specialized_and_expose_no_format_ident
     assert!(!public_source.contains("pub enum FormatVersion"));
     assert!(!public_source.contains("pub struct FormatVersion"));
 }
+
+#[test]
+fn public_api_exposes_no_implicit_migration_or_background_compaction_controls() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let public_sources = [
+        "src/lib.rs",
+        "src/maintenance.rs",
+        "src/config.rs",
+        "src/key_value_store.rs",
+        "src/key_set_store.rs",
+        "src/key_map_store.rs",
+    ]
+    .map(|relative| std::fs::read_to_string(root.join(relative)).unwrap())
+    .join("\n");
+
+    for forbidden in [
+        "pub enum FormatVersion",
+        "pub struct FormatVersion",
+        "AutomaticMigration",
+        "with_automatic_migration",
+        "migrate_on_open",
+        "with_background_compaction",
+        "schedule_compaction",
+    ] {
+        assert!(
+            !public_sources.contains(forbidden),
+            "public runtime API unexpectedly exposes `{forbidden}`"
+        );
+    }
+}

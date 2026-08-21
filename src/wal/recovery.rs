@@ -104,7 +104,7 @@ fn sealed_segment_paths(paths: &ArtifactPaths) -> Result<Vec<PathBuf>, RecoveryE
             continue;
         };
         if id.len() != 20 || !id.bytes().all(|byte| byte.is_ascii_digit()) {
-            continue;
+            return Err(RecoveryError::InvalidArtifact { path: entry.path() });
         }
         let id = id
             .parse::<u64>()

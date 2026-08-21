@@ -19,3 +19,6 @@ remain immutable comparator inputs and were not regenerated.
 
 Feature 008 reverified the same three file-byte SHA-256 values on 2026-08-20
 before adding compaction or Windows durability production behavior.
+
+The post-implementation verification on 2026-08-20 produced the same three
+values shown above; every before/after hash is identical.

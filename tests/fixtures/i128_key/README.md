@@ -17,3 +17,6 @@ The byte layout is the pre-correction derived binary model: `I128` is enum discr
 
 Feature 008 reverified both the encoded file bytes and decoded binary hashes on
 2026-08-20 before any compaction or Windows durability production edit.
+
+The post-implementation verification on 2026-08-20 reproduced every encoded
+and decoded hash in the table; every before/after hash is identical.

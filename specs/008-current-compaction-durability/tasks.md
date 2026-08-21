@@ -310,16 +310,16 @@
 
 **Independent Test**: Present every frozen recognized older fixture to runtime open, inspection, and closed compaction; assert `MigrationRequired`, exact path/tool guidance, no namespace/byte change, no public format-version API, and unchanged migration CLI output/checksums.
 
-- [ ] T175 [US5] Write and run a runtime RED exercising every recognized older key/value, key/set, and key/map fixture through runtime open, inspection, and closed compaction with exact path/tool guidance in `tests/migration_compatibility.rs`
-- [ ] T176 [US5] Keep application-data decoding exclusively in `src/migration.rs` and route runtime entry points in `src/recovery.rs`, `src/compaction/inspection.rs`, and `src/maintenance.rs` through only the bounded shallow classifier, then run T175 GREEN
-- [ ] T177 [US5] Write and run a runtime RED proving every legacy rejection creates, repairs, renames, truncates, synchronizes, deletes, or stages zero artifacts in `tests/migration_compatibility.rs`
-- [ ] T178 [US5] Move classification before every maintenance mutation boundary and remove any runtime conversion call path in `src/compaction/mod.rs` and `src/compaction/recovery.rs`, then run T177 GREEN
-- [ ] T179 [US5] Write and run a runtime RED distinguishing corrupt/wrong-family/malformed current data from genuinely ambiguous old/staging/replacement evidence across open, inspect, and compact in `tests/migration_compatibility.rs`
-- [ ] T180 [US5] Unify structured `MigrationRequired`, `InvalidArtifact`, and `AuthorityUndetermined` mapping without exposing internal versions in `src/recovery.rs`, `src/maintenance.rs`, and `src/compaction/recovery.rs`, then run T179 GREEN
-- [ ] T181 [P] [US5] Verify frozen legacy/i128 fixture SHA-256 values remain unchanged and record before/after hashes in `tests/fixtures/legacy/README.md`, `tests/fixtures/i128_key/README.md`, and `specs/008-current-compaction-durability/quickstart.md`
-- [ ] T182 [US5] Run the complete external `pigment-db-migrate` contract, compatibility, failure, process, and i128 suites unchanged in `tests/migration_cli/` and record first-execution-GREEN outcomes in `specs/008-current-compaction-durability/quickstart.md`
-- [ ] T183 [P] [US5] Add compile/rustdoc contract assertions that no public format-version enum, implicit migration option, or background compaction scheduler exists in `tests/maintenance_api.rs` and `src/lib.rs`
-- [ ] T184 [US5] Run the complete US5 plus US1 invalid-evidence and US2 source-preservation suites and record SC-007 GREEN evidence in `specs/008-current-compaction-durability/quickstart.md`
+- [X] T175 [US5] Write and run a runtime RED exercising every recognized older key/value, key/set, and key/map fixture through runtime open, inspection, and closed compaction with exact path/tool guidance in `tests/migration_compatibility.rs`
+- [X] T176 [US5] Keep application-data decoding exclusively in `src/migration.rs` and route runtime entry points in `src/recovery.rs`, `src/compaction/inspection.rs`, and `src/maintenance.rs` through only the bounded shallow classifier, then run T175 GREEN
+- [X] T177 [US5] Write and run a runtime RED proving every legacy rejection creates, repairs, renames, truncates, synchronizes, deletes, or stages zero artifacts in `tests/migration_compatibility.rs`
+- [X] T178 [US5] Move classification before every maintenance mutation boundary and remove any runtime conversion call path in `src/compaction/mod.rs` and `src/compaction/recovery.rs`, then run T177 GREEN
+- [X] T179 [US5] Write and run a runtime RED distinguishing corrupt/wrong-family/malformed current data from genuinely ambiguous old/staging/replacement evidence across open, inspect, and compact in `tests/migration_compatibility.rs`
+- [X] T180 [US5] Unify structured `MigrationRequired`, `InvalidArtifact`, and `AuthorityUndetermined` mapping without exposing internal versions in `src/recovery.rs`, `src/maintenance.rs`, and `src/compaction/recovery.rs`, then run T179 GREEN
+- [X] T181 [P] [US5] Verify frozen legacy/i128 fixture SHA-256 values remain unchanged and record before/after hashes in `tests/fixtures/legacy/README.md`, `tests/fixtures/i128_key/README.md`, and `specs/008-current-compaction-durability/quickstart.md`
+- [X] T182 [US5] Run the complete external `pigment-db-migrate` contract, compatibility, failure, process, and i128 suites unchanged in `tests/migration_cli/` and record first-execution-GREEN outcomes in `specs/008-current-compaction-durability/quickstart.md`
+- [X] T183 [P] [US5] Add compile/rustdoc contract assertions that no public format-version enum, implicit migration option, or background compaction scheduler exists in `tests/maintenance_api.rs` and `src/lib.rs`
+- [X] T184 [US5] Run the complete US5 plus US1 invalid-evidence and US2 source-preservation suites and record SC-007 GREEN evidence in `specs/008-current-compaction-durability/quickstart.md`
 
 **Checkpoint**: Runtime remains current-format-only and external migration behavior is immutable.
 

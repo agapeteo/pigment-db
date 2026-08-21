@@ -212,6 +212,37 @@ The checkpoint completed with zero failures:
 - `cargo fmt --all -- --check`;
 - `cargo clippy --all-targets --all-features -- -D warnings`.
 
+### User Story 5 external-migration compatibility GREEN checkpoint (2026-08-20)
+
+SC-007 is GREEN. Runtime open, read-only inspection, and closed compaction
+returned `MigrationRequired` with the exact frozen artifact path and
+`pigment-db-migrate` guidance for key/value, key/set, and key/map legacy
+fixtures. The three entry points created, repaired, renamed, truncated,
+synchronized, and deleted zero artifacts. Corrupt, wrong-family, malformed-name,
+and ambiguous current evidence retained distinct structured errors and remained
+byte-identical.
+
+All six encoded fixture hashes before and after implementation are identical to
+the table in section 3. The decoded I128 binary hashes also remained
+`85d26da3569c2df38e5c6b4ab0684e918dd6d9826c18b7335c96554f4d964589`
+for `legacy-map.hex`,
+`85c6eb7c4da5072d5ecebef04456b6722e64e996ce421164d866e76c298ce963`
+for `v1-map.hex`, and
+`10570a1ba66873b45f7f04da51506bc5b109d8811c9ef71dfd6922674a6bc62b`
+for `earlier-v2-map.hex`.
+
+The checkpoint completed with zero failures:
+
+- `cargo test --test migration_compatibility -- --test-threads=1` (2 passed);
+- `cargo test --test migration_cli -- --test-threads=1` (15 passed);
+- `cargo test --test i128_key -- --test-threads=1` (9 passed);
+- `cargo test --test maintenance_api -- --test-threads=1` (4 passed);
+- `cargo test --test storage_inspection -- --test-threads=1` (6 passed);
+- `cargo test --test closed_compaction -- --test-threads=1` (10 passed);
+- `cargo test --test recovery -- --test-threads=1` (18 passed);
+- `cargo fmt --all -- --check`;
+- `cargo clippy --all-targets --all-features -- -D warnings`.
+
 ## 7. Expected caller usage
 
 Callers inspect and choose when to compact; Pigment DB schedules nothing. Closed callers drop every same-process store before `compact_directory_in_place`. Online callers invoke `try_compact_online` on exactly one file-backed store and may choose a delta bound; policy is inherited. `CleanupStatus::Pending` means replacement publication succeeded and ordinary use may continue, with cleanup retried at reopen or a later explicit compaction. `MigrationRequired` means the caller must run `pigment-db-migrate` separately.
