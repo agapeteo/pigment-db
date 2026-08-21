@@ -62,6 +62,14 @@ struct WalState<W: Write> {
     delta_recorder: Option<DeltaRecorder>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OnlineCaptureMetadata {
+    pub(crate) active_len: u64,
+    pub(crate) granularity_nanos: u64,
+    pub(crate) last_bucket: u64,
+    pub(crate) durability_policy: crate::config::DurabilityPolicy,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RecordedFrame {
     action: u8,
@@ -722,6 +730,26 @@ impl WalStorage<Vec<u8>> {
 }
 
 impl<W: Write> WalStorage<W> {
+    pub(crate) fn online_capture_metadata(&self) -> std::io::Result<OnlineCaptureMetadata> {
+        let state = self
+            .wal_state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ensure_ready(&state.health)?;
+        if !matches!(state.format, WalFormat::V2) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "online compaction requires current V2 WAL storage",
+            ));
+        }
+        Ok(OnlineCaptureMetadata {
+            active_len: state.active_len,
+            granularity_nanos: state.granularity_nanos,
+            last_bucket: state.last_bucket,
+            durability_policy: state.durability_policy,
+        })
+    }
+
     pub(crate) fn activate_delta_recorder(&self, token: u64, limit: u64) -> Result<(), ()> {
         self.wal_state
             .write()

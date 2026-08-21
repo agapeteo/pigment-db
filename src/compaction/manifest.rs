@@ -75,6 +75,34 @@ pub(crate) struct CompactionManifest {
     pub(crate) replacement_inventory: Vec<ArtifactDescriptor>,
 }
 
+impl CompactionManifest {
+    pub(crate) fn online_prepared(
+        operation_id: [u8; 16],
+        family: StoreFamily,
+        active_name: PathBuf,
+        durability: DurabilityPolicy,
+        source_inventory: Vec<ArtifactDescriptor>,
+        staging_location: PathBuf,
+        previous_location: PathBuf,
+    ) -> Self {
+        Self {
+            operation_id,
+            mode: ManifestMode::OnlineFamily,
+            scope: ManifestScope::Family {
+                family,
+                active_name,
+            },
+            phase: ManifestPhase::Prepared,
+            source_finalized: false,
+            durability,
+            source_inventory,
+            staging_location,
+            previous_location,
+            replacement_inventory: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ManifestCodecError {
     InvalidEnvelope,

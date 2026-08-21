@@ -11,6 +11,7 @@ use crate::key_set_store::DurableKeySetStore;
 use crate::key_value_store::DurableKeyValueStore;
 use crate::maintenance_coordination::MaintenanceCoordinator;
 use crate::model::SearchKey;
+use crate::test_support::maintenance_schedule::{MaintenanceCheckpoint, MaintenanceObserver};
 
 #[test]
 fn coordinator_is_constant_per_instance_exclusive_and_immediately_single_attempt() {
@@ -278,6 +279,113 @@ fn async_conflict_cancellation_and_callback_panic_leave_no_delta_or_coordination
     assert!(!store.has_delta_recorder_probe());
     let next = store.begin_online_probe(u64::MAX).unwrap();
     drop(next);
+    assert!(!store.has_delta_recorder_probe());
+}
+
+#[test]
+fn online_prepared_capture_has_no_mutation_gap() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        DurableKeyValueStore::try_init_new(directory.path())
+            .unwrap()
+            .into_store(),
+    );
+    store.put(b"captured".to_vec(), b"before".to_vec());
+
+    let (observer, controller) = MaintenanceObserver::controlled([
+        MaintenanceCheckpoint::SnapshotCapture,
+        MaintenanceCheckpoint::RecorderActivation,
+        MaintenanceCheckpoint::ManifestPrepared,
+    ]);
+    let (capture_tx, capture_rx) = mpsc::sync_channel(0);
+    let (drop_tx, drop_rx) = mpsc::sync_channel(0);
+    let worker_store = Arc::clone(&store);
+    let capture_worker = std::thread::spawn(move || {
+        let capture = worker_store
+            .begin_online_capture_probe(u64::MAX, observer)
+            .unwrap();
+        capture_tx
+            .send((
+                capture.capture.clone(),
+                capture.paths.clone(),
+                capture.manifest.clone(),
+            ))
+            .unwrap();
+        drop_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(capture);
+    });
+
+    controller.wait_until_reached(MaintenanceCheckpoint::SnapshotCapture);
+    let (mutation_tx, mutation_rx) = mpsc::sync_channel(0);
+    let mutation_store = Arc::clone(&store);
+    let mutation = std::thread::spawn(move || {
+        mutation_store
+            .try_put(b"concurrent".to_vec(), b"after".to_vec())
+            .unwrap();
+        mutation_tx.send(()).unwrap();
+    });
+    assert!(mutation_rx
+        .recv_timeout(Duration::from_millis(100))
+        .is_err());
+
+    controller.release(MaintenanceCheckpoint::SnapshotCapture);
+    controller.wait_until_reached(MaintenanceCheckpoint::RecorderActivation);
+    assert!(mutation_rx
+        .recv_timeout(Duration::from_millis(100))
+        .is_err());
+    assert!(store.maintenance_probe().try_begin_online().is_err());
+
+    controller.release(MaintenanceCheckpoint::RecorderActivation);
+    controller.wait_until_reached(MaintenanceCheckpoint::ManifestPrepared);
+    assert!(mutation_rx
+        .recv_timeout(Duration::from_millis(100))
+        .is_err());
+
+    let active = directory.path().join("kv.wal.dat");
+    let expected_paths = crate::compaction::publication::family_artifact_paths(&active).unwrap();
+    let published = crate::compaction::publication::read_published_manifest(&expected_paths)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        published.phase,
+        crate::compaction::manifest::ManifestPhase::Prepared
+    );
+    assert_eq!(
+        published.mode,
+        crate::compaction::manifest::ManifestMode::OnlineFamily
+    );
+    assert!(!published.source_finalized);
+    assert_eq!(published.durability, crate::DurabilityPolicy::Buffered);
+    assert_eq!(published.replacement_inventory, Vec::new());
+    assert!(crate::compaction::recovery::source_descriptors_match(
+        directory.path(),
+        &published
+    ));
+
+    controller.release(MaintenanceCheckpoint::ManifestPrepared);
+    let (captured, paths, manifest) = capture_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(paths, expected_paths);
+    assert_eq!(manifest, published);
+    assert_eq!(captured.family, crate::StoreFamily::KeyValue);
+    let crate::compaction::CapturedLogicalState::Value(snapshot) = captured.state else {
+        panic!("key/value capture returned the wrong family state");
+    };
+    assert_eq!(
+        snapshot.get(b"captured".as_slice()),
+        Some(&b"before".to_vec())
+    );
+    assert!(!snapshot.contains_key(b"concurrent".as_slice()));
+    assert_eq!(captured.granularity_nanos, 60_000_000_000);
+    assert!(captured.last_bucket > 0);
+
+    mutation_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    mutation.join().unwrap();
+    assert_eq!(store.get(b"concurrent"), Some(b"after".to_vec()));
+    assert_eq!(store.delta_group_count_probe(), 1);
+    assert!(store.has_delta_recorder_probe());
+
+    drop_tx.send(()).unwrap();
+    capture_worker.join().unwrap();
     assert!(!store.has_delta_recorder_probe());
 }
 

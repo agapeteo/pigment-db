@@ -79,14 +79,27 @@ pub(crate) struct OnlineAttemptGuard<'a, W: Write> {
 }
 
 impl<'a, W: Write> OnlineAttemptGuard<'a, W> {
+    pub(crate) fn claim(
+        coordinator: &'a MaintenanceCoordinator,
+        wal: &'a crate::wal::WalStorage<W>,
+    ) -> Result<Self, ()> {
+        let attempt = coordinator.try_begin_online()?;
+        Ok(Self { attempt, wal })
+    }
+
+    pub(crate) fn activate_recorder(&self, max_delta_bytes: u64) -> Result<(), ()> {
+        self.wal
+            .activate_delta_recorder(self.attempt.id(), max_delta_bytes)
+    }
+
     pub(crate) fn begin(
         coordinator: &'a MaintenanceCoordinator,
         wal: &'a crate::wal::WalStorage<W>,
         max_delta_bytes: u64,
     ) -> Result<Self, ()> {
-        let attempt = coordinator.try_begin_online()?;
-        wal.activate_delta_recorder(attempt.id(), max_delta_bytes)?;
-        Ok(Self { attempt, wal })
+        let guard = Self::claim(coordinator, wal)?;
+        guard.activate_recorder(max_delta_bytes)?;
+        Ok(guard)
     }
 
     pub(crate) const fn token(&self) -> u64 {

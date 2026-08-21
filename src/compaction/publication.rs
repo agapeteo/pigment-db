@@ -355,6 +355,26 @@ fn next_operation_id() -> [u8; 16] {
     id
 }
 
+pub(crate) fn publish_online_prepared(
+    paths: &MaintenanceArtifactPaths,
+    family: crate::StoreFamily,
+    active_name: PathBuf,
+    durability: DurabilityPolicy,
+    source_inventory: Vec<super::manifest::ArtifactDescriptor>,
+) -> Result<CompactionManifest, CompactionError> {
+    let manifest = CompactionManifest::online_prepared(
+        next_operation_id(),
+        family,
+        active_name,
+        durability,
+        source_inventory,
+        native_leaf(&paths.staging)?,
+        native_leaf(&paths.previous)?,
+    );
+    publish_manifest_for_policy(paths, &manifest, durability)?;
+    Ok(manifest)
+}
+
 fn native_leaf(path: &Path) -> Result<PathBuf, CompactionError> {
     path.file_name()
         .map(PathBuf::from)

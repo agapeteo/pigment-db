@@ -6,14 +6,14 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::compaction::inspection::{
-    exact_artifact_bytes_match, inspect_directory, inspect_generation, FamilyInspection,
-    InspectedFamily,
+    exact_artifact_bytes_match, inspect_directory, inspect_generation, inspect_open_family,
+    FamilyInspection, InspectedFamily,
 };
 use crate::compaction::manifest::{verify_descriptor, ArtifactDescriptor, ArtifactRole};
 use crate::compaction::publication::{
     cleanup_closed_with_checkpoint, directory_artifact_paths, publish_closed_prepared,
     publish_closed_previous_with_checkpoint, publish_closed_replacement_with_checkpoint,
-    MaintenanceArtifactPaths,
+    publish_online_prepared, MaintenanceArtifactPaths,
 };
 use crate::wal::replay::{
     encode_current_key_map_snapshot_with_metadata, encode_current_key_set_snapshot_with_metadata,
@@ -25,6 +25,85 @@ use crate::{
     ClosedCompactionOptions, CompactionError, CompactionOperation, DirectoryCompactionOutcome,
     DurabilityPolicy, FamilyCompactionOutcome, StoreFamily,
 };
+
+#[allow(dead_code)]
+pub(crate) struct PreparedOnlineCapture<'a, W: Write> {
+    pub(crate) attempt: crate::maintenance_coordination::OnlineAttemptGuard<'a, W>,
+    pub(crate) capture: CapturedFamily,
+    pub(crate) paths: MaintenanceArtifactPaths,
+    pub(crate) manifest: crate::compaction::manifest::CompactionManifest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OnlineCaptureStage {
+    SnapshotCaptured,
+    RecorderActivated,
+    ManifestPrepared,
+}
+
+pub(crate) fn begin_online_capture<'a, W: Write>(
+    coordinator: &'a crate::maintenance_coordination::MaintenanceCoordinator,
+    wal: &'a crate::wal::WalStorage<W>,
+    store_dir: &Path,
+    inspected_family: InspectedFamily,
+    max_delta_bytes: u64,
+    capture_live_state: impl FnOnce() -> CapturedLogicalState,
+    mut checkpoint: impl FnMut(OnlineCaptureStage),
+) -> Result<PreparedOnlineCapture<'a, W>, CompactionError> {
+    let attempt = crate::maintenance_coordination::OnlineAttemptGuard::claim(coordinator, wal)
+        .map_err(|()| CompactionError::FailedClosed {
+            detail: "online compaction is already active for this store instance".to_owned(),
+        })?;
+    let (capture, source_inventory, paths, manifest) = {
+        let _exclusive = coordinator.exclusive();
+        let live_state = capture_live_state();
+        let metadata = wal
+            .online_capture_metadata()
+            .map_err(|source| CompactionError::Io {
+                operation: CompactionOperation::Capture,
+                path: store_dir.to_path_buf(),
+                source,
+            })?;
+        let inspection = inspect_open_family(store_dir, inspected_family).map_err(|error| {
+            crate::maintenance::map_inspection_error(store_dir.to_path_buf(), error)
+        })?;
+        let (capture, source_inventory) =
+            capture_online_family(store_dir, &inspection, live_state, metadata)?;
+        checkpoint(OnlineCaptureStage::SnapshotCaptured);
+
+        attempt
+            .activate_recorder(max_delta_bytes)
+            .map_err(|()| CompactionError::FailedClosed {
+                detail: "online compaction could not activate its WAL delta recorder".to_owned(),
+            })?;
+        checkpoint(OnlineCaptureStage::RecorderActivated);
+
+        let active_path = store_dir.join(inspected_family.active_name());
+        let paths = crate::compaction::publication::family_artifact_paths(&active_path).map_err(
+            |source| CompactionError::Io {
+                operation: CompactionOperation::WriteManifest,
+                path: active_path.clone(),
+                source,
+            },
+        )?;
+        let manifest = publish_online_prepared(
+            &paths,
+            capture.family,
+            PathBuf::from(inspected_family.active_name()),
+            metadata.durability_policy,
+            source_inventory.clone(),
+        )?;
+        checkpoint(OnlineCaptureStage::ManifestPrepared);
+        (capture, source_inventory, paths, manifest)
+    };
+    debug_assert_eq!(source_inventory, manifest.source_inventory);
+    Ok(PreparedOnlineCapture {
+        attempt,
+        capture,
+        paths,
+        manifest,
+    })
+}
 
 pub(crate) mod inspection;
 pub(crate) mod manifest;
@@ -488,6 +567,127 @@ fn capture_family(
         before_bytes: inspection.total_bytes,
         sealed_segment_count: inspection.sealed_segment_count,
     })
+}
+
+fn capture_online_family(
+    store_dir: &Path,
+    inspection: &FamilyInspection,
+    live_state: CapturedLogicalState,
+    metadata: crate::wal::OnlineCaptureMetadata,
+) -> Result<(CapturedFamily, Vec<ArtifactDescriptor>), CompactionError> {
+    let family: StoreFamily = inspection.family.into();
+    let active_name = inspection.family.active_name();
+    let mut inventory = Vec::with_capacity(inspection.sealed_segment_count + 1);
+    let mut chain = Vec::new();
+    for segment in 0..inspection.sealed_segment_count {
+        let name = format!("{active_name}.segment-{segment:020}");
+        capture_online_artifact(
+            store_dir,
+            Path::new(&name),
+            ArtifactRole::SealedSegment,
+            family,
+            &mut inventory,
+            &mut chain,
+        )?;
+    }
+    capture_online_artifact(
+        store_dir,
+        Path::new(active_name),
+        ArtifactRole::Active,
+        family,
+        &mut inventory,
+        &mut chain,
+    )?;
+
+    let active = inventory
+        .last()
+        .expect("online capture always includes an active artifact");
+    let measured_total = inventory.iter().try_fold(0_u64, |total, descriptor| {
+        total
+            .checked_add(descriptor.length)
+            .ok_or_else(|| CompactionError::InvalidArtifact {
+                path: store_dir.to_path_buf(),
+            })
+    })?;
+    if active.length != metadata.active_len || measured_total != inspection.total_bytes {
+        return Err(CompactionError::InvalidArtifact {
+            path: store_dir.join(active_name),
+        });
+    }
+
+    let (source_state, granularity_nanos, last_bucket) = match inspection.family {
+        InspectedFamily::KeyValue => {
+            let replay = accepted_tail(replay_key_value_tail(&chain), store_dir)?;
+            (
+                CapturedLogicalState::Value(replay.snapshot),
+                replay.granularity_nanos,
+                replay.last_bucket,
+            )
+        }
+        InspectedFamily::KeySet => {
+            let replay = accepted_tail(replay_key_set_tail(&chain), store_dir)?;
+            (
+                CapturedLogicalState::Set(replay.snapshot),
+                replay.granularity_nanos,
+                replay.last_bucket,
+            )
+        }
+        InspectedFamily::KeyMap => {
+            let replay = accepted_tail(replay_key_map_tail(&chain), store_dir)?;
+            (
+                CapturedLogicalState::Map(replay.snapshot),
+                replay.granularity_nanos,
+                replay.last_bucket,
+            )
+        }
+    };
+    if source_state != live_state
+        || granularity_nanos != metadata.granularity_nanos
+        || last_bucket != metadata.last_bucket
+    {
+        return Err(CompactionError::FailedClosed {
+            detail: "open logical state or timestamp metadata diverged from its WAL".to_owned(),
+        });
+    }
+
+    Ok((
+        CapturedFamily {
+            family,
+            state: live_state,
+            granularity_nanos,
+            last_bucket,
+            before_bytes: inspection.total_bytes,
+            sealed_segment_count: inspection.sealed_segment_count,
+        },
+        inventory,
+    ))
+}
+
+fn capture_online_artifact(
+    store_dir: &Path,
+    name: &Path,
+    role: ArtifactRole,
+    family: StoreFamily,
+    inventory: &mut Vec<ArtifactDescriptor>,
+    chain: &mut Vec<u8>,
+) -> Result<(), CompactionError> {
+    let path = store_dir.join(name);
+    let bytes = fs::read(&path).map_err(|source| CompactionError::Io {
+        operation: CompactionOperation::Capture,
+        path: path.clone(),
+        source,
+    })?;
+    let length = u64::try_from(bytes.len())
+        .map_err(|_| CompactionError::InvalidArtifact { path: path.clone() })?;
+    inventory.push(ArtifactDescriptor {
+        relative_path: name.to_path_buf(),
+        role,
+        family: Some(family),
+        length,
+        checksum: crc32fast::hash(&bytes),
+    });
+    chain.extend_from_slice(&bytes);
+    Ok(())
 }
 
 fn accepted_tail<S>(

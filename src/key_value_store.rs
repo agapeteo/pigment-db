@@ -39,6 +39,47 @@ pub struct DurableKeyValueStore<W: Write> {
 }
 
 impl DurableKeyValueStore<File> {
+    #[cfg(test)]
+    pub(crate) fn begin_online_capture_probe(
+        &self,
+        max_delta_bytes: u64,
+        observer: crate::test_support::maintenance_schedule::MaintenanceObserver,
+    ) -> Result<crate::compaction::PreparedOnlineCapture<'_, File>, crate::CompactionError> {
+        let store_dir = self
+            .file_backing
+            .as_deref()
+            .expect("online compaction requires file backing");
+        crate::compaction::begin_online_capture(
+            &self.maintenance,
+            &self.wal,
+            store_dir,
+            crate::compaction::inspection::InspectedFamily::KeyValue,
+            max_delta_bytes,
+            || {
+                crate::compaction::CapturedLogicalState::Value(
+                    self.store
+                        .iter()
+                        .map(|entry| (entry.key().clone(), entry.value().clone()))
+                        .collect(),
+                )
+            },
+            |stage| {
+                let checkpoint = match stage {
+                    crate::compaction::OnlineCaptureStage::SnapshotCaptured => {
+                        crate::test_support::maintenance_schedule::MaintenanceCheckpoint::SnapshotCapture
+                    }
+                    crate::compaction::OnlineCaptureStage::RecorderActivated => {
+                        crate::test_support::maintenance_schedule::MaintenanceCheckpoint::RecorderActivation
+                    }
+                    crate::compaction::OnlineCaptureStage::ManifestPrepared => {
+                        crate::test_support::maintenance_schedule::MaintenanceCheckpoint::ManifestPrepared
+                    }
+                };
+                observer.checkpoint(checkpoint);
+            },
+        )
+    }
+
     /// Returns exact storage usage for this open key/value generation.
     ///
     /// Vector-backed stores intentionally do not expose filesystem maintenance:
@@ -250,6 +291,16 @@ impl<W: Write> DurableKeyValueStore<W> {
     #[cfg(test)]
     pub(crate) fn maintenance_probe(&self) -> &MaintenanceCoordinator {
         &self.maintenance
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delta_group_count_probe(&self) -> usize {
+        self.wal.delta_group_count_probe()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_delta_recorder_probe(&self) -> bool {
+        self.wal.has_delta_recorder_probe()
     }
 
     #[cfg(test)]

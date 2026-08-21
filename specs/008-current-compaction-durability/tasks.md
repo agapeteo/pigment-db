@@ -208,8 +208,8 @@
 
 ### Snapshot, staging, and cutover
 
-- [ ] T112 [US3] Write and run a runtime RED proving one exclusive interval captures consistent state/metadata, activates exactly one recorder, and durably writes initial online `Prepared` without a mutation gap in `src/compaction/online_tests.rs`
-- [ ] T113 [US3] Implement initial online capture, recorder activation, verified-prefix manifest, and exclusive release in `src/compaction/mod.rs` and `src/compaction/manifest.rs`, then run T112 GREEN
+- [X] T112 [US3] Write and run a runtime RED proving one exclusive interval captures consistent state/metadata, activates exactly one recorder, and durably writes initial online `Prepared` without a mutation gap in `src/compaction/online_tests.rs`
+- [X] T113 [US3] Implement initial online capture, recorder activation, verified-prefix manifest, and exclusive release in `src/compaction/mod.rs` and `src/compaction/manifest.rs`, then run T112 GREEN
 - [ ] T114 [US3] Write and run a runtime RED proving online `Prepared` accepts valid old-WAL appends/rotation during staging, recovery selects old authority, and publication requires `source_finalized = true` in `src/compaction/online_tests.rs`
 - [ ] T115 [US3] Implement online mode/prefix validation and atomic finalized same-phase rewrite rules in `src/compaction/manifest.rs` and `src/compaction/recovery.rs`, then run T114 GREEN
 - [ ] T116 [US3] Write and run one deterministic runtime RED for the single out-of-gate staging behavior, proving reads and writes complete while encoding/validation checkpoints are paused and exclusive maintenance records zero staging operations in `src/compaction/online_tests.rs`
