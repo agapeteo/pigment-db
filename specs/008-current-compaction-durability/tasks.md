@@ -237,8 +237,8 @@
 - [X] T135 [US3] Extend internal WAL health for maintenance indeterminacy and replacement-reopen failure in `src/wal/mod.rs` and `src/compaction/mod.rs`, then run T134 GREEN
 - [X] T136 [US3] Write and run a runtime RED proving post-publication cleanup failure reports pending while replacement stays readable/writable and cleanup converges on reopen or next explicit compaction in `src/compaction/online_tests.rs`
 - [X] T137 [US3] Implement replacement-prefix validation and foreground cleanup retry without background scheduling in `src/compaction/recovery.rs`, `src/compaction/mod.rs`, and all file-store initializers, then run T136 GREEN
-- [ ] T138 [US3] Write and run a runtime RED proving panic/unwind/cancellation at every pre-publication checkpoint clears only the matching recorder and resets the attempt flag after lock guards drop in `src/compaction/online_tests.rs`
-- [ ] T139 [US3] Implement token-safe `OnlineAttemptGuard` and phase-aware `StagingGenerationGuard` drop behavior in `src/maintenance_coordination.rs`, then run T138 GREEN
+- [X] T138 [US3] Write and run a runtime RED proving panic/unwind/cancellation at every pre-publication checkpoint clears only the matching recorder and resets the attempt flag after lock guards drop in `src/compaction/online_tests.rs`
+- [X] T139 [US3] Implement token-safe `OnlineAttemptGuard` and phase-aware `StagingGenerationGuard` drop behavior in `src/maintenance_coordination.rs`, then run T138 GREEN
 
 ### Public US3 promotion and checkpoint
 

@@ -32,6 +32,7 @@ pub(crate) struct PreparedOnlineCapture<'a, W: Write> {
     pub(crate) capture: CapturedFamily,
     pub(crate) paths: MaintenanceArtifactPaths,
     pub(crate) manifest: crate::compaction::manifest::CompactionManifest,
+    pub(crate) generation_guard: crate::maintenance_coordination::StagingGenerationGuard,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,7 +47,6 @@ pub(crate) struct ValidatedOnlineStaging<'a, W: Write> {
     pub(crate) prepared: PreparedOnlineCapture<'a, W>,
     pub(crate) staging: CapturedFamily,
     pub(crate) replacement_inventory: Vec<ArtifactDescriptor>,
-    pub(crate) generation_guard: crate::maintenance_coordination::StagingGenerationGuard,
 }
 
 #[allow(dead_code)]
@@ -92,14 +92,9 @@ pub(crate) enum OnlineStagingStage {
 }
 
 pub(crate) fn prepare_online_staging<'a, W: Write>(
-    prepared: PreparedOnlineCapture<'a, W>,
+    mut prepared: PreparedOnlineCapture<'a, W>,
     mut checkpoint: impl FnMut(OnlineStagingStage) -> io::Result<()>,
 ) -> Result<ValidatedOnlineStaging<'a, W>, CompactionError> {
-    let mut generation_guard = crate::maintenance_coordination::StagingGenerationGuard::new(
-        prepared.paths.clone(),
-        prepared.manifest.operation_id,
-        prepared.manifest.durability,
-    );
     let checkpoint_error = |stage, source| CompactionError::Io {
         operation: match stage {
             OnlineStagingStage::Validation | OnlineStagingStage::Reopen => {
@@ -129,7 +124,7 @@ pub(crate) fn prepare_online_staging<'a, W: Write>(
             path: prepared.paths.staging.clone(),
             source,
         })?;
-    generation_guard.mark_staging_owned();
+    prepared.generation_guard.mark_staging_owned();
     checkpoint(OnlineStagingStage::Write)
         .map_err(|source| checkpoint_error(OnlineStagingStage::Write, source))?;
     staging_file
@@ -206,7 +201,6 @@ pub(crate) fn prepare_online_staging<'a, W: Write>(
         prepared,
         staging,
         replacement_inventory,
-        generation_guard,
     })
 }
 
@@ -433,7 +427,7 @@ pub(crate) fn begin_online_capture<'a, W: Write>(
             detail: "online compaction is already active for this store instance".to_owned(),
         })?;
     recovery::resolve_online_maintenance_for_compaction(store_dir, inspected_family)?;
-    let (capture, source_inventory, paths, manifest) = {
+    let (capture, source_inventory, paths, manifest, generation_guard) = {
         let _exclusive = coordinator.exclusive();
         let live_state = capture_live_state();
         let metadata = wal
@@ -473,8 +467,13 @@ pub(crate) fn begin_online_capture<'a, W: Write>(
             metadata.durability_policy,
             source_inventory.clone(),
         )?;
+        let generation_guard = crate::maintenance_coordination::StagingGenerationGuard::new(
+            paths.clone(),
+            manifest.operation_id,
+            manifest.durability,
+        );
         checkpoint(OnlineCaptureStage::ManifestPrepared);
-        (capture, source_inventory, paths, manifest)
+        (capture, source_inventory, paths, manifest, generation_guard)
     };
     debug_assert_eq!(source_inventory, manifest.source_inventory);
     Ok(PreparedOnlineCapture {
@@ -482,6 +481,7 @@ pub(crate) fn begin_online_capture<'a, W: Write>(
         capture,
         paths,
         manifest,
+        generation_guard,
     })
 }
 

@@ -1041,6 +1041,96 @@ fn post_publication_cleanup_failure_is_pending_and_retries_only_in_foreground() 
 }
 
 #[test]
+fn every_prepublication_panic_and_cancellation_clears_only_its_attempt_artifacts() {
+    fn assert_ready_after_unwind(
+        store: &DurableKeyValueStore<std::fs::File>,
+        directory: &std::path::Path,
+    ) {
+        let paths =
+            crate::compaction::publication::family_artifact_paths(&directory.join("kv.wal.dat"))
+                .unwrap();
+        assert!(!paths.manifest.exists());
+        assert!(!paths.manifest_next.exists());
+        assert!(!paths.staging.exists());
+        assert!(!paths.previous.exists());
+        assert!(!store.has_delta_recorder_probe());
+        let next = store.maintenance_probe().try_begin_online().unwrap();
+        drop(next);
+        store
+            .try_put(b"after-unwind".to_vec(), b"accepted".to_vec())
+            .unwrap();
+        assert_eq!(store.get(b"after-unwind"), Some(b"accepted".to_vec()));
+    }
+
+    for target in [
+        super::OnlineCaptureStage::SnapshotCaptured,
+        super::OnlineCaptureStage::RecorderActivated,
+        super::OnlineCaptureStage::ManifestPrepared,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableKeyValueStore::try_init_new(directory.path())
+            .unwrap()
+            .into_store();
+        store.put(b"authority".to_vec(), b"unchanged".to_vec());
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.begin_online_capture_with_checkpoint_probe(u64::MAX, |stage| {
+                if stage == target {
+                    panic!("scripted {target:?} panic");
+                }
+            });
+        }));
+        assert!(unwind.is_err(), "{target:?} did not unwind");
+        assert_eq!(store.get(b"authority"), Some(b"unchanged".to_vec()));
+        assert_ready_after_unwind(&store, directory.path());
+    }
+
+    for target in [
+        super::OnlineStagingStage::Encoding,
+        super::OnlineStagingStage::Create,
+        super::OnlineStagingStage::Write,
+        super::OnlineStagingStage::Synchronize,
+        super::OnlineStagingStage::Validation,
+        super::OnlineStagingStage::Reopen,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableKeyValueStore::try_init_new(directory.path())
+            .unwrap()
+            .into_store();
+        store.put(b"authority".to_vec(), b"unchanged".to_vec());
+        let capture = store
+            .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
+            .unwrap();
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = super::prepare_online_staging(capture, |stage| {
+                if stage == target {
+                    panic!("scripted {target:?} panic");
+                }
+                Ok(())
+            });
+        }));
+        assert!(unwind.is_err(), "{target:?} did not unwind");
+        assert_eq!(store.get(b"authority"), Some(b"unchanged".to_vec()));
+        assert_ready_after_unwind(&store, directory.path());
+    }
+
+    for cancel_after_staging in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableKeyValueStore::try_init_new(directory.path())
+            .unwrap()
+            .into_store();
+        let capture = store
+            .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
+            .unwrap();
+        if cancel_after_staging {
+            drop(super::prepare_online_staging(capture, |_| Ok(())).unwrap());
+        } else {
+            drop(capture);
+        }
+        assert_ready_after_unwind(&store, directory.path());
+    }
+}
+
+#[test]
 fn paused_first_attempt_keeps_progress_and_losing_second_call_artifact_free() {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(

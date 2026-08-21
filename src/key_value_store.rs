@@ -47,6 +47,28 @@ impl DurableKeyValueStore<File> {
         max_delta_bytes: u64,
         observer: crate::test_support::maintenance_schedule::MaintenanceObserver,
     ) -> Result<crate::compaction::PreparedOnlineCapture<'_, File>, crate::CompactionError> {
+        self.begin_online_capture_with_checkpoint_probe(max_delta_bytes, |stage| {
+            let checkpoint = match stage {
+                crate::compaction::OnlineCaptureStage::SnapshotCaptured => {
+                    crate::test_support::maintenance_schedule::MaintenanceCheckpoint::SnapshotCapture
+                }
+                crate::compaction::OnlineCaptureStage::RecorderActivated => {
+                    crate::test_support::maintenance_schedule::MaintenanceCheckpoint::RecorderActivation
+                }
+                crate::compaction::OnlineCaptureStage::ManifestPrepared => {
+                    crate::test_support::maintenance_schedule::MaintenanceCheckpoint::ManifestPrepared
+                }
+            };
+            observer.checkpoint(checkpoint);
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_online_capture_with_checkpoint_probe(
+        &self,
+        max_delta_bytes: u64,
+        checkpoint: impl FnMut(crate::compaction::OnlineCaptureStage),
+    ) -> Result<crate::compaction::PreparedOnlineCapture<'_, File>, crate::CompactionError> {
         let store_dir = self
             .file_backing
             .as_deref()
@@ -65,20 +87,7 @@ impl DurableKeyValueStore<File> {
                         .collect(),
                 )
             },
-            |stage| {
-                let checkpoint = match stage {
-                    crate::compaction::OnlineCaptureStage::SnapshotCaptured => {
-                        crate::test_support::maintenance_schedule::MaintenanceCheckpoint::SnapshotCapture
-                    }
-                    crate::compaction::OnlineCaptureStage::RecorderActivated => {
-                        crate::test_support::maintenance_schedule::MaintenanceCheckpoint::RecorderActivation
-                    }
-                    crate::compaction::OnlineCaptureStage::ManifestPrepared => {
-                        crate::test_support::maintenance_schedule::MaintenanceCheckpoint::ManifestPrepared
-                    }
-                };
-                observer.checkpoint(checkpoint);
-            },
+            checkpoint,
         )
     }
 
