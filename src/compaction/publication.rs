@@ -478,25 +478,32 @@ pub(crate) fn publish_online_previous(
         })?;
         let source_path = anchor.join(&descriptor.relative_path);
         let previous_path = paths.previous.join(file_name);
-        fs::rename(&source_path, &previous_path).map_err(|source| CompactionError::Io {
+        crate::durability::move_namespace(
+            &source_path,
+            &previous_path,
+            manifest.durability,
+            crate::durability::NamespaceMoveMode::NoReplace,
+        )
+        .map_err(|source| CompactionError::Io {
             operation: CompactionOperation::PublishPrevious,
             path: previous_path,
             source,
         })?;
     }
     if manifest.durability == DurabilityPolicy::Physical {
-        crate::durability::synchronize_directory(&paths.previous).map_err(|source| {
-            CompactionError::Io {
+        crate::durability::synchronize_namespace_parent(&paths.previous, manifest.durability)
+            .map_err(|source| CompactionError::Io {
                 operation: CompactionOperation::PublishPrevious,
                 path: paths.previous.clone(),
                 source,
-            }
-        })?;
-        crate::durability::synchronize_directory(anchor).map_err(|source| CompactionError::Io {
-            operation: CompactionOperation::PublishPrevious,
-            path: anchor.to_path_buf(),
-            source,
-        })?;
+            })?;
+        crate::durability::synchronize_namespace_parent(anchor, manifest.durability).map_err(
+            |source| CompactionError::Io {
+                operation: CompactionOperation::PublishPrevious,
+                path: anchor.to_path_buf(),
+                source,
+            },
+        )?;
     }
     let mut next = manifest.clone();
     next.phase = ManifestPhase::PreviousPublished;
@@ -561,7 +568,13 @@ pub(crate) fn publish_online_replacement_with_reopen<T>(
             });
         }
     }
-    fs::rename(&paths.staging, &active_path).map_err(|source| CompactionError::Io {
+    crate::durability::move_namespace(
+        &paths.staging,
+        &active_path,
+        manifest.durability,
+        crate::durability::NamespaceMoveMode::NoReplace,
+    )
+    .map_err(|source| CompactionError::Io {
         operation: CompactionOperation::PublishReplacement,
         path: active_path.clone(),
         source,
