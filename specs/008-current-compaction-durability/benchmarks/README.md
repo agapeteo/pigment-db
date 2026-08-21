@@ -72,6 +72,65 @@ This reconstruction keeps production code at the pre-feature commit while
 using byte-identical test infrastructure. No specification, integration-test,
 or candidate production file is copied.
 
+## Platform prerequisites
+
+- Final performance acceptance requires this Linux host to be quiet, CPUs
+  `12-19` available for `taskset`, the recorded Btrfs data placement, the
+  recorded Rust/Cargo toolchain, and no concurrent baseline/candidate runs.
+- Real Windows physical-durability evidence requires a Windows worker with an
+  NTFS same-directory test location. Linux cross-compilation validates the
+  target-specific source boundary but cannot execute `MoveFileExW`, sharing
+  violations, or write-through namespace publication.
+- Linux/macOS compatibility jobs retain their existing rename plus directory
+  synchronization behavior and must be green in CI before release.
+
+## Preparation evidence (2026-08-20)
+
+The three immutable quiet-host baseline captures remain available in
+[baseline.md](./baseline.md) and
+[`baseline/`](./baseline/). Their source commit, dirty-state digest, harness
+digest, toolchain, filesystem, affinity, row counts, and artifact checksums all
+match the frozen protocol above.
+
+The pre-feature implementation was reconstructed at
+`/work/@projects/penpack-projects/pigment-db-008-baseline` from commit
+`a7c8281f72e25c177a142be99285faead7335e01`. Only the frozen performance
+harness was copied into that worktree. Both copies hashed to
+`c8ca6c94e6f38d54e456462bce2e8fad0d3cffa2b2457f4c2818129b1c62006c`.
+Baseline and candidate release binaries each completed a result-free 36-cell
+smoke traversal with the same CPUs, temporary directory, filesystem, payload,
+workload, and toolchain.
+
+From the reconstructed baseline worktree:
+
+```text
+CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=/work/@projects/penpack-projects/pigment-db/target/008-baseline-build TMPDIR=/work/@projects/penpack-projects/pigment-db/target/compaction-benchmark-tmp PIGMENT_DB_COMPACTION_BENCHMARK_SMOKE=1 taskset -c 12-19 cargo test --release --test mutation_ordering performance::paired_baseline -- --exact --ignored --nocapture --test-threads=1
+```
+
+From the candidate worktree:
+
+```text
+TMPDIR=/work/@projects/penpack-projects/pigment-db/target/compaction-benchmark-tmp PIGMENT_DB_COMPACTION_BENCHMARK_SMOKE=1 taskset -c 12-19 cargo test --release --test mutation_ordering performance::paired_baseline -- --exact --ignored --nocapture --test-threads=1
+```
+
+A non-acceptance diagnostic compared a newly reconstructed pre-feature matrix
+with the candidate under the current machine state. The reconstructed baseline
+itself was substantially slower than the immutable quiet baseline in several
+one-worker cells, proving that direct comparison with the earlier quiet capture
+was invalid for development diagnosis. Deterministic tests found no structural
+failure: every mutation still holds the maintenance gate through WAL acceptance
+and live publication, reads bypass it, inactive delta recording builds no
+payload, and staging encode/validation occurs outside exclusive maintenance.
+
+Two speculative optimizations were rejected rather than carried into the
+candidate. Bypassing maintenance for vector stores violated the all-mutation
+gate invariant and failed three deterministic ordering tests. A custom atomic
+reader gate first exposed a lost-wakeup deadlock and, after that defect was
+corrected, was materially slower than the standard-library `RwLock`. The final
+candidate therefore retains the simpler, fully GREEN standard gate. Diagnostic
+measurements are not acceptance evidence; only the approved counterbalanced
+quiet-host matrices may decide the thresholds.
+
 ## Artifact policy
 
 - `baseline/` contains immutable raw pre-feature CSV and metadata.

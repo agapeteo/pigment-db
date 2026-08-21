@@ -48,6 +48,12 @@ impl DurableKeySetStore<File> {
     ///
     /// The operation is explicitly caller-triggered, inherits the store's opened
     /// durability policy, and bounds concurrent delta recording with `options`.
+    /// Reads bypass maintenance coordination. Mutations pause only during
+    /// snapshot capture and cutover; staging work runs outside the exclusive
+    /// gate. Indeterminate publication keeps reads available but rejects later
+    /// mutations until reopen resolves authority. A successful
+    /// [`crate::CleanupStatus::Pending`] outcome is authoritative and cleanup is
+    /// retried on reopen or another explicit compaction.
     pub fn try_compact_online(
         &self,
         options: crate::OnlineCompactionOptions,

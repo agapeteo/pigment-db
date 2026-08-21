@@ -1,4 +1,12 @@
 //! Durability capability errors and internal barrier implementation.
+//!
+//! On Windows, physical durability preflights file-content synchronization and
+//! a disposable same-directory write-through namespace move before a store is
+//! exposed. Windows publication uses a narrowly scoped `MoveFileExW` boundary
+//! because standard Rust rename APIs cannot request write-through namespace
+//! semantics. A failed preflight is returned as
+//! [`DurabilitySupportError::RequiredBarrierUnavailable`]; physical requests
+//! are never downgraded to buffered mode.
 
 #[cfg(target_os = "windows")]
 mod windows;

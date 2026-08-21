@@ -138,6 +138,29 @@ The checkpoint completed with zero failures:
 - `cargo fmt --all -- --check`;
 - `cargo clippy --all-targets --all-features -- -D warnings`.
 
+### End-to-end local validation checkpoint (2026-08-20)
+
+The final Linux development tree completed every required local command with
+zero failures after documentation and performance diagnosis:
+
+- `cargo test --all-targets --all-features -- --test-threads=1`;
+- `cargo test --release --all-targets --all-features -- --test-threads=1`;
+- `cargo fmt --all -- --check`;
+- `cargo clippy --all-targets --all-features -- -D warnings`;
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features`.
+
+`cargo check --tests --target x86_64-pc-windows-gnu --all-features` is also
+GREEN, including the target-specific Windows durability implementation and test
+sources. This Linux host cannot execute the real Win32 matrix, so Windows
+runtime evidence remains a CI prerequisite rather than a local claim.
+
+Recovery/fault evidence is summarized in the User Story 2 and 3 checkpoints
+below. Migration fixture evidence is summarized in User Story 5. Immutable
+baseline provenance, raw CSV links, diagnostic conclusions, exact smoke
+commands, and quiet-host prerequisites are recorded in
+[benchmarks/README.md](./benchmarks/README.md); the final candidate and verdict
+remain pending the explicitly approved quiet-machine capture.
+
 ### User Story 2 closed-compaction GREEN checkpoint (2026-08-20)
 
 SC-002 is GREEN. Public buffered and supported physical compaction reduced

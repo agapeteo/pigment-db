@@ -419,6 +419,18 @@ pub(crate) fn map_inspection_error(default_path: PathBuf, error: io::Error) -> C
 }
 
 /// Inspects exact current-format storage usage without changing files or recovery state.
+///
+/// Inspection never repairs interrupted maintenance or legacy data. A
+/// [`CompactionError::MigrationRequired`] result means the caller must run the
+/// external `pigment-db-migrate` tool.
+///
+/// ```no_run
+/// # fn main() -> Result<(), pigment_db::CompactionError> {
+/// let stats = pigment_db::inspect_storage("database")?;
+/// println!("{} bytes in {} families", stats.total_bytes(), stats.families().len());
+/// # Ok(())
+/// # }
+/// ```
 pub fn inspect_storage(
     store_dir: impl AsRef<Path>,
 ) -> Result<DirectoryStorageStats, CompactionError> {
@@ -433,6 +445,21 @@ pub fn inspect_storage(
 /// The caller must close every store instance for `store_dir` before calling
 /// this function. Pigment DB detects same-process overlap and returns
 /// [`CompactionError::FailedClosed`] without changing storage.
+///
+/// [`CleanupStatus::Pending`] in a successful outcome means replacement
+/// authority is established but obsolete evidence remains. Reopening the store
+/// or invoking compaction again retries safe cleanup.
+///
+/// ```no_run
+/// # fn main() -> Result<(), pigment_db::CompactionError> {
+/// use pigment_db::{compact_directory_in_place, ClosedCompactionOptions};
+/// let outcome = compact_directory_in_place("database", ClosedCompactionOptions::default())?;
+/// for family in outcome.families() {
+///     println!("{:?}: {} -> {} bytes", family.family(), family.before_bytes(), family.after_bytes());
+/// }
+/// # Ok(())
+/// # }
+/// ```
 pub fn compact_directory_in_place(
     store_dir: impl AsRef<Path>,
     options: ClosedCompactionOptions,

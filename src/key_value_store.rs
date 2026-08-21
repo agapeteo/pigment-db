@@ -44,6 +44,23 @@ impl DurableKeyValueStore<File> {
     ///
     /// The operation is explicitly caller-triggered, inherits the store's opened
     /// durability policy, and bounds concurrent delta recording with `options`.
+    /// Reads stay on the normal DashMap path. Mutations pause only during the
+    /// initial snapshot and final cutover; staging encode and validation run
+    /// outside the exclusive maintenance gate. If publication becomes
+    /// indeterminate, reads remain available but later mutations fail until a
+    /// successful reopen resolves authority.
+    ///
+    /// ```no_run
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// use pigment_db::key_value_store::DurableKeyValueStore;
+    /// use pigment_db::OnlineCompactionOptions;
+    /// let store = DurableKeyValueStore::try_init_new("database")?.into_store();
+    /// store.put(b"key".to_vec(), b"value".to_vec());
+    /// let outcome = store.try_compact_online(OnlineCompactionOptions::default())?;
+    /// println!("cleanup: {:?}", outcome.cleanup());
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn try_compact_online(
         &self,
         options: crate::OnlineCompactionOptions,
