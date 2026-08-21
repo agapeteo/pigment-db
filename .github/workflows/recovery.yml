@@ -72,6 +72,16 @@ jobs:
             Write-Output "::error title=Windows physical durability tests::$details"
             exit $exit_code
           }
+      - name: Windows native boundary and physical fault models
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo test durability::windows::tests -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test wal::durability_tests:: -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test compaction::recovery_tests:: -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Set compute publication faults
         run: |
           cargo test key_set_store::tests:: -- --test-threads=1

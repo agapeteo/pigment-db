@@ -137,6 +137,33 @@ fn windows_physical_durability_failure_is_reported_as_a_structured_annotation() 
 }
 
 #[test]
+fn windows_workflow_runs_native_boundary_and_private_physical_fault_models() {
+    let workflow_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(".github")
+        .join("workflows")
+        .join("recovery.yml");
+    let workflow = fs::read_to_string(&workflow_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read recovery workflow {}: {error}",
+            workflow_path.display()
+        )
+    });
+
+    for required in [
+        "- name: Windows native boundary and physical fault models",
+        "if: runner.os == 'Windows'",
+        "cargo test durability::windows::tests -- --test-threads=1",
+        "cargo test wal::durability_tests:: -- --test-threads=1",
+        "cargo test compaction::recovery_tests:: -- --test-threads=1",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "Windows CI must execute the private native boundary and physical fault-model suites; missing `{required}`"
+        );
+    }
+}
+
+#[test]
 fn maintenance_public_api_is_narrow_while_implementation_modules_remain_private() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     for relative in [
