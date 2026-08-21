@@ -49,10 +49,13 @@ jobs:
         if: runner.os == 'Windows'
         run: cargo test --test windows_physical_durability -- --test-threads=1
       - name: Set compute publication faults
-        run: cargo test key_set_store::tests:: -- --test-threads=1
+        run: |
+          cargo test key_set_store::tests:: -- --test-threads=1
       - name: Map compute publication faults
-        run: cargo test key_map_store::tests:: -- --test-threads=1
+        run: |
+          cargo test key_map_store::tests:: -- --test-threads=1
       - name: Offline migration engine
-        run: cargo test migration::tests:: -- --test-threads=1
+        run: |
+          cargo test migration::tests:: -- --test-threads=1
       - name: Migration command-line contract
         run: cargo test --test migration_cli -- --test-threads=1

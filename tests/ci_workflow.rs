@@ -57,6 +57,31 @@ fn recovery_workflow_runs_the_complete_suite_on_linux() {
 }
 
 #[test]
+fn recovery_workflow_does_not_use_yaml_ambiguous_inline_run_commands() {
+    let workflow_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(".github")
+        .join("workflows")
+        .join("recovery.yml");
+    let workflow = fs::read_to_string(&workflow_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read recovery workflow {}: {error}",
+            workflow_path.display()
+        )
+    });
+
+    let ambiguous_commands = workflow
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("run: "))
+        .filter(|command| command.contains(": "))
+        .collect::<Vec<_>>();
+
+    assert!(
+        ambiguous_commands.is_empty(),
+        "inline `run:` commands containing `: ` are ambiguous YAML scalars; use a block scalar: {ambiguous_commands:?}"
+    );
+}
+
+#[test]
 fn maintenance_public_api_is_narrow_while_implementation_modules_remain_private() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     for relative in [
