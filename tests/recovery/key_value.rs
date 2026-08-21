@@ -400,7 +400,7 @@ fn filesystem_failures_include_operation_path_and_source() {
     assert_io(
         DurableKeyValueStore::try_init_new(&not_a_directory),
         RecoveryOperation::Inspect,
-        &not_a_directory.join("kv.wal.dat"),
+        &not_a_directory,
     );
 
     let open_directory = tempfile::tempdir().unwrap();

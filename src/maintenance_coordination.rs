@@ -200,6 +200,17 @@ fn lock_registry() -> MutexGuard<'static, HashMap<PathBuf, OwnershipState>> {
 }
 
 fn canonical_directory_identity(store_dir: &Path) -> io::Result<PathBuf> {
+    match std::fs::metadata(store_dir) {
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "store directory path is not a directory",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     if let Ok(canonical) = std::fs::canonicalize(store_dir) {
         return Ok(canonical);
     }
