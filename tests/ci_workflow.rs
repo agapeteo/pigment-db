@@ -158,6 +158,9 @@ fn windows_workflow_runs_native_boundary_and_private_physical_fault_models() {
         "::error title=Windows native durability boundary::",
         "::error title=Windows WAL durability fault models::",
         "::error title=Windows compaction recovery fault models::",
+        "$failed = $false",
+        "$failed = $true",
+        "if ($failed) { exit 1 }",
     ] {
         assert!(
             workflow.contains(required),

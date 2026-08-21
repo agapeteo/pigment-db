@@ -398,7 +398,7 @@ mod tests {
         let source = directory.path().join("held-source");
         let destination = directory.path().join("held-destination");
         std::fs::write(&source, b"authoritative").unwrap();
-        let held = std::fs::OpenOptions::new()
+        let mut held = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(0)
             .open(&source)
@@ -408,8 +408,11 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.raw_os_error(), Some(32));
-        assert_eq!(std::fs::read(&source).unwrap(), b"authoritative");
+        let mut held_bytes = Vec::new();
+        held.read_to_end(&mut held_bytes).unwrap();
+        assert_eq!(held_bytes, b"authoritative");
         assert!(!destination.exists());
         drop(held);
+        assert_eq!(std::fs::read(&source).unwrap(), b"authoritative");
     }
 }
