@@ -701,6 +701,129 @@ fn cutover_rejects_exact_live_mismatch_before_namespace_publication() {
     assert!(!store.has_delta_recorder_probe());
 }
 
+#[test]
+fn bounded_delta_zero_exact_and_one_group_over_preserve_original_authority() {
+    struct Case {
+        name: &'static str,
+        limit: u64,
+        mutations: usize,
+        overflows: bool,
+    }
+
+    let exact_group_bytes = one_put_delta_encoded_len();
+    let cases = [
+        Case {
+            name: "zero",
+            limit: 0,
+            mutations: 0,
+            overflows: false,
+        },
+        Case {
+            name: "exact",
+            limit: exact_group_bytes,
+            mutations: 1,
+            overflows: false,
+        },
+        Case {
+            name: "one-group-over",
+            limit: exact_group_bytes,
+            mutations: 2,
+            overflows: true,
+        },
+    ];
+
+    for case in cases {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableKeyValueStore::try_init_new(directory.path())
+            .unwrap()
+            .into_store();
+        store.put(b"snapshot".to_vec(), case.name.as_bytes().to_vec());
+        let capture = store
+            .begin_online_capture_probe(case.limit, MaintenanceObserver::default())
+            .unwrap();
+        let staged = super::prepare_online_staging(capture, |_| {}).unwrap();
+        let paths = staged.prepared.paths.clone();
+
+        if case.mutations >= 1 {
+            store.put(b"delta-a".to_vec(), b"value-a".to_vec());
+        }
+        if case.mutations >= 2 {
+            store.put(b"delta-b".to_vec(), b"value-b".to_vec());
+        }
+        let active = directory.path().join("kv.wal.dat");
+        let authoritative_before_cutover = std::fs::read(&active).unwrap();
+        let result = store.apply_online_delta_probe(staged);
+
+        match (case.overflows, result) {
+            (true, Err(crate::CompactionError::ConcurrentDeltaLimitExceeded { limit })) => {
+                assert_eq!(limit, exact_group_bytes);
+                assert_eq!(
+                    std::fs::read(&active).unwrap(),
+                    authoritative_before_cutover
+                );
+                assert!(
+                    !paths.staging.exists(),
+                    "{} staging survived abort",
+                    case.name
+                );
+                assert!(
+                    !paths.manifest.exists(),
+                    "{} manifest survived abort",
+                    case.name
+                );
+                assert!(!paths.previous.exists());
+                assert!(!store.has_delta_recorder_probe());
+
+                store.put(b"after-abort".to_vec(), b"still-writable".to_vec());
+                assert_eq!(store.get(b"delta-a"), Some(b"value-a".to_vec()));
+                assert_eq!(store.get(b"delta-b"), Some(b"value-b".to_vec()));
+            }
+            (true, Err(error)) => panic!("{} returned wrong error: {error}", case.name),
+            (true, Ok(_)) => panic!("{} unexpectedly succeeded", case.name),
+            (false, Ok(applied)) => {
+                assert_eq!(applied.replayed, case.mutations);
+                assert_eq!(
+                    applied.encoded_bytes,
+                    exact_group_bytes * case.mutations as u64
+                );
+                assert!(!paths.previous.exists());
+                drop(applied);
+            }
+            (false, Err(error)) => panic!("{} failed: {error}", case.name),
+        };
+
+        if case.overflows {
+            drop(store);
+            let reopened = DurableKeyValueStore::try_init_new(directory.path())
+                .unwrap()
+                .into_store();
+            assert_eq!(reopened.get(b"delta-a"), Some(b"value-a".to_vec()));
+            assert_eq!(reopened.get(b"delta-b"), Some(b"value-b".to_vec()));
+            assert_eq!(
+                reopened.get(b"after-abort"),
+                Some(b"still-writable".to_vec())
+            );
+        }
+    }
+}
+
+fn one_put_delta_encoded_len() -> u64 {
+    let directory = tempfile::tempdir().unwrap();
+    let store = DurableKeyValueStore::try_init_new(directory.path())
+        .unwrap()
+        .into_store();
+    store.put(b"snapshot".to_vec(), b"calibration".to_vec());
+    let capture = store
+        .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
+        .unwrap();
+    let staged = super::prepare_online_staging(capture, |_| {}).unwrap();
+    store.put(b"delta-a".to_vec(), b"value-a".to_vec());
+    let exact = store.delta_used_bytes_probe();
+    assert!(exact > 0);
+    drop(staged);
+    exact
+}
+
 fn assert_staging_pause_allows_progress(
     store: &Arc<DurableKeyValueStore<std::fs::File>>,
     key: &[u8],

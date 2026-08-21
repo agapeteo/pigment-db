@@ -817,6 +817,16 @@ impl<W: Write> WalStorage<W> {
     }
 
     #[cfg(test)]
+    pub(crate) fn delta_used_bytes_probe(&self) -> u64 {
+        self.wal_state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .delta_recorder
+            .as_ref()
+            .map_or(0, DeltaRecorder::used_bytes)
+    }
+
+    #[cfg(test)]
     pub(crate) fn has_delta_recorder_probe(&self) -> bool {
         self.wal_state
             .read()

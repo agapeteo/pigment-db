@@ -92,7 +92,15 @@ impl DurableKeyValueStore<File> {
                     detail: "online compaction lost its matching delta recorder".to_owned(),
                 }
             })?;
-            let applied = crate::compaction::apply_online_delta_to_staging(&mut staged, &delta)?;
+            let applied =
+                match crate::compaction::apply_online_delta_to_staging(&mut staged, &delta) {
+                    Ok(applied) => applied,
+                    Err(error @ crate::CompactionError::ConcurrentDeltaLimitExceeded { .. }) => {
+                        crate::compaction::abandon_online_prepublication(&staged)?;
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                };
             let live_state = crate::compaction::CapturedLogicalState::Value(
                 self.store
                     .iter()
@@ -335,6 +343,11 @@ impl<W: Write> DurableKeyValueStore<W> {
     #[cfg(test)]
     pub(crate) fn delta_group_count_probe(&self) -> usize {
         self.wal.delta_group_count_probe()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delta_used_bytes_probe(&self) -> u64 {
+        self.wal.delta_used_bytes_probe()
     }
 
     #[cfg(test)]

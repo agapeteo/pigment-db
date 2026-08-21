@@ -272,6 +272,17 @@ pub(crate) fn apply_online_delta_to_staging<W: Write>(
     })
 }
 
+pub(crate) fn abandon_online_prepublication<W: Write>(
+    staged: &ValidatedOnlineStaging<'_, W>,
+) -> Result<(), CompactionError> {
+    let store_dir = staged.prepared.paths.manifest.parent().ok_or_else(|| {
+        CompactionError::InvalidArtifact {
+            path: staged.prepared.paths.manifest.clone(),
+        }
+    })?;
+    recovery::abandon_prepared_online(store_dir, &staged.prepared.paths, &staged.prepared.manifest)
+}
+
 pub(crate) fn validate_online_staging_against_live<W: Write>(
     staged: &ValidatedOnlineStaging<'_, W>,
     live_state: CapturedLogicalState,

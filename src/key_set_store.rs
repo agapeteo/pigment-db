@@ -97,7 +97,15 @@ impl DurableKeySetStore<File> {
                     detail: "online compaction lost its matching delta recorder".to_owned(),
                 }
             })?;
-            let applied = crate::compaction::apply_online_delta_to_staging(&mut staged, &delta)?;
+            let applied =
+                match crate::compaction::apply_online_delta_to_staging(&mut staged, &delta) {
+                    Ok(applied) => applied,
+                    Err(error @ crate::CompactionError::ConcurrentDeltaLimitExceeded { .. }) => {
+                        crate::compaction::abandon_online_prepublication(&staged)?;
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                };
             let live_state = crate::compaction::CapturedLogicalState::Set(
                 self.store
                     .iter()

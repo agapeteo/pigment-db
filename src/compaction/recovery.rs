@@ -623,6 +623,14 @@ pub(crate) fn recover_prepared_online(
     paths: &MaintenanceArtifactPaths,
     manifest: &CompactionManifest,
 ) -> Result<(), CompactionError> {
+    abandon_prepared_online(store_dir, paths, manifest)
+}
+
+pub(crate) fn abandon_prepared_online(
+    store_dir: &Path,
+    paths: &MaintenanceArtifactPaths,
+    manifest: &CompactionManifest,
+) -> Result<(), CompactionError> {
     validate_online_prepared_binding(store_dir, paths, manifest)?;
     remove_unpublished_manifest_temp(paths)?;
     if !source_descriptors_match(store_dir, manifest) {
