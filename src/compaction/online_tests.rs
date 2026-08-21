@@ -486,6 +486,104 @@ fn online_prepared_recovery_accepts_append_rotation_and_requires_finalization() 
     drop(second);
 }
 
+#[test]
+fn staging_encode_and_validation_run_without_exclusive_maintenance() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        DurableKeyValueStore::try_init_new(directory.path())
+            .unwrap()
+            .into_store(),
+    );
+    store.put(b"snapshot".to_vec(), b"captured".to_vec());
+    let (observer, controller) = MaintenanceObserver::controlled([
+        MaintenanceCheckpoint::StagingEncode,
+        MaintenanceCheckpoint::StagingValidation,
+    ]);
+    let (staged_tx, staged_rx) = mpsc::sync_channel(0);
+    let (drop_tx, drop_rx) = mpsc::sync_channel(0);
+    let worker_store = Arc::clone(&store);
+    let worker = std::thread::spawn(move || {
+        let capture = worker_store
+            .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
+            .unwrap();
+        let staged = super::prepare_online_staging(capture, |stage| {
+            observer.checkpoint(match stage {
+                super::OnlineStagingStage::Encoding => MaintenanceCheckpoint::StagingEncode,
+                super::OnlineStagingStage::Validation => MaintenanceCheckpoint::StagingValidation,
+            });
+        })
+        .unwrap();
+        staged_tx
+            .send((
+                staged.staging.clone(),
+                staged.prepared.paths.clone(),
+                staged.replacement_inventory.clone(),
+            ))
+            .unwrap();
+        drop_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(staged);
+    });
+
+    controller.wait_until_reached(MaintenanceCheckpoint::StagingEncode);
+    assert_staging_pause_allows_progress(&store, b"during-encode", b"one");
+    controller.release(MaintenanceCheckpoint::StagingEncode);
+
+    controller.wait_until_reached(MaintenanceCheckpoint::StagingValidation);
+    assert_staging_pause_allows_progress(&store, b"during-validation", b"two");
+    controller.release(MaintenanceCheckpoint::StagingValidation);
+
+    let (staging, paths, replacement_inventory) =
+        staged_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(staging.family, crate::StoreFamily::KeyValue);
+    let crate::compaction::CapturedLogicalState::Value(snapshot) = staging.state else {
+        panic!("key/value staging returned the wrong family state");
+    };
+    assert_eq!(
+        snapshot.get(b"snapshot".as_slice()),
+        Some(&b"captured".to_vec())
+    );
+    assert!(!snapshot.contains_key(b"during-encode".as_slice()));
+    assert!(!snapshot.contains_key(b"during-validation".as_slice()));
+    assert_eq!(replacement_inventory.len(), 1);
+    assert_eq!(
+        replacement_inventory[0].relative_path,
+        std::path::PathBuf::from(paths.staging.file_name().unwrap())
+    );
+    assert!(paths.staging.is_file());
+    assert_eq!(store.delta_group_count_probe(), 2);
+
+    drop_tx.send(()).unwrap();
+    worker.join().unwrap();
+    assert!(!store.has_delta_recorder_probe());
+}
+
+fn assert_staging_pause_allows_progress(
+    store: &Arc<DurableKeyValueStore<std::fs::File>>,
+    key: &[u8],
+    value: &[u8],
+) {
+    assert_eq!(store.get(b"snapshot"), Some(b"captured".to_vec()));
+    let (mutation_tx, mutation_rx) = mpsc::sync_channel(0);
+    let mutation_store = Arc::clone(store);
+    let key = key.to_vec();
+    let value = value.to_vec();
+    let mutation = std::thread::spawn(move || {
+        mutation_store.try_put(key, value).unwrap();
+        mutation_tx.send(()).unwrap();
+    });
+    mutation_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    mutation.join().unwrap();
+
+    let (exclusive_tx, exclusive_rx) = mpsc::sync_channel(0);
+    let exclusive_store = Arc::clone(store);
+    let exclusive = std::thread::spawn(move || {
+        let _exclusive = exclusive_store.maintenance_probe().exclusive();
+        exclusive_tx.send(()).unwrap();
+    });
+    exclusive_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    exclusive.join().unwrap();
+}
+
 fn block_on_online<F: Future>(future: F) -> F::Output {
     let waker = Waker::noop();
     let mut context = Context::from_waker(waker);

@@ -41,6 +41,109 @@ pub(crate) enum OnlineCaptureStage {
     ManifestPrepared,
 }
 
+#[allow(dead_code)]
+pub(crate) struct ValidatedOnlineStaging<'a, W: Write> {
+    pub(crate) prepared: PreparedOnlineCapture<'a, W>,
+    pub(crate) staging: CapturedFamily,
+    pub(crate) replacement_inventory: Vec<ArtifactDescriptor>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OnlineStagingStage {
+    Encoding,
+    Validation,
+}
+
+pub(crate) fn prepare_online_staging<'a, W: Write>(
+    prepared: PreparedOnlineCapture<'a, W>,
+    mut checkpoint: impl FnMut(OnlineStagingStage),
+) -> Result<ValidatedOnlineStaging<'a, W>, CompactionError> {
+    checkpoint(OnlineStagingStage::Encoding);
+    let encoded =
+        encode_captured_family(&prepared.capture).map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::WriteStaging,
+            path: prepared.paths.staging.clone(),
+            source,
+        })?;
+    let mut staging_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&prepared.paths.staging)
+        .map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::WriteStaging,
+            path: prepared.paths.staging.clone(),
+            source,
+        })?;
+    staging_file
+        .write_all(&encoded)
+        .and_then(|()| staging_file.flush())
+        .and_then(|()| {
+            if prepared.manifest.durability == DurabilityPolicy::Physical {
+                staging_file.sync_all()
+            } else {
+                Ok(())
+            }
+        })
+        .map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::WriteStaging,
+            path: prepared.paths.staging.clone(),
+            source,
+        })?;
+    drop(staging_file);
+    let staging_name = prepared
+        .paths
+        .staging
+        .file_name()
+        .map(PathBuf::from)
+        .ok_or_else(|| CompactionError::Io {
+            operation: CompactionOperation::WriteStaging,
+            path: prepared.paths.staging.clone(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "online staging has no native file name",
+            ),
+        })?;
+    let replacement_inventory = vec![ArtifactDescriptor {
+        relative_path: staging_name,
+        role: ArtifactRole::ReplacementPrefix,
+        family: Some(prepared.capture.family),
+        length: u64::try_from(encoded.len()).map_err(|_| CompactionError::InvalidArtifact {
+            path: prepared.paths.staging.clone(),
+        })?,
+        checksum: crc32fast::hash(&encoded),
+    }];
+
+    checkpoint(OnlineStagingStage::Validation);
+    let anchor = prepared
+        .paths
+        .staging
+        .parent()
+        .ok_or_else(|| CompactionError::Io {
+            operation: CompactionOperation::ValidateStaging,
+            path: prepared.paths.staging.clone(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "online staging has no parent anchor",
+            ),
+        })?;
+    verify_descriptor(anchor, &replacement_inventory[0]).map_err(|_| {
+        CompactionError::InvalidArtifact {
+            path: prepared.paths.staging.clone(),
+        }
+    })?;
+    let staging =
+        capture_validated_online_staging(&prepared.paths.staging, prepared.capture.family)?;
+    compare_captured_families(
+        std::slice::from_ref(&prepared.capture),
+        std::slice::from_ref(&staging),
+    )?;
+    Ok(ValidatedOnlineStaging {
+        prepared,
+        staging,
+        replacement_inventory,
+    })
+}
+
 pub(crate) fn begin_online_capture<'a, W: Write>(
     coordinator: &'a crate::maintenance_coordination::MaintenanceCoordinator,
     wal: &'a crate::wal::WalStorage<W>,
@@ -835,6 +938,67 @@ fn encode_captured_family(family: &CapturedFamily) -> io::Result<Vec<u8>> {
         ),
     };
     encoded.map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+}
+
+fn capture_validated_online_staging(
+    staging_path: &Path,
+    family: StoreFamily,
+) -> Result<CapturedFamily, CompactionError> {
+    let bytes = fs::read(staging_path).map_err(|source| CompactionError::Io {
+        operation: CompactionOperation::ValidateStaging,
+        path: staging_path.to_path_buf(),
+        source,
+    })?;
+    let (state, granularity_nanos, last_bucket) = match family {
+        StoreFamily::KeyValue => {
+            let replay = complete_staging(replay_key_value_tail(&bytes), staging_path)?;
+            (
+                CapturedLogicalState::Value(replay.snapshot),
+                replay.granularity_nanos,
+                replay.last_bucket,
+            )
+        }
+        StoreFamily::KeySet => {
+            let replay = complete_staging(replay_key_set_tail(&bytes), staging_path)?;
+            (
+                CapturedLogicalState::Set(replay.snapshot),
+                replay.granularity_nanos,
+                replay.last_bucket,
+            )
+        }
+        StoreFamily::KeyMap => {
+            let replay = complete_staging(replay_key_map_tail(&bytes), staging_path)?;
+            (
+                CapturedLogicalState::Map(replay.snapshot),
+                replay.granularity_nanos,
+                replay.last_bucket,
+            )
+        }
+    };
+    Ok(CapturedFamily {
+        family,
+        state,
+        granularity_nanos,
+        last_bucket,
+        before_bytes: u64::try_from(bytes.len()).map_err(|_| CompactionError::InvalidArtifact {
+            path: staging_path.to_path_buf(),
+        })?,
+        sealed_segment_count: 0,
+    })
+}
+
+fn complete_staging<S>(
+    replay: TailReplay<S>,
+    path: &Path,
+) -> Result<ReplaySnapshot<S>, CompactionError> {
+    match replay {
+        TailReplay::Complete(replay) => Ok(replay),
+        TailReplay::RecoverableTail { .. } | TailReplay::Invalid(_) => {
+            Err(CompactionError::InvalidArtifact {
+                path: path.to_path_buf(),
+            })
+        }
+    }
 }
 
 fn active_name(family: StoreFamily) -> &'static str {

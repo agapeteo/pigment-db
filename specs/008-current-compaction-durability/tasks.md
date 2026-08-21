@@ -212,8 +212,8 @@
 - [X] T113 [US3] Implement initial online capture, recorder activation, verified-prefix manifest, and exclusive release in `src/compaction/mod.rs` and `src/compaction/manifest.rs`, then run T112 GREEN
 - [X] T114 [US3] Write and run a runtime RED proving online `Prepared` accepts valid old-WAL appends/rotation during staging, recovery selects old authority, and publication requires `source_finalized = true` in `src/compaction/online_tests.rs`
 - [X] T115 [US3] Implement online mode/prefix validation and atomic finalized same-phase rewrite rules in `src/compaction/manifest.rs` and `src/compaction/recovery.rs`, then run T114 GREEN
-- [ ] T116 [US3] Write and run one deterministic runtime RED for the single out-of-gate staging behavior, proving reads and writes complete while encoding/validation checkpoints are paused and exclusive maintenance records zero staging operations in `src/compaction/online_tests.rs`
-- [ ] T117 [US3] Encode, synchronize, reopen, and validate current-V2 staging strictly outside exclusive maintenance in `src/compaction/mod.rs` and `src/wal/replay.rs`, then run T116 GREEN
+- [X] T116 [US3] Write and run one deterministic runtime RED for the single out-of-gate staging behavior, proving reads and writes complete while encoding/validation checkpoints are paused and exclusive maintenance records zero staging operations in `src/compaction/online_tests.rs`
+- [X] T117 [US3] Encode, synchronize, reopen, and validate current-V2 staging strictly outside exclusive maintenance in `src/compaction/mod.rs` and `src/wal/replay.rs`, then run T116 GREEN
 - [ ] T118 [US3] Write and run a runtime RED for same-key, distinct-key, put/remove, and delete/recreate accepted deltas replaying exactly once in WAL order in `src/compaction/online_tests.rs`
 - [ ] T119 [US3] Implement ordered single-action delta application with regenerated current-V2 framing in `src/compaction/mod.rs` and `src/wal/replay.rs`, then run T118 GREEN
 - [ ] T120 [US3] Write and run a runtime RED for compute/ordinary overlap, atomic multi-change batches, accepted timestamps, and final last-bucket continuity in `src/compaction/online_tests.rs`
