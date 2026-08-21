@@ -351,6 +351,13 @@ pub(crate) fn preflight_directory(path: &Path) -> Result<(), DurabilitySupportEr
 }
 
 pub(crate) fn preflight_file(path: &Path) -> Result<(), DurabilitySupportError> {
+    #[cfg(target_os = "windows")]
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|source| unavailable(DurabilityCapability::FileContent, path, source))?;
+    #[cfg(not(target_os = "windows"))]
     let file = File::open(path)
         .map_err(|source| unavailable(DurabilityCapability::FileContent, path, source))?;
     preflight_file_handle(&file, path)
