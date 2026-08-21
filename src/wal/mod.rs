@@ -71,13 +71,13 @@ pub(crate) struct OnlineCaptureMetadata {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RecordedFrame {
+pub(crate) struct RecordedFrame {
     action: u8,
     payload: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RecordedMutation {
+pub(crate) struct RecordedMutation {
     timestamp_bucket: u64,
     frames: Vec<RecordedFrame>,
 }
@@ -90,7 +90,7 @@ enum DeltaRecordResult {
 }
 
 #[derive(Debug)]
-struct DeltaRecorder {
+pub(crate) struct DeltaRecorder {
     token: u64,
     limit: u64,
     used_bytes: u64,
@@ -148,6 +148,30 @@ impl DeltaRecorder {
         self.used_bytes = 0;
         self.groups.clear();
         self.groups.shrink_to_fit();
+    }
+
+    pub(crate) fn groups(&self) -> &[RecordedMutation] {
+        &self.groups
+    }
+
+    pub(crate) fn group_count(&self) -> usize {
+        self.groups.len()
+    }
+
+    pub(crate) const fn used_bytes(&self) -> u64 {
+        self.used_bytes
+    }
+
+    pub(crate) const fn limit(&self) -> u64 {
+        self.limit
+    }
+
+    pub(crate) const fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
+    pub(crate) const fn wal_healthy(&self) -> bool {
+        self.wal_healthy
     }
 }
 
@@ -763,6 +787,13 @@ impl<W: Write> WalStorage<W> {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .detach_delta(token);
+    }
+
+    pub(crate) fn detach_delta_recorder(&self, token: u64) -> Option<DeltaRecorder> {
+        self.wal_state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .detach_delta(token)
     }
 
     #[cfg(test)]

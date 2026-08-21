@@ -557,6 +557,52 @@ fn staging_encode_and_validation_run_without_exclusive_maintenance() {
     assert!(!store.has_delta_recorder_probe());
 }
 
+#[test]
+fn single_action_delta_replays_once_in_wal_acceptance_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = DurableKeyValueStore::try_init_new(directory.path())
+        .unwrap()
+        .into_store();
+    store.put(b"same".to_vec(), b"base".to_vec());
+    store.put(b"remove".to_vec(), b"present".to_vec());
+    store.put(b"recreate".to_vec(), b"old".to_vec());
+    let capture = store
+        .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
+        .unwrap();
+    let staged = super::prepare_online_staging(capture, |_| {}).unwrap();
+    let initial_staging_bytes = staged.replacement_inventory[0].length;
+
+    store.put(b"same".to_vec(), b"first".to_vec());
+    store.put(b"distinct".to_vec(), b"value".to_vec());
+    store.put(b"same".to_vec(), b"second".to_vec());
+    store.remove(b"remove");
+    store.remove(b"recreate");
+    store.put(b"recreate".to_vec(), b"new".to_vec());
+    assert_eq!(store.delta_group_count_probe(), 6);
+
+    let applied = store.apply_online_delta_probe(staged).unwrap();
+    assert_eq!(applied.replayed, 6);
+    assert!(applied.encoded_bytes > 0);
+    assert_eq!(
+        applied.staged.replacement_inventory[0].length,
+        initial_staging_bytes + applied.encoded_bytes
+    );
+    assert!(!store.has_delta_recorder_probe());
+    let crate::compaction::CapturedLogicalState::Value(snapshot) = &applied.staged.staging.state
+    else {
+        panic!("key/value delta application returned the wrong family state");
+    };
+    assert_eq!(snapshot.get(b"same".as_slice()), Some(&b"second".to_vec()));
+    assert_eq!(
+        snapshot.get(b"distinct".as_slice()),
+        Some(&b"value".to_vec())
+    );
+    assert!(!snapshot.contains_key(b"remove".as_slice()));
+    assert_eq!(snapshot.get(b"recreate".as_slice()), Some(&b"new".to_vec()));
+    assert_eq!(snapshot.len(), store.size());
+    drop(applied);
+}
+
 fn assert_staging_pause_allows_progress(
     store: &Arc<DurableKeyValueStore<std::fs::File>>,
     key: &[u8],

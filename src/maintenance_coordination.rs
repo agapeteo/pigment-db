@@ -105,6 +105,10 @@ impl<'a, W: Write> OnlineAttemptGuard<'a, W> {
     pub(crate) const fn token(&self) -> u64 {
         self.attempt.id()
     }
+
+    pub(crate) fn detach_recorder(&self) -> Option<crate::wal::DeltaRecorder> {
+        self.wal.detach_delta_recorder(self.attempt.id())
+    }
 }
 
 impl<W: Write> Drop for OnlineAttemptGuard<'_, W> {

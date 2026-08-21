@@ -48,6 +48,13 @@ pub(crate) struct ValidatedOnlineStaging<'a, W: Write> {
     pub(crate) replacement_inventory: Vec<ArtifactDescriptor>,
 }
 
+#[allow(dead_code)]
+pub(crate) struct AppliedOnlineDelta<'a, W: Write> {
+    pub(crate) staged: ValidatedOnlineStaging<'a, W>,
+    pub(crate) replayed: usize,
+    pub(crate) encoded_bytes: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OnlineStagingStage {
     Encoding,
@@ -142,6 +149,112 @@ pub(crate) fn prepare_online_staging<'a, W: Write>(
         staging,
         replacement_inventory,
     })
+}
+
+pub(crate) fn apply_online_delta_to_staging<W: Write>(
+    staged: &mut ValidatedOnlineStaging<'_, W>,
+    delta: &crate::wal::DeltaRecorder,
+) -> Result<(usize, u64), CompactionError> {
+    if delta.overflowed() {
+        return Err(CompactionError::ConcurrentDeltaLimitExceeded {
+            limit: delta.limit(),
+        });
+    }
+    if !delta.wal_healthy() {
+        return Err(CompactionError::FailedClosed {
+            detail: "online compaction WAL became unhealthy during staging".to_owned(),
+        });
+    }
+    let descriptor =
+        staged
+            .replacement_inventory
+            .first()
+            .ok_or_else(|| CompactionError::FailedClosed {
+                detail: "validated online staging has no replacement descriptor".to_owned(),
+            })?;
+    let actual_len = fs::metadata(&staged.prepared.paths.staging)
+        .map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::WriteStaging,
+            path: staged.prepared.paths.staging.clone(),
+            source,
+        })?
+        .len();
+    if descriptor.length != actual_len {
+        return Err(CompactionError::InvalidArtifact {
+            path: staged.prepared.paths.staging.clone(),
+        });
+    }
+    let encoded = crate::wal::replay::encode_current_v2_delta(actual_len, delta.groups()).map_err(
+        |source| CompactionError::Io {
+            operation: CompactionOperation::WriteStaging,
+            path: staged.prepared.paths.staging.clone(),
+            source,
+        },
+    )?;
+    let encoded_len =
+        u64::try_from(encoded.len()).map_err(|_| CompactionError::InvalidArtifact {
+            path: staged.prepared.paths.staging.clone(),
+        })?;
+    if encoded_len != delta.used_bytes() {
+        return Err(CompactionError::FailedClosed {
+            detail: "online delta accounting diverged from regenerated V2 framing".to_owned(),
+        });
+    }
+    if !encoded.is_empty() {
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&staged.prepared.paths.staging)
+            .map_err(|source| CompactionError::Io {
+                operation: CompactionOperation::WriteStaging,
+                path: staged.prepared.paths.staging.clone(),
+                source,
+            })?;
+        file.write_all(&encoded)
+            .and_then(|()| file.flush())
+            .and_then(|()| {
+                if staged.prepared.manifest.durability == DurabilityPolicy::Physical {
+                    file.sync_all()
+                } else {
+                    Ok(())
+                }
+            })
+            .map_err(|source| CompactionError::Io {
+                operation: CompactionOperation::WriteStaging,
+                path: staged.prepared.paths.staging.clone(),
+                source,
+            })?;
+    }
+    let bytes = fs::read(&staged.prepared.paths.staging).map_err(|source| CompactionError::Io {
+        operation: CompactionOperation::ValidateStaging,
+        path: staged.prepared.paths.staging.clone(),
+        source,
+    })?;
+    let replacement = staged
+        .replacement_inventory
+        .first_mut()
+        .expect("replacement descriptor presence was checked");
+    replacement.length =
+        u64::try_from(bytes.len()).map_err(|_| CompactionError::InvalidArtifact {
+            path: staged.prepared.paths.staging.clone(),
+        })?;
+    replacement.checksum = crc32fast::hash(&bytes);
+    let anchor =
+        staged
+            .prepared
+            .paths
+            .staging
+            .parent()
+            .ok_or_else(|| CompactionError::InvalidArtifact {
+                path: staged.prepared.paths.staging.clone(),
+            })?;
+    verify_descriptor(anchor, replacement).map_err(|_| CompactionError::InvalidArtifact {
+        path: staged.prepared.paths.staging.clone(),
+    })?;
+    staged.staging = capture_validated_online_staging(
+        &staged.prepared.paths.staging,
+        staged.prepared.capture.family,
+    )?;
+    Ok((delta.group_count(), encoded_len))
 }
 
 pub(crate) fn begin_online_capture<'a, W: Write>(

@@ -22,6 +22,74 @@ pub(crate) type KeyValueSnapshot = HashMap<Vec<u8>, Vec<u8>>;
 pub(crate) type KeySetSnapshot = HashMap<Vec<u8>, HashSet<Vec<u8>>>;
 pub(crate) type KeyMapSnapshot = HashMap<Vec<u8>, BTreeMap<SearchKey, Vec<u8>>>;
 
+pub(crate) fn encode_current_v2_delta(
+    start_offset: u64,
+    groups: &[super::RecordedMutation],
+) -> std::io::Result<Vec<u8>> {
+    let capacity = groups.iter().try_fold(0_usize, |total, group| {
+        group.frames.iter().try_fold(total, |total, frame| {
+            total
+                .checked_add(V2CodecProbe::EMPTY_RECORD_LEN)
+                .and_then(|total| total.checked_add(frame.payload.len()))
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "online delta encoded length overflow",
+                    )
+                })
+        })
+    })?;
+    let mut encoded = Vec::with_capacity(capacity);
+    let mut offset = start_offset;
+    for group in groups {
+        let count = u32::try_from(group.frames.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "online delta group exceeds the V2 frame count",
+            )
+        })?;
+        if count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "online delta contains an empty mutation group",
+            ));
+        }
+        let mutation_start = offset;
+        for (index, frame) in group.frames.iter().enumerate() {
+            let bytes = V2CodecProbe::encode_complete_record(super::format::V2RecordProbeFields {
+                action: frame.action,
+                payload: &frame.payload,
+                physical_start: offset,
+                mutation_start,
+                index: u32::try_from(index).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "online delta frame index exceeds u32",
+                    )
+                })?,
+                count,
+                timestamp_bucket: group.timestamp_bucket,
+            });
+            offset = offset
+                .checked_add(u64::try_from(bytes.len()).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "online delta frame length exceeds u64",
+                    )
+                })?)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "online delta V2 offset overflow",
+                    )
+                })?;
+            encoded.extend_from_slice(&bytes);
+        }
+    }
+    debug_assert_eq!(encoded.len(), capacity);
+    Ok(encoded)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ValidationError {
     Truncated { offset: usize },

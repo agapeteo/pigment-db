@@ -80,6 +80,28 @@ impl DurableKeyValueStore<File> {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn apply_online_delta_probe<'a>(
+        &'a self,
+        mut staged: crate::compaction::ValidatedOnlineStaging<'a, File>,
+    ) -> Result<crate::compaction::AppliedOnlineDelta<'a, File>, crate::CompactionError> {
+        let applied = {
+            let _exclusive = self.maintenance.exclusive();
+            let delta = staged.prepared.attempt.detach_recorder().ok_or_else(|| {
+                crate::CompactionError::FailedClosed {
+                    detail: "online compaction lost its matching delta recorder".to_owned(),
+                }
+            })?;
+            crate::compaction::apply_online_delta_to_staging(&mut staged, &delta)
+        };
+        let (replayed, encoded_bytes) = applied?;
+        Ok(crate::compaction::AppliedOnlineDelta {
+            staged,
+            replayed,
+            encoded_bytes,
+        })
+    }
+
     /// Returns exact storage usage for this open key/value generation.
     ///
     /// Vector-backed stores intentionally do not expose filesystem maintenance:
