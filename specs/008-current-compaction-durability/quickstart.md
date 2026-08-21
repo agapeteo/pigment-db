@@ -235,6 +235,38 @@ The checkpoint completed with zero failures:
 - `cargo fmt --all -- --check`;
 - `cargo clippy --all-targets --all-features -- -D warnings`.
 
+### User Story 4 Windows physical-durability GREEN checkpoint (2026-08-21)
+
+SC-008 and the platform portion of SC-010 are GREEN at commit
+`01c23f89da0559d18d0b482f91581e96acec4ccc`. The
+[Recovery workflow run](https://github.com/agapeteo/pigment-db/actions/runs/32455792040)
+completed successfully on Windows, Ubuntu, and macOS. The Windows job exercised
+the public physical-durability and buffered-compatibility matrix together with
+7 native Win32 boundary tests, 51 private WAL durability tests, and 13 private
+compaction recovery tests.
+
+The real Windows coverage proves physical construction and existing-store
+opening, all-family ordinary and compute mutations, rollback semantics,
+rotation, normal recovery, closed and online compaction, three reopenings,
+buffered compatibility, and failed-closed sharing/destination conflicts. The
+native boundary tests prove lossless Unicode and supported long-path encoding,
+NUL rejection, stable UTF-16 ownership, exact no-replace/replace-existing
+`MoveFileExW` flags, no copy fallback, and preservation of original Win32 error
+codes. The private fault models cover content synchronization, rollback,
+preflight ordering, every compaction manifest/publication/cleanup cut, exact
+authority retention, and physical power-loss semantics for all three families.
+
+Platform jobs completed with zero failures:
+
+- [Windows job](https://github.com/agapeteo/pigment-db/actions/runs/32455792040/job/96692697199);
+- [Ubuntu job](https://github.com/agapeteo/pigment-db/actions/runs/32455792040/job/96692697395);
+- [macOS job](https://github.com/agapeteo/pigment-db/actions/runs/32455792040/job/96692697387).
+
+The final local debug/release all-target/all-feature suites, formatting,
+warning-denying Clippy, warning-denying rustdoc, and Windows cross-target check
+also completed successfully. No physical-policy path silently falls back to a
+buffered namespace operation.
+
 ### User Story 5 external-migration compatibility GREEN checkpoint (2026-08-20)
 
 SC-007 is GREEN. Runtime open, read-only inspection, and closed compaction
