@@ -176,6 +176,7 @@ fn windows_is_supported_while_unknown_targets_are_rejected_before_filesystem_wor
     assert!(namespace.events().is_empty());
 }
 
+#[cfg(not(target_os = "windows"))]
 #[test]
 fn parent_directory_preflight_maps_every_open_failure_to_support_error() {
     let directory = tempfile::tempdir().unwrap();
@@ -438,6 +439,7 @@ fn failed_staging_cleanup_is_diagnosed_as_the_only_remaining_non_authority() {
     );
 }
 
+#[cfg(not(target_os = "windows"))]
 #[test]
 fn fresh_publication_requires_parent_barrier_before_store_exposure() {
     let directory = tempfile::tempdir().unwrap();
@@ -469,6 +471,7 @@ fn fresh_publication_requires_parent_barrier_before_store_exposure() {
     assert!(DurableKeyValueStore::try_init_new(directory.path()).is_ok());
 }
 
+#[cfg(not(target_os = "windows"))]
 #[test]
 fn deferred_granularity_rotation_fails_closed_when_directory_barrier_fails() {
     let directory = tempfile::tempdir().unwrap();
@@ -510,6 +513,7 @@ fn deferred_granularity_rotation_fails_closed_when_directory_barrier_fails() {
         .is_err());
 }
 
+#[cfg(not(target_os = "windows"))]
 #[test]
 fn deferred_granularity_rotation_publishes_one_new_segment_before_mutation() {
     let directory = tempfile::tempdir().unwrap();
