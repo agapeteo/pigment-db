@@ -81,7 +81,7 @@ jobs:
           $exit_code = $LASTEXITCODE
           $output | ForEach-Object { Write-Output $_ }
           if ($exit_code -ne 0) {
-            $details = ($output | Select-Object -Last 100) -join "`n"
+            $details = ($output | Select-Object -Last 40) -join "`n"
             $details = $details.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
             Write-Output "::error title=Windows native durability boundary::$details"
             $failed = $true
@@ -90,7 +90,7 @@ jobs:
           $exit_code = $LASTEXITCODE
           $output | ForEach-Object { Write-Output $_ }
           if ($exit_code -ne 0) {
-            $details = ($output | Select-Object -Last 100) -join "`n"
+            $details = ($output | Select-Object -Last 40) -join "`n"
             $details = $details.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
             Write-Output "::error title=Windows WAL durability fault models::$details"
             $failed = $true
@@ -99,7 +99,7 @@ jobs:
           $exit_code = $LASTEXITCODE
           $output | ForEach-Object { Write-Output $_ }
           if ($exit_code -ne 0) {
-            $details = ($output | Select-Object -Last 100) -join "`n"
+            $details = ($output | Select-Object -Last 40) -join "`n"
             $details = $details.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
             Write-Output "::error title=Windows compaction recovery fault models::$details"
             $failed = $true

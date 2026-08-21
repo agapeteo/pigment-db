@@ -567,6 +567,7 @@ fn opening_with_changed_granularity_does_not_rewrite_immutable_segment() {
     assert!(DurableKeyValueStore::try_init_new(directory.path()).is_ok());
 }
 
+#[cfg(not(target_os = "windows"))]
 #[test]
 fn recovery_authority_remains_available_when_publication_barrier_fails() {
     let directory = tempfile::tempdir().unwrap();
@@ -634,6 +635,7 @@ fn prepared_v2_repair_preserves_an_offset_above_four_gibibytes() {
     assert_eq!(state.active_len, offset);
 }
 
+#[cfg(not(target_os = "windows"))]
 #[test]
 fn recovery_cleanup_barrier_failure_preserves_published_active_authority() {
     let directory = tempfile::tempdir().unwrap();

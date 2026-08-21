@@ -161,6 +161,7 @@ fn windows_workflow_runs_native_boundary_and_private_physical_fault_models() {
         "$failed = $false",
         "$failed = $true",
         "if ($failed) { exit 1 }",
+        "Select-Object -Last 40",
     ] {
         assert!(
             workflow.contains(required),
