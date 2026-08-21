@@ -243,7 +243,7 @@
 ### Public US3 promotion and checkpoint
 
 - [X] T140 [US3] Promote 8-MiB-default/`with_max_delta_bytes` `OnlineCompactionOptions` and three file-backed `try_compact_online` methods that inherit opened durability over GREEN private behavior in `src/maintenance.rs`, `src/key_value_store.rs`, `src/key_set_store.rs`, `src/key_map_store.rs`, and `src/lib.rs`, with first public executions GREEN in `tests/online_compaction/contract.rs`
-- [ ] T141 [P] [US3] Run the complete public progress/ordering/failure matrix and exact three-reopen assertions for all families in `tests/online_compaction/{progress,ordering,failures,contract}.rs`
+- [X] T141 [P] [US3] Run the complete public progress/ordering/failure matrix and exact three-reopen assertions for all families in `tests/online_compaction/{progress,ordering,failures,contract}.rs`
 - [ ] T142 [P] [US3] Run lock-rank, watchdog deadlock, inactive-recorder allocation, direct-read bypass, callback release, and unrelated-instance structural tests in `src/compaction/online_tests.rs`, `src/wal/maintenance_tests.rs`, and `tests/mutation_ordering/traceability.rs`
 - [ ] T143 [US3] Run all US3 plus existing mutation-ordering, compute, durability, recovery, rotation, and async suites and record SC-004–SC-006 GREEN evidence in `specs/008-current-compaction-durability/quickstart.md`
 

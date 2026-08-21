@@ -1,5 +1,6 @@
 //! Online-compaction contract tests.
 
+use crate::support::{assert_map_reopens, assert_set_reopens, assert_value_reopens};
 use pigment_db::key_map_store::DurableKeyMapStore;
 use pigment_db::key_set_store::DurableKeySetStore;
 use pigment_db::key_value_store::DurableKeyValueStore;
@@ -42,6 +43,10 @@ fn public_online_options_and_all_file_family_entry_points_execute() {
         StoreFamily::KeyValue,
     );
     assert_eq!(value.get(b"key"), Some(b"value".to_vec()));
+    value.put(b"live".to_vec(), b"value".to_vec());
+    let value_expected = value.get(b"live");
+    drop(value);
+    assert_value_reopens(value_dir.path(), &value_expected);
 
     let set_dir = tempfile::tempdir().unwrap();
     let set = DurableKeySetStore::try_init_new(set_dir.path())
@@ -57,6 +62,10 @@ fn public_online_options_and_all_file_family_entry_points_execute() {
         .get_hashset(b"group")
         .unwrap()
         .contains(b"member".as_slice()));
+    set.append(b"live".to_vec(), b"member".to_vec());
+    let set_expected = set.get_hashset(b"live");
+    drop(set);
+    assert_set_reopens(set_dir.path(), &set_expected);
 
     let map_dir = tempfile::tempdir().unwrap();
     let map = DurableKeyMapStore::try_init_new(map_dir.path())
@@ -72,6 +81,10 @@ fn public_online_options_and_all_file_family_entry_points_execute() {
         map.get_element(b"book", &SearchKey::from(7)),
         Some(b"entry".to_vec())
     );
+    map.put(b"live".to_vec(), SearchKey::from(7), b"entry".to_vec());
+    let map_expected = map.get_sorted_map(b"live");
+    drop(map);
+    assert_map_reopens(map_dir.path(), &map_expected);
 }
 
 fn assert_outcome(outcome: FamilyCompactionOutcome, family: StoreFamily) {
