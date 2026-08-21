@@ -82,6 +82,33 @@ fn recovery_workflow_does_not_use_yaml_ambiguous_inline_run_commands() {
 }
 
 #[test]
+fn windows_recovery_failure_is_reported_as_a_structured_annotation() {
+    let workflow_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(".github")
+        .join("workflows")
+        .join("recovery.yml");
+    let workflow = fs::read_to_string(&workflow_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read recovery workflow {}: {error}",
+            workflow_path.display()
+        )
+    });
+
+    for required in [
+        "- name: Public recovery scenarios (Windows diagnostics)",
+        "if: runner.os == 'Windows'",
+        "shell: pwsh",
+        "::error title=Windows recovery tests::",
+        "exit $exit_code",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "Windows recovery failures must preserve and annotate test output; missing `{required}`"
+        );
+    }
+}
+
+#[test]
 fn maintenance_public_api_is_narrow_while_implementation_modules_remain_private() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     for relative in [

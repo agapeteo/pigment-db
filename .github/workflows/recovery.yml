@@ -23,7 +23,21 @@ jobs:
       - name: Public truncation and timestamp matrices
         run: cargo test --test truncated_wal -- --test-threads=1
       - name: Public recovery scenarios
+        if: runner.os != 'Windows'
         run: cargo test --test recovery -- --test-threads=1
+      - name: Public recovery scenarios (Windows diagnostics)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $output = & cargo test --test recovery -- --test-threads=1 --nocapture 2>&1
+          $exit_code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          if ($exit_code -ne 0) {
+            $details = ($output | Select-Object -Last 100) -join "`n"
+            $details = $details.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+            Write-Output "::error title=Windows recovery tests::$details"
+            exit $exit_code
+          }
       - name: Publication fault checkpoints
         run: cargo test wal::recovery::tests -- --test-threads=1
       - name: Compute persistence scenarios
