@@ -92,6 +92,7 @@ impl<'a, W: Write> OnlineAttemptGuard<'a, W> {
             .activate_delta_recorder(self.attempt.id(), max_delta_bytes)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn begin(
         coordinator: &'a MaintenanceCoordinator,
         wal: &'a crate::wal::WalStorage<W>,

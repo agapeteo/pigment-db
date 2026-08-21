@@ -421,6 +421,7 @@ impl<W: Write> WalStorage<W> {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn reinstall_online_writer(
         &self,
         token: u64,

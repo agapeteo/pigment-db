@@ -45,6 +45,53 @@ pub struct DurableKeyMapStore<W: Write> {
 
 #[allow(unused)]
 impl DurableKeyMapStore<File> {
+    /// Compacts this open key/sorted-map store while reads and ordinary mutations continue.
+    ///
+    /// The operation is explicitly caller-triggered, inherits the store's opened
+    /// durability policy, and bounds concurrent delta recording with `options`.
+    pub fn try_compact_online(
+        &self,
+        options: crate::OnlineCompactionOptions,
+    ) -> Result<crate::FamilyCompactionOutcome, crate::CompactionError> {
+        let store_dir = self
+            .file_backing
+            .as_deref()
+            .expect("file-backed store retains its directory identity");
+        let capture = crate::compaction::begin_online_capture(
+            &self.maintenance,
+            &self.wal,
+            store_dir,
+            crate::compaction::inspection::InspectedFamily::KeyMap,
+            options.max_delta_bytes(),
+            || {
+                crate::compaction::CapturedLogicalState::Map(
+                    self.store
+                        .iter()
+                        .map(|entry| (entry.key().clone(), entry.value().clone()))
+                        .collect(),
+                )
+            },
+            |_| {},
+        )?;
+        let staged = crate::compaction::prepare_online_staging(capture, |_| Ok(()))?;
+        crate::compaction::complete_online_cutover(
+            &self.maintenance,
+            &self.wal,
+            staged,
+            || {
+                crate::compaction::CapturedLogicalState::Map(
+                    self.store
+                        .iter()
+                        .map(|entry| (entry.key().clone(), entry.value().clone()))
+                        .collect(),
+                )
+            },
+            |active_path| std::fs::OpenOptions::new().append(true).open(active_path),
+            |_| Ok(()),
+        )
+        .map(crate::compaction::CompletedOnlineCutover::into_outcome)
+    }
+
     /// Returns exact storage usage for this open key/sorted-map generation.
     ///
     /// Vector-backed stores intentionally do not expose filesystem maintenance:

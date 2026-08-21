@@ -58,6 +58,7 @@ pub(crate) struct AppliedOnlineDelta<'a, W: Write> {
     pub(crate) group_frame_counts: Vec<usize>,
 }
 
+#[allow(dead_code)]
 pub(crate) struct OnlineDeltaSummary {
     pub(crate) replayed: usize,
     pub(crate) encoded_bytes: u64,
@@ -67,10 +68,27 @@ pub(crate) struct OnlineDeltaSummary {
 
 #[allow(dead_code)]
 pub(crate) struct CompletedOnlineCutover {
+    pub(crate) family: StoreFamily,
+    pub(crate) before_bytes: u64,
+    pub(crate) after_bytes: u64,
+    pub(crate) sealed_segments_removed: usize,
     pub(crate) replayed: usize,
     pub(crate) paths: MaintenanceArtifactPaths,
     pub(crate) manifest: crate::compaction::manifest::CompactionManifest,
     pub(crate) cleanup: crate::CleanupStatus,
+}
+
+impl CompletedOnlineCutover {
+    pub(crate) fn into_outcome(self) -> FamilyCompactionOutcome {
+        FamilyCompactionOutcome::online(
+            self.family,
+            self.before_bytes,
+            self.after_bytes,
+            self.sealed_segments_removed,
+            self.replayed,
+            self.cleanup,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -411,6 +429,112 @@ pub(crate) fn cleanup_online_publication(
             path: paths.manifest.clone(),
         })?;
     recovery::recover_online_cleanup_with_checkpoint(store_dir, paths, manifest, checkpoint)
+}
+
+pub(crate) fn complete_online_cutover<'a>(
+    coordinator: &'a crate::maintenance_coordination::MaintenanceCoordinator,
+    wal: &'a crate::wal::WalStorage<std::fs::File>,
+    mut staged: ValidatedOnlineStaging<'a, std::fs::File>,
+    capture_live_state: impl FnOnce() -> CapturedLogicalState,
+    reopen: impl FnOnce(&Path) -> io::Result<std::fs::File>,
+    cleanup_checkpoint: impl FnMut(OnlineCleanupStage) -> io::Result<()>,
+) -> Result<CompletedOnlineCutover, CompactionError> {
+    let mut completed = {
+        let _exclusive = coordinator.exclusive();
+        let delta = staged.prepared.attempt.detach_recorder().ok_or_else(|| {
+            CompactionError::FailedClosed {
+                detail: "online compaction lost its matching delta recorder".to_owned(),
+            }
+        })?;
+        let applied = match apply_online_delta_to_staging(&mut staged, &delta) {
+            Ok(applied) => applied,
+            Err(error @ CompactionError::ConcurrentDeltaLimitExceeded { .. }) => {
+                abandon_online_prepublication(&staged)?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        let metadata = wal
+            .online_capture_metadata()
+            .map_err(|source| CompactionError::Io {
+                operation: CompactionOperation::ValidateStaging,
+                path: staged.prepared.paths.staging.clone(),
+                source,
+            })?;
+        finalize_online_prepared(&mut staged, capture_live_state(), metadata)?;
+
+        let token = staged.prepared.attempt.token();
+        let detached = wal
+            .take_online_writer(token)
+            .map_err(|source| CompactionError::Io {
+                operation: CompactionOperation::PublishPrevious,
+                path: staged.prepared.paths.manifest.clone(),
+                source,
+            })?;
+        let closed = detached.close();
+        let expected_len = staged
+            .replacement_inventory
+            .first()
+            .ok_or_else(|| CompactionError::InvalidArtifact {
+                path: staged.prepared.paths.staging.clone(),
+            })?
+            .length;
+        let publication = (|| {
+            publication::publish_online_previous(
+                &staged.prepared.paths,
+                &mut staged.prepared.manifest,
+            )?;
+            let (active_path, writer) = publication::publish_online_replacement_with_reopen(
+                &staged.prepared.paths,
+                &mut staged.prepared.manifest,
+                |active_path| {
+                    let writer = reopen(active_path)?;
+                    if writer.metadata()?.len() != expected_len {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "online replacement length changed before writer handoff",
+                        ));
+                    }
+                    Ok(writer)
+                },
+            )?;
+            wal.install_online_replacement_writer(
+                closed,
+                writer,
+                active_path,
+                expected_len,
+                staged.staging.granularity_nanos,
+                staged.staging.last_bucket,
+            )
+            .map_err(|source| CompactionError::Io {
+                operation: CompactionOperation::ReopenReplacement,
+                path: staged.prepared.paths.manifest.clone(),
+                source,
+            })?;
+            Ok::<(), CompactionError>(())
+        })();
+        if let Err(error) = publication {
+            fail_online_publication_closed(wal, token, &error)?;
+            return Err(error);
+        }
+        CompletedOnlineCutover {
+            family: staged.prepared.capture.family,
+            before_bytes: staged.prepared.capture.before_bytes,
+            after_bytes: expected_len,
+            sealed_segments_removed: staged.prepared.capture.sealed_segment_count,
+            replayed: applied.replayed,
+            paths: staged.prepared.paths.clone(),
+            manifest: staged.prepared.manifest.clone(),
+            cleanup: crate::CleanupStatus::Pending,
+        }
+    };
+    completed.cleanup = cleanup_online_publication(
+        &completed.paths,
+        &mut completed.manifest,
+        cleanup_checkpoint,
+    )?;
+    drop(staged);
+    Ok(completed)
 }
 
 pub(crate) fn begin_online_capture<'a, W: Write>(
