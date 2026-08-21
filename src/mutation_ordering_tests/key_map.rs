@@ -20,7 +20,12 @@ use std::sync::Arc;
 
 #[test]
 fn every_map_mutation_waits_for_maintenance_through_publication_and_result_delivery() {
-    let store = Arc::new(DurableKeyMapStore::new_vec_based());
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        DurableKeyMapStore::try_init_new(directory.path())
+            .unwrap()
+            .into_store(),
+    );
     for key in [
         b"remove-entry".as_slice(),
         b"callback-remove",

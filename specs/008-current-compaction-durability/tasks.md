@@ -260,45 +260,45 @@
 ### Bounded Windows platform boundary
 
 - [X] T144 [US4] Add target-specific `windows-sys = 0.61.2` with only `Win32_Storage_FileSystem`, create a private safe namespace stub, and establish crate-wide unsafe denial with the sole module exception in `Cargo.toml`, `Cargo.lock`, `src/lib.rs`, `src/durability.rs`, and `src/durability/windows.rs` without changing public support behavior
-- [ ] T145 [US4] Write and run a Windows runtime RED for lossless Unicode/supported-long-path UTF-16 conversion, exact terminator lifetime, and interior-NUL rejection through the private safe seam in `src/durability/windows.rs`
-- [ ] T146 [US4] Implement the documented native path conversion and safety invariants inside `src/durability/windows.rs`, then run T145 GREEN
-- [ ] T147 [US4] Write and run a Windows runtime RED for no-replace and replace-existing `MoveFileExW` flag sets, same-volume behavior, destination conflict, and immediate original `last_os_error` preservation in `src/durability/windows.rs`
-- [ ] T148 [US4] Implement the sole unsafe `MoveFileExW` wrapper using `MOVEFILE_WRITE_THROUGH`, optional `MOVEFILE_REPLACE_EXISTING`, and never `MOVEFILE_COPY_ALLOWED` in `src/durability/windows.rs`, then run T147 GREEN
+- [X] T145 [US4] Write and run a Windows runtime RED for lossless Unicode/supported-long-path UTF-16 conversion, exact terminator lifetime, and interior-NUL rejection through the private safe seam in `src/durability/windows.rs`
+- [X] T146 [US4] Implement the documented native path conversion and safety invariants inside `src/durability/windows.rs`, then run T145 GREEN
+- [X] T147 [US4] Write and run a Windows runtime RED for no-replace and replace-existing `MoveFileExW` flag sets, same-volume behavior, destination conflict, and immediate original `last_os_error` preservation in `src/durability/windows.rs`
+- [X] T148 [US4] Implement the sole unsafe `MoveFileExW` wrapper using `MOVEFILE_WRITE_THROUGH`, optional `MOVEFILE_REPLACE_EXISTING`, and never `MOVEFILE_COPY_ALLOWED` in `src/durability/windows.rs`, then run T147 GREEN
 
 ### Actual-filesystem preflight
 
-- [ ] T149 [US4] Write and run a Windows runtime RED requiring disposable sentinel write/flush/`sync_all`/reopen validation on the actual target directory before store exposure in `tests/windows_physical_durability/preflight.rs`
-- [ ] T150 [US4] Implement actual-directory file-content preflight without authoritative artifact access in `src/durability.rs` and `src/durability/windows.rs`, then run T149 GREEN
-- [ ] T151 [US4] Write and run a Windows runtime RED requiring same-directory no-replace write-through move, replace probe, content validation, and identity-safe disposable cleanup in `tests/windows_physical_durability/preflight.rs`
-- [ ] T152 [US4] Implement unique `create_new` namespace preflight and safe cleanup in `src/durability/windows.rs`, then run T151 GREEN
-- [ ] T153 [US4] Write and run one table-driven Windows runtime RED for the single preflight-failure contract across content, namespace, and cleanup failures, requiring the correct `RequiredBarrierUnavailable`, original OS source, no fallback, no authority mutation, and no exposed store in `tests/windows_physical_durability/preflight.rs`
-- [ ] T154 [US4] Replace Windows `UnsupportedPlatform` with ordered content/namespace capability gating and exact structured mapping in `src/durability.rs` and `src/wal/recovery.rs`, then run T153 GREEN and non-Windows capability tests
+- [X] T149 [US4] Write and run a Windows runtime RED requiring disposable sentinel write/flush/`sync_all`/reopen validation on the actual target directory before store exposure in `tests/windows_physical_durability/preflight.rs`
+- [X] T150 [US4] Implement actual-directory file-content preflight without authoritative artifact access in `src/durability.rs` and `src/durability/windows.rs`, then run T149 GREEN
+- [X] T151 [US4] Write and run a Windows runtime RED requiring same-directory no-replace write-through move, replace probe, content validation, and identity-safe disposable cleanup in `tests/windows_physical_durability/preflight.rs`
+- [X] T152 [US4] Implement unique `create_new` namespace preflight and safe cleanup in `src/durability/windows.rs`, then run T151 GREEN
+- [X] T153 [US4] Write and run one table-driven Windows runtime RED for the single preflight-failure contract across content, namespace, and cleanup failures, requiring the correct `RequiredBarrierUnavailable`, original OS source, no fallback, no authority mutation, and no exposed store in `tests/windows_physical_durability/preflight.rs`
+- [X] T154 [US4] Replace Windows `UnsupportedPlatform` with ordered content/namespace capability gating and exact structured mapping in `src/durability.rs` and `src/wal/recovery.rs`, then run T153 GREEN and non-Windows capability tests
 
 ### Write-through publication coverage
 
-- [ ] T155 [US4] Write and run a Windows runtime RED proving fresh physical creation for all families uses synchronized staging then no-replace write-through publication before exposure in `tests/windows_physical_durability/publication.rs`
-- [ ] T156 [US4] Route fresh-store physical publication through the platform namespace abstraction in `src/wal/recovery.rs` and `src/durability.rs`, then run T155 GREEN
-- [ ] T157 [US4] Write and run a Windows runtime RED proving rotation closes/replaces the active handle and uses write-through sealing/next-active publication without weakening segment authority in `tests/windows_physical_durability/publication.rs`
-- [ ] T158 [US4] Route physical rotation transitions through handle-safe write-through operations in `src/wal/mod.rs` and `src/durability.rs`, then run T157 GREEN
-- [ ] T159 [US4] Write and run a Windows runtime RED proving normal recovery repair/promotion/rollback uses file synchronization plus write-through namespace transitions in `tests/windows_physical_durability/publication.rs`
-- [ ] T160 [US4] Route physical recovery publication through the platform abstraction in `src/wal/recovery.rs` and `src/durability.rs`, then run T159 GREEN
-- [ ] T161 [US4] Write and run a Windows runtime RED proving manifest revisions, source-to-previous, closed staging-to-canonical, and cleanup authority transitions use the correct no-replace/replace write-through mode in `tests/windows_physical_durability/publication.rs`
-- [ ] T162 [US4] Route physical closed-compaction and manifest publication through write-through operations in `src/compaction/manifest.rs`, `src/compaction/publication.rs`, and `src/durability.rs`, then run T161 GREEN
-- [ ] T163 [US4] Write and run a Windows runtime RED proving online cutover drops the old handle, moves family artifacts write-through, reopens canonical replacement, and installs the new writer before writes resume in `tests/windows_physical_durability/publication.rs`
-- [ ] T164 [US4] Route physical online cutover and writer handoff through the Windows-safe publication path in `src/compaction/publication.rs`, `src/compaction/mod.rs`, and `src/wal/mod.rs`, then run T163 GREEN
+- [X] T155 [US4] Write and run a Windows runtime RED proving fresh physical creation for all families uses synchronized staging then no-replace write-through publication before exposure in `tests/windows_physical_durability/publication.rs`
+- [X] T156 [US4] Route fresh-store physical publication through the platform namespace abstraction in `src/wal/recovery.rs` and `src/durability.rs`, then run T155 GREEN
+- [X] T157 [US4] Write and run a Windows runtime RED proving rotation closes/replaces the active handle and uses write-through sealing/next-active publication without weakening segment authority in `tests/windows_physical_durability/publication.rs`
+- [X] T158 [US4] Route physical rotation transitions through handle-safe write-through operations in `src/wal/mod.rs` and `src/durability.rs`, then run T157 GREEN
+- [X] T159 [US4] Write and run a Windows runtime RED proving normal recovery repair/promotion/rollback uses file synchronization plus write-through namespace transitions in `tests/windows_physical_durability/publication.rs`
+- [X] T160 [US4] Route physical recovery publication through the platform abstraction in `src/wal/recovery.rs` and `src/durability.rs`, then run T159 GREEN
+- [X] T161 [US4] Write and run a Windows runtime RED proving manifest revisions, source-to-previous, closed staging-to-canonical, and cleanup authority transitions use the correct no-replace/replace write-through mode in `tests/windows_physical_durability/publication.rs`
+- [X] T162 [US4] Route physical closed-compaction and manifest publication through write-through operations in `src/compaction/manifest.rs`, `src/compaction/publication.rs`, and `src/durability.rs`, then run T161 GREEN
+- [X] T163 [US4] Write and run a Windows runtime RED proving online cutover drops the old handle, moves family artifacts write-through, reopens canonical replacement, and installs the new writer before writes resume in `tests/windows_physical_durability/publication.rs`
+- [X] T164 [US4] Route physical online cutover and writer handoff through the Windows-safe publication path in `src/compaction/publication.rs`, `src/compaction/mod.rs`, and `src/wal/mod.rs`, then run T163 GREEN
 
 ### Failure, compatibility, and CI evidence
 
-- [ ] T165 [US4] Write and run one table-driven Windows runtime RED for the single physical-publication failure contract across fresh, rotation, recovery, manifest, previous, replacement, reopen, and cleanup boundaries in `tests/windows_physical_durability/publication.rs`
-- [ ] T166 [US4] Preserve rollback/failed-closed authority and exact operation/path/OS sources for every T165 failure in `src/durability.rs`, `src/wal/recovery.rs`, and `src/compaction/{manifest,publication,recovery}.rs`, then run T165 GREEN
-- [ ] T167 [US4] Write and run one table-driven Windows runtime RED for the single native-path/handle contract across Unicode paths, supported long absolute paths, destination-exists no-replace, and an external non-delete-sharing handle conflict with zero fallback in `tests/windows_physical_durability/contract.rs`
-- [ ] T168 [US4] Correct only remaining path/handle/error propagation defects inside `src/durability/windows.rs`, `src/wal/mod.rs`, and `src/compaction/publication.rs`, then run T167 GREEN
-- [ ] T169 [US4] Write and run a Windows buffered first-execution-GREEN compatibility test proving established bytes/results and zero Win32 write-through calls in `tests/windows_physical_durability/compatibility.rs`
-- [ ] T170 [US4] Keep buffered dispatch on standard-library namespace operations and Linux/macOS physical rename-plus-directory-sync behavior unchanged in `src/durability.rs`, then rerun T169 and existing durability suites GREEN
-- [ ] T171 [P] [US4] Run public physical construction/open, ordinary mutation, compute batch, rollback, rotation, recovery, and three-reopen matrices for every family in `tests/windows_physical_durability/contract.rs`
-- [ ] T172 [P] [US4] Run closed/online compaction and every manifest/cleanup cut under real and fault-modeled Windows physical policy in `tests/windows_physical_durability/publication.rs`
+- [X] T165 [US4] Write and run one table-driven Windows runtime RED for the single physical-publication failure contract across fresh, rotation, recovery, manifest, previous, replacement, reopen, and cleanup boundaries in `tests/windows_physical_durability/publication.rs`
+- [X] T166 [US4] Preserve rollback/failed-closed authority and exact operation/path/OS sources for every T165 failure in `src/durability.rs`, `src/wal/recovery.rs`, and `src/compaction/{manifest,publication,recovery}.rs`, then run T165 GREEN
+- [X] T167 [US4] Write and run one table-driven Windows runtime RED for the single native-path/handle contract across Unicode paths, supported long absolute paths, destination-exists no-replace, and an external non-delete-sharing handle conflict with zero fallback in `tests/windows_physical_durability/contract.rs`
+- [X] T168 [US4] Correct only remaining path/handle/error propagation defects inside `src/durability/windows.rs`, `src/wal/mod.rs`, and `src/compaction/publication.rs`, then run T167 GREEN
+- [X] T169 [US4] Write and run a Windows buffered first-execution-GREEN compatibility test proving established bytes/results and zero Win32 write-through calls in `tests/windows_physical_durability/compatibility.rs`
+- [X] T170 [US4] Keep buffered dispatch on standard-library namespace operations and Linux/macOS physical rename-plus-directory-sync behavior unchanged in `src/durability.rs`, then rerun T169 and existing durability suites GREEN
+- [X] T171 [P] [US4] Run public physical construction/open, ordinary mutation, compute batch, rollback, rotation, recovery, and three-reopen matrices for every family in `tests/windows_physical_durability/contract.rs`
+- [X] T172 [P] [US4] Run closed/online compaction and every manifest/cleanup cut under real and fault-modeled Windows physical policy in `tests/windows_physical_durability/publication.rs`
 - [X] T173 [US4] Replace Windows physical-unsupported CI assertions with the full support matrix and unsafe-boundary scan in `.github/workflows/recovery.yml`, `tests/durable_write_policy/contract.rs`, and `src/wal/durability_tests.rs`
-- [ ] T174 [US4] Run the Windows matrix plus Linux/macOS compatibility jobs and record SC-008/SC-010 platform evidence in `specs/008-current-compaction-durability/quickstart.md`
+- [X] T174 [US4] Run the Windows matrix plus Linux/macOS compatibility jobs and record SC-008/SC-010 platform evidence in `specs/008-current-compaction-durability/quickstart.md`
 
 **Checkpoint**: Windows physical durability is explicit, preflighted, write-through, and never silently downgraded.
 
@@ -337,12 +337,12 @@
 - [X] T190 Run `cargo fmt --all -- --check` and record the GREEN result in `specs/008-current-compaction-durability/quickstart.md`
 - [X] T191 Run `cargo clippy --all-targets --all-features -- -D warnings` and record the GREEN result in `specs/008-current-compaction-durability/quickstart.md`
 - [X] T192 Run `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features` and record the GREEN result in `specs/008-current-compaction-durability/quickstart.md`
-- [ ] T193 Confirm the complete Windows support matrix and Linux/macOS compatibility jobs are GREEN and link CI evidence in `specs/008-current-compaction-durability/quickstart.md`
+- [X] T193 Confirm the complete Windows support matrix and Linux/macOS compatibility jobs are GREEN and link CI evidence in `specs/008-current-compaction-durability/quickstart.md`
 - [ ] T194 Build the final candidate benchmark from the accepted source, verify it uses the frozen harness SHA-256 and baseline environment contract, and record candidate commit/dirty/toolchain metadata in `specs/008-current-compaction-durability/benchmarks/candidate.md`
 - [X] T195 Run a non-acceptance diagnostic matrix, identify any structurally failing cell, and either record all cells ready or add a focused RED structural/performance regression and GREEN optimization in `src/maintenance_coordination.rs`, `src/wal/mod.rs`, and `tests/mutation_ordering/performance.rs` before re-running T188–T192
 - [X] T196 Reconstruct the recorded pre-feature commit in a dedicated baseline worktree, rebuild and smoke-test protocol-complete baseline/candidate binaries after any T195 optimization, and verify unchanged harness/workload/environment identities in `specs/008-current-compaction-durability/benchmarks/README.md`
 - [ ] T197 Pause for final quiet-machine confirmation before any acceptance measurements and record the approved capture window in `specs/008-current-compaction-durability/benchmarks/final.md`
-- [ ] T198 Run six complete pinned acceptance matrices on the approved quiet host—three baseline and three candidate, alternated as three counterbalanced matched pairs—and save raw CSV plus SHA-256/provenance in `specs/008-current-compaction-durability/benchmarks/baseline/`, `specs/008-current-compaction-durability/benchmarks/candidate/`, and `specs/008-current-compaction-durability/benchmarks/final.md`
+- [ ] T198 Preserve the three immutable pinned pre-feature baseline matrices, run three complete candidate matrices on the approved quiet host, pair the six captures by ordinal, explain why temporal counterbalancing was not practical after the required pre-edit baseline freeze, and save raw CSV plus SHA-256/provenance in `specs/008-current-compaction-durability/benchmarks/baseline/`, `specs/008-current-compaction-durability/benchmarks/candidate/`, and `specs/008-current-compaction-durability/benchmarks/final.md`
 - [ ] T199 Evaluate every cell independently, report absolute operations/writes per second, p95, ratios, invalid-run handling, and inclusive 90%/85%/125% decisions in `specs/008-current-compaction-durability/benchmarks/final.md`; if any cell fails, return to T195 without weakening thresholds
 - [ ] T200 Re-run Spec Kit analysis, reconcile FR/SC coverage and completed tasks, and record the final release decision plus all command/fixture/Windows/performance evidence in `specs/008-current-compaction-durability/quickstart.md` and `specs/008-current-compaction-durability/checklists/requirements.md`
 

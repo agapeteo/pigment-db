@@ -428,7 +428,7 @@ impl DurableKeyValueStore<Vec<u8>> {
             wal: WalStorage::new_vec_based(),
             file_backing: None,
             _open_lease: None,
-            maintenance: MaintenanceCoordinator::default(),
+            maintenance: MaintenanceCoordinator::disabled(),
             #[cfg(test)]
             mutation_observer: MutationObserver::default(),
         }
@@ -454,7 +454,7 @@ impl DurableKeyValueStore<Vec<u8>> {
             wal: WalStorage::new_vec_based_v1(&header),
             file_backing: None,
             _open_lease: None,
-            maintenance: MaintenanceCoordinator::default(),
+            maintenance: MaintenanceCoordinator::disabled(),
             #[cfg(test)]
             mutation_observer: MutationObserver::default(),
         })

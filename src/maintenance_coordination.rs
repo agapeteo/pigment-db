@@ -5,11 +5,14 @@ use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Debug)]
 pub(crate) struct MaintenanceCoordinator {
     gate: RwLock<()>,
+    coordinates_mutations: bool,
     active_attempt: AtomicU64,
     next_attempt: AtomicU64,
 }
@@ -18,6 +21,7 @@ impl Default for MaintenanceCoordinator {
     fn default() -> Self {
         Self {
             gate: RwLock::new(()),
+            coordinates_mutations: true,
             active_attempt: AtomicU64::new(0),
             next_attempt: AtomicU64::new(1),
         }
@@ -25,16 +29,21 @@ impl Default for MaintenanceCoordinator {
 }
 
 impl MaintenanceCoordinator {
-    pub(crate) fn shared(&self) -> RwLockReadGuard<'_, ()> {
-        self.gate
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    pub(crate) fn disabled() -> Self {
+        Self {
+            gate: RwLock::new(()),
+            coordinates_mutations: false,
+            active_attempt: AtomicU64::new(0),
+            next_attempt: AtomicU64::new(1),
+        }
+    }
+
+    pub(crate) fn shared(&self) -> Option<RwLockReadGuard<'_, ()>> {
+        self.coordinates_mutations.then(|| self.gate.read())
     }
 
     pub(crate) fn exclusive(&self) -> RwLockWriteGuard<'_, ()> {
-        self.gate
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.gate.write()
     }
 
     pub(crate) fn try_begin_online(&self) -> Result<OnlineAttemptToken<'_>, ()> {

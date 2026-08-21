@@ -22,7 +22,12 @@ use std::task::{Context, Poll, Waker};
 
 #[test]
 fn every_set_acceptance_uses_maintenance_but_async_user_work_does_not() {
-    let store = Arc::new(DurableKeySetStore::new_vec_based());
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        DurableKeySetStore::try_init_new(directory.path())
+            .unwrap()
+            .into_store(),
+    );
     for key in [
         b"remove-member".as_slice(),
         b"compute",

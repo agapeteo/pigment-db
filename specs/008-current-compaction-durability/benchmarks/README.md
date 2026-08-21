@@ -126,10 +126,34 @@ Two speculative optimizations were rejected rather than carried into the
 candidate. Bypassing maintenance for vector stores violated the all-mutation
 gate invariant and failed three deterministic ordering tests. A custom atomic
 reader gate first exposed a lost-wakeup deadlock and, after that defect was
-corrected, was materially slower than the standard-library `RwLock`. The final
-candidate therefore retains the simpler, fully GREEN standard gate. Diagnostic
-measurements are not acceptance evidence; only the approved counterbalanced
-quiet-host matrices may decide the thresholds.
+corrected, was materially slower than the standard-library `RwLock`. The
+attempt-1 candidate therefore retained the simpler, fully GREEN standard gate.
+Diagnostic measurements are not acceptance evidence; only the approved
+counterbalanced quiet-host matrices may decide the thresholds.
+
+## Attempt-1 failure and retry preparation (2026-08-21)
+
+The first complete candidate capture preserved all three matrices but failed
+six one-worker throughput cells. All eight-worker throughput and median p95
+cells passed, identifying fixed uncontended gate cost rather than contention
+collapse. The full result and checksums are recorded in `candidate.md` and
+`final.md`.
+
+The RED–GREEN retry narrows the coordination invariant to stores that can
+actually perform file maintenance. Vector-backed stores expose neither storage
+inspection nor online compaction and now bypass the maintenance gate. The
+existing all-mutation coordination tests were moved to file-backed stores, and
+a new deterministic test proves vector mutations progress while a file-only
+maintenance probe is held. The file-backed gate now uses `parking_lot::RwLock`;
+the WAL retains its original standard-library lock after a diagnostic userspace
+WAL-lock experiment was rejected for worse eight-worker p95 latency.
+
+After the optimization, the complete debug and release suites, formatting,
+Clippy with warnings denied, rustdoc with warnings denied, Windows GNU
+cross-check, and byte-identical baseline/candidate 36-cell smoke traversals all
+passed. Diagnostic timing runs were not accepted because host load rose to
+approximately 7 and results varied materially by run order. A new acceptance
+capture requires a new committed candidate and fresh quiet-host confirmation.
 
 ## Artifact policy
 

@@ -69,6 +69,28 @@ fn coordinator_is_constant_per_instance_exclusive_and_immediately_single_attempt
 }
 
 #[test]
+fn vector_backed_mutations_bypass_file_maintenance_coordination() {
+    let store = Arc::new(DurableKeyValueStore::new_vec_based());
+    let exclusive = store.maintenance_probe().exclusive();
+    let (completed_tx, completed_rx) = mpsc::channel();
+    let worker_store = Arc::clone(&store);
+    let worker = std::thread::spawn(move || {
+        worker_store.put(b"vector-only".to_vec(), b"value".to_vec());
+        completed_tx.send(()).unwrap();
+    });
+
+    let completed_while_file_maintenance_was_held =
+        completed_rx.recv_timeout(Duration::from_millis(100));
+    drop(exclusive);
+    worker.join().unwrap();
+
+    assert!(
+        completed_while_file_maintenance_was_held.is_ok(),
+        "vector-backed mutations must not pay or block on a gate reserved for file maintenance"
+    );
+}
+
+#[test]
 fn reads_bypass_maintenance_and_post_publication_callbacks_hold_no_store_guard() {
     let key_value = Arc::new(DurableKeyValueStore::new_vec_based());
     key_value.put(b"value".to_vec(), 7_u64.to_ne_bytes().to_vec());

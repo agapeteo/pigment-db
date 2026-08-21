@@ -18,7 +18,12 @@ use std::sync::Arc;
 
 #[test]
 fn every_mutation_waits_for_maintenance_and_holds_it_through_publication() {
-    let store = Arc::new(DurableKeyValueStore::new_vec_based());
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        DurableKeyValueStore::try_init_new(directory.path())
+            .unwrap()
+            .into_store(),
+    );
     store.put(b"number".to_vec(), 10_u64.to_ne_bytes().to_vec());
     store.put(b"removed".to_vec(), b"before".to_vec());
     let exclusive = store.maintenance_probe().exclusive();
@@ -79,7 +84,10 @@ fn every_mutation_waits_for_maintenance_and_holds_it_through_publication() {
         worker.join().unwrap();
     }
 
-    let mut publication_store = DurableKeyValueStore::new_vec_based();
+    let publication_directory = tempfile::tempdir().unwrap();
+    let mut publication_store = DurableKeyValueStore::try_init_new(publication_directory.path())
+        .unwrap()
+        .into_store();
     let key = b"publication".to_vec();
     let (observer, publication_gate) =
         MutationObserver::one_shot(key.clone(), MutationPhase::Published);
