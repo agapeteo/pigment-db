@@ -389,6 +389,103 @@ fn online_prepared_capture_has_no_mutation_gap() {
     assert!(!store.has_delta_recorder_probe());
 }
 
+#[test]
+fn online_prepared_recovery_accepts_append_rotation_and_requires_finalization() {
+    let directory = tempfile::tempdir().unwrap();
+    let options = crate::DurableStoreOptions::default()
+        .with_wal_segment_size(crate::WalSegmentSize::try_from(170_u64).unwrap());
+    let store = DurableKeyValueStore::try_init_new_with_probe_options(directory.path(), options)
+        .unwrap()
+        .into_store();
+    store.put(b"first".to_vec(), b"one".to_vec());
+    let capture = store
+        .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
+        .unwrap();
+    let initial = capture.manifest.clone();
+    let paths = capture.paths.clone();
+    assert!(!initial.source_finalized);
+
+    store.put(b"second".to_vec(), b"two".to_vec());
+    store.put(b"third".to_vec(), b"three".to_vec());
+    assert!(directory
+        .path()
+        .join("kv.wal.dat.segment-00000000000000000000")
+        .is_file());
+    assert!(crate::compaction::recovery::source_descriptors_match(
+        directory.path(),
+        &initial
+    ));
+
+    drop(capture);
+    drop(store);
+    crate::compaction::recovery::recover_prepared_online(directory.path(), &paths, &initial)
+        .unwrap();
+    assert!(!paths.manifest.exists());
+
+    let reopened = DurableKeyValueStore::try_init_new_with_probe_options(directory.path(), options)
+        .unwrap()
+        .into_store();
+    assert_eq!(reopened.get(b"first"), Some(b"one".to_vec()));
+    assert_eq!(reopened.get(b"second"), Some(b"two".to_vec()));
+    assert_eq!(reopened.get(b"third"), Some(b"three".to_vec()));
+
+    let second = reopened
+        .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
+        .unwrap();
+    let mut finalizing = second.manifest.clone();
+    assert!(crate::compaction::publication::online_publication_ready(&finalizing).is_err());
+    let operation_id = finalizing.operation_id;
+    let phase = finalizing.phase;
+    std::fs::write(&second.paths.staging, b"validated-replacement-prefix").unwrap();
+    let replacement_inventory = vec![crate::compaction::manifest::ArtifactDescriptor {
+        relative_path: std::path::PathBuf::from(second.paths.staging.file_name().unwrap()),
+        role: crate::compaction::manifest::ArtifactRole::ReplacementPrefix,
+        family: Some(crate::StoreFamily::KeyValue),
+        length: u64::try_from(b"validated-replacement-prefix".len()).unwrap(),
+        checksum: crc32fast::hash(b"validated-replacement-prefix"),
+    }];
+    let finalized_source_inventory = finalizing.source_inventory.clone();
+    crate::compaction::publication::publish_online_finalized_prepared(
+        &second.paths,
+        &mut finalizing,
+        finalized_source_inventory,
+        replacement_inventory.clone(),
+    )
+    .unwrap();
+    assert_eq!(finalizing.operation_id, operation_id);
+    assert_eq!(finalizing.phase, phase);
+    assert!(finalizing.source_finalized);
+    assert_eq!(finalizing.replacement_inventory, replacement_inventory);
+    assert_eq!(
+        crate::compaction::publication::read_published_manifest(&second.paths)
+            .unwrap()
+            .unwrap(),
+        finalizing
+    );
+    crate::compaction::publication::online_publication_ready(&finalizing).unwrap();
+    assert!(crate::compaction::recovery::source_descriptors_match(
+        directory.path(),
+        &finalizing
+    ));
+    let durable_finalized = finalizing.clone();
+    assert!(
+        crate::compaction::publication::publish_online_finalized_prepared(
+            &second.paths,
+            &mut finalizing,
+            durable_finalized.source_inventory.clone(),
+            durable_finalized.replacement_inventory.clone(),
+        )
+        .is_err()
+    );
+    assert_eq!(
+        crate::compaction::publication::read_published_manifest(&second.paths)
+            .unwrap()
+            .unwrap(),
+        durable_finalized
+    );
+    drop(second);
+}
+
 fn block_on_online<F: Future>(future: F) -> F::Output {
     let waker = Waker::noop();
     let mut context = Context::from_waker(waker);

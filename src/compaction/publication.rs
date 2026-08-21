@@ -375,6 +375,41 @@ pub(crate) fn publish_online_prepared(
     Ok(manifest)
 }
 
+pub(crate) fn publish_online_finalized_prepared(
+    paths: &MaintenanceArtifactPaths,
+    manifest: &mut CompactionManifest,
+    source_inventory: Vec<super::manifest::ArtifactDescriptor>,
+    replacement_inventory: Vec<super::manifest::ArtifactDescriptor>,
+) -> Result<(), CompactionError> {
+    let next = manifest
+        .finalized_online_prepared(source_inventory, replacement_inventory)
+        .map_err(|error| CompactionError::FailedClosed {
+            detail: format!("invalid online Prepared finalization: {error:?}"),
+        })?;
+    publish_manifest_for_policy(paths, &next, manifest.durability)?;
+    *manifest = next;
+    Ok(())
+}
+
+pub(crate) fn online_publication_ready(
+    manifest: &CompactionManifest,
+) -> Result<(), CompactionError> {
+    if manifest.mode == ManifestMode::OnlineFamily
+        && matches!(manifest.scope, ManifestScope::Family { .. })
+        && manifest.phase == ManifestPhase::Prepared
+        && manifest.source_finalized
+        && !manifest.source_inventory.is_empty()
+        && !manifest.replacement_inventory.is_empty()
+        && encode_manifest(manifest).is_ok()
+    {
+        return Ok(());
+    }
+    Err(CompactionError::FailedClosed {
+        detail: "online publication requires a finalized Prepared source and replacement"
+            .to_owned(),
+    })
+}
+
 fn native_leaf(path: &Path) -> Result<PathBuf, CompactionError> {
     path.file_name()
         .map(PathBuf::from)

@@ -9,15 +9,12 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use super::manifest::{
-    verify_descriptor, ArtifactDescriptor, CompactionManifest, ManifestMode, ManifestPhase,
-    ManifestScope,
+    verify_descriptor, ArtifactDescriptor, ArtifactRole, CompactionManifest, ManifestMode,
+    ManifestPhase, ManifestScope,
 };
 use super::publication::{
     directory_artifact_paths, publish_manifest_for_policy, read_published_manifest,
     MaintenanceArtifactPaths,
-};
-use crate::wal::replay::{
-    classify_key_map_read_only, classify_key_set_read_only, classify_key_value_read_only,
 };
 use crate::{CompactionError, CompactionOperation, RecoveryError, RecoveryOperation, StoreFamily};
 
@@ -612,29 +609,193 @@ pub(crate) fn source_descriptors_match(anchor: &Path, manifest: &CompactionManif
     let prefix_mode = manifest.phase == ManifestPhase::Prepared
         && manifest.mode == ManifestMode::OnlineFamily
         && !manifest.source_finalized;
-    manifest.source_inventory.iter().all(|descriptor| {
-        let path = anchor.join(&descriptor.relative_path);
-        if !prefix_mode {
-            return verify_descriptor(anchor, descriptor).is_ok();
+    if prefix_mode {
+        return online_source_prefix_matches(anchor, manifest);
+    }
+    manifest
+        .source_inventory
+        .iter()
+        .all(|descriptor| verify_descriptor(anchor, descriptor).is_ok())
+}
+
+pub(crate) fn recover_prepared_online(
+    store_dir: &Path,
+    paths: &MaintenanceArtifactPaths,
+    manifest: &CompactionManifest,
+) -> Result<(), CompactionError> {
+    validate_online_prepared_binding(store_dir, paths, manifest)?;
+    remove_unpublished_manifest_temp(paths)?;
+    if !source_descriptors_match(store_dir, manifest) {
+        return Err(authority_undetermined(store_dir, paths));
+    }
+    if path_exists(&paths.previous)? {
+        return Err(authority_undetermined(store_dir, paths));
+    }
+    if path_exists(&paths.staging)? {
+        let metadata =
+            fs::symlink_metadata(&paths.staging).map_err(|source| CompactionError::Io {
+                operation: CompactionOperation::Cleanup,
+                path: paths.staging.clone(),
+                source,
+            })?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(authority_undetermined(store_dir, paths));
         }
+        fs::remove_file(&paths.staging).map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::Cleanup,
+            path: paths.staging.clone(),
+            source,
+        })?;
+    }
+    match fs::remove_file(&paths.manifest) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(CompactionError::Io {
+                operation: CompactionOperation::Cleanup,
+                path: paths.manifest.clone(),
+                source,
+            });
+        }
+    }
+    if manifest.durability == crate::DurabilityPolicy::Physical {
+        crate::durability::synchronize_directory(store_dir).map_err(|source| {
+            CompactionError::Io {
+                operation: CompactionOperation::Cleanup,
+                path: store_dir.to_path_buf(),
+                source,
+            }
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_online_prepared_binding(
+    store_dir: &Path,
+    paths: &MaintenanceArtifactPaths,
+    manifest: &CompactionManifest,
+) -> Result<(), CompactionError> {
+    let ManifestScope::Family {
+        family,
+        active_name,
+    } = &manifest.scope
+    else {
+        return Err(CompactionError::InvalidArtifact {
+            path: paths.manifest.clone(),
+        });
+    };
+    let expected_paths = super::publication::family_artifact_paths(&store_dir.join(active_name))
+        .map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::Inspect,
+            path: store_dir.join(active_name),
+            source,
+        })?;
+    let source_names_bound = online_source_inventory_is_canonical(manifest, *family, active_name);
+    let replacement_name = paths.staging.file_name();
+    let replacement_bound = manifest.replacement_inventory.iter().all(|descriptor| {
+        descriptor.family == Some(*family)
+            && descriptor.role == ArtifactRole::ReplacementPrefix
+            && descriptor.relative_path.file_name() == replacement_name
+            && descriptor.relative_path.components().count() == 1
+    });
+    if manifest.mode != ManifestMode::OnlineFamily
+        || manifest.phase != ManifestPhase::Prepared
+        || &expected_paths != paths
+        || paths.staging.file_name().map(PathBuf::from) != Some(manifest.staging_location.clone())
+        || paths.previous.file_name().map(PathBuf::from) != Some(manifest.previous_location.clone())
+        || !source_names_bound
+        || !replacement_bound
+    {
+        return Err(CompactionError::InvalidArtifact {
+            path: paths.manifest.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn online_source_prefix_matches(anchor: &Path, manifest: &CompactionManifest) -> bool {
+    let ManifestScope::Family {
+        family,
+        active_name,
+    } = &manifest.scope
+    else {
+        return false;
+    };
+    let inspected_family = match family {
+        StoreFamily::KeyValue => super::inspection::InspectedFamily::KeyValue,
+        StoreFamily::KeySet => super::inspection::InspectedFamily::KeySet,
+        StoreFamily::KeyMap => super::inspection::InspectedFamily::KeyMap,
+    };
+    if active_name != Path::new(inspected_family.active_name())
+        || !online_source_inventory_is_canonical(manifest, *family, active_name)
+    {
+        return false;
+    }
+    let Ok(inspection) = super::inspection::inspect_open_family(anchor, inspected_family) else {
+        return false;
+    };
+    let mut chain = Vec::new();
+    for segment in 0..inspection.sealed_segment_count {
+        let path = anchor.join(format!(
+            "{}.segment-{segment:020}",
+            inspected_family.active_name()
+        ));
         let Ok(bytes) = fs::read(path) else {
             return false;
         };
+        chain.extend_from_slice(&bytes);
+    }
+    let Ok(active) = fs::read(anchor.join(active_name)) else {
+        return false;
+    };
+    chain.extend_from_slice(&active);
+
+    let mut offset = 0_usize;
+    for descriptor in &manifest.source_inventory {
         let Ok(length) = usize::try_from(descriptor.length) else {
             return false;
         };
-        let Some(prefix) = bytes.get(..length) else {
+        let Some(end) = offset.checked_add(length) else {
             return false;
         };
-        if crc32fast::hash(prefix) != descriptor.checksum {
+        let Some(prefix_part) = chain.get(offset..end) else {
+            return false;
+        };
+        if crc32fast::hash(prefix_part) != descriptor.checksum {
             return false;
         }
-        match descriptor.family {
-            Some(StoreFamily::KeyValue) => classify_key_value_read_only(&bytes).is_ok(),
-            Some(StoreFamily::KeySet) => classify_key_set_read_only(&bytes).is_ok(),
-            Some(StoreFamily::KeyMap) => classify_key_map_read_only(&bytes).is_ok(),
-            None => false,
-        }
+        offset = end;
+    }
+    true
+}
+
+fn online_source_inventory_is_canonical(
+    manifest: &CompactionManifest,
+    family: StoreFamily,
+    active_name: &Path,
+) -> bool {
+    let expected_active_name = match family {
+        StoreFamily::KeyValue => "kv.wal.dat",
+        StoreFamily::KeySet => "set.wal.dat",
+        StoreFamily::KeyMap => "map.wal.dat",
+    };
+    if active_name != Path::new(expected_active_name) {
+        return false;
+    }
+    let Some((active, sealed)) = manifest.source_inventory.split_last() else {
+        return false;
+    };
+    if active.family != Some(family)
+        || active.role != ArtifactRole::Active
+        || active.relative_path != active_name
+    {
+        return false;
+    }
+    sealed.iter().enumerate().all(|(segment, descriptor)| {
+        descriptor.family == Some(family)
+            && descriptor.role == ArtifactRole::SealedSegment
+            && descriptor.relative_path
+                == PathBuf::from(format!("{}.segment-{segment:020}", expected_active_name))
     })
 }
 

@@ -101,6 +101,25 @@ impl CompactionManifest {
             replacement_inventory: Vec::new(),
         }
     }
+
+    pub(crate) fn finalized_online_prepared(
+        &self,
+        source_inventory: Vec<ArtifactDescriptor>,
+        replacement_inventory: Vec<ArtifactDescriptor>,
+    ) -> Result<Self, ManifestCodecError> {
+        if self.mode != ManifestMode::OnlineFamily
+            || self.phase != ManifestPhase::Prepared
+            || self.source_finalized
+        {
+            return Err(ManifestCodecError::InvalidTransition);
+        }
+        let mut next = self.clone();
+        next.source_finalized = true;
+        next.source_inventory = source_inventory;
+        next.replacement_inventory = replacement_inventory;
+        validate_manifest(&next)?;
+        Ok(next)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,6 +133,7 @@ pub(crate) enum ManifestCodecError {
     DuplicatePath,
     LimitExceeded,
     DescriptorMismatch,
+    InvalidTransition,
 }
 
 pub(crate) fn verify_descriptor(
@@ -320,8 +340,36 @@ fn validate_manifest(manifest: &CompactionManifest) -> Result<(), ManifestCodecE
     if manifest.mode == ManifestMode::ClosedDirectory && !manifest.source_finalized {
         return Err(ManifestCodecError::InvalidBody);
     }
-    if let ManifestScope::Family { active_name, .. } = &manifest.scope {
+    if let ManifestScope::Family {
+        family,
+        active_name,
+    } = &manifest.scope
+    {
         validate_relative_path(active_name)?;
+        if manifest.phase != ManifestPhase::Prepared && !manifest.source_finalized {
+            return Err(ManifestCodecError::InvalidBody);
+        }
+        if manifest.source_inventory.is_empty()
+            || (manifest.source_finalized && manifest.replacement_inventory.is_empty())
+            || (!manifest.source_finalized && !manifest.replacement_inventory.is_empty())
+        {
+            return Err(ManifestCodecError::InvalidBody);
+        }
+        let Some((active, sealed)) = manifest.source_inventory.split_last() else {
+            return Err(ManifestCodecError::InvalidBody);
+        };
+        if active.role != ArtifactRole::Active
+            || active.family != Some(*family)
+            || sealed.iter().any(|descriptor| {
+                descriptor.role != ArtifactRole::SealedSegment || descriptor.family != Some(*family)
+            })
+            || manifest.replacement_inventory.iter().any(|descriptor| {
+                descriptor.role != ArtifactRole::ReplacementPrefix
+                    || descriptor.family != Some(*family)
+            })
+        {
+            return Err(ManifestCodecError::InvalidBody);
+        }
     }
     validate_relative_path(&manifest.staging_location)?;
     validate_relative_path(&manifest.previous_location)?;
@@ -655,20 +703,31 @@ mod tests {
             ManifestScope::Directory => ManifestMode::ClosedDirectory,
             ManifestScope::Family { .. } => ManifestMode::OnlineFamily,
         };
+        let family = match &scope {
+            ManifestScope::Family { family, .. } => *family,
+            ManifestScope::Directory => StoreFamily::KeyValue,
+        };
+        let source_finalized =
+            mode == ManifestMode::ClosedDirectory || phase != ManifestPhase::Prepared;
+        let mut source = descriptor("source.pigment", ArtifactRole::Active);
+        source.family = Some(family);
+        let mut replacement = descriptor("replacement.pigment", ArtifactRole::ReplacementPrefix);
+        replacement.family = Some(family);
         CompactionManifest {
             operation_id: *b"0123456789abcdef",
             mode,
             scope,
             phase,
-            source_finalized: mode == ManifestMode::ClosedDirectory,
+            source_finalized,
             durability,
-            source_inventory: vec![descriptor("source.pigment", ArtifactRole::Active)],
+            source_inventory: vec![source],
             staging_location: PathBuf::from("staging.pigment"),
             previous_location: PathBuf::from("previous.pigment"),
-            replacement_inventory: vec![descriptor(
-                "replacement.pigment",
-                ArtifactRole::ReplacementPrefix,
-            )],
+            replacement_inventory: if source_finalized {
+                vec![replacement]
+            } else {
+                Vec::new()
+            },
         }
     }
 
