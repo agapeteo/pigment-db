@@ -488,6 +488,48 @@ fn online_prepared_recovery_accepts_append_rotation_and_requires_finalization() 
 }
 
 #[test]
+fn finalized_prepared_recovery_discards_an_empty_previous_directory_before_the_first_move() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = DurableKeyValueStore::try_init_new(directory.path())
+        .unwrap()
+        .into_store();
+    store.put(b"stable".to_vec(), b"authority".to_vec());
+    let capture = store
+        .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
+        .unwrap();
+    let staged = super::prepare_online_staging(capture, |_| Ok(())).unwrap();
+    let paths = staged.prepared.paths.clone();
+    std::fs::create_dir(&paths.previous).unwrap();
+
+    let error = match store.complete_online_cutover_probe(staged) {
+        Ok(_) => panic!("preexisting previous directory unexpectedly allowed publication"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        crate::CompactionError::Io {
+            operation: crate::CompactionOperation::PublishPrevious,
+            ..
+        }
+    ));
+    assert!(paths.previous.is_dir());
+    assert_eq!(std::fs::read_dir(&paths.previous).unwrap().count(), 0);
+    assert!(paths.staging.is_file());
+    drop(store);
+
+    let reopened = DurableKeyValueStore::try_init_new(directory.path())
+        .expect("empty pre-move directory cannot compete with exact old authority")
+        .into_store();
+    assert_eq!(reopened.get(b"stable"), Some(b"authority".to_vec()));
+    reopened
+        .try_put(b"after-reopen".to_vec(), b"accepted".to_vec())
+        .unwrap();
+    assert!(!paths.previous.exists());
+    assert!(!paths.staging.exists());
+    assert!(!paths.manifest.exists());
+}
+
+#[test]
 fn staging_encode_and_validation_run_without_exclusive_maintenance() {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(

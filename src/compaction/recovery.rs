@@ -196,9 +196,7 @@ pub(crate) fn recover_online_cleanup_with_checkpoint(
     {
         return Ok(crate::CleanupStatus::Pending);
     }
-    if manifest.durability == crate::DurabilityPolicy::Physical
-        && crate::durability::synchronize_directory(store_dir).is_err()
-    {
+    if crate::durability::synchronize_namespace_parent(store_dir, manifest.durability).is_err() {
         return Ok(crate::CleanupStatus::Pending);
     }
     if checkpoint(super::OnlineCleanupStage::BeforeManifest).is_err() {
@@ -209,9 +207,7 @@ pub(crate) fn recover_online_cleanup_with_checkpoint(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(_) => return Ok(crate::CleanupStatus::Pending),
     }
-    if manifest.durability == crate::DurabilityPolicy::Physical
-        && crate::durability::synchronize_directory(store_dir).is_err()
-    {
+    if crate::durability::synchronize_namespace_parent(store_dir, manifest.durability).is_err() {
         return Ok(crate::CleanupStatus::Pending);
     }
     Ok(crate::CleanupStatus::Complete)
@@ -831,7 +827,35 @@ pub(crate) fn abandon_prepared_online(
         return Err(authority_undetermined(store_dir, paths));
     }
     if path_exists(&paths.previous)? {
-        return Err(authority_undetermined(store_dir, paths));
+        let metadata =
+            fs::symlink_metadata(&paths.previous).map_err(|source| CompactionError::Io {
+                operation: CompactionOperation::Cleanup,
+                path: paths.previous.clone(),
+                source,
+            })?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(authority_undetermined(store_dir, paths));
+        }
+        let mut entries = fs::read_dir(&paths.previous).map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::Cleanup,
+            path: paths.previous.clone(),
+            source,
+        })?;
+        match entries.next() {
+            None => fs::remove_dir(&paths.previous).map_err(|source| CompactionError::Io {
+                operation: CompactionOperation::Cleanup,
+                path: paths.previous.clone(),
+                source,
+            })?,
+            Some(Ok(_)) => return Err(authority_undetermined(store_dir, paths)),
+            Some(Err(source)) => {
+                return Err(CompactionError::Io {
+                    operation: CompactionOperation::Cleanup,
+                    path: paths.previous.clone(),
+                    source,
+                });
+            }
+        }
     }
     if path_exists(&paths.staging)? {
         let metadata =
