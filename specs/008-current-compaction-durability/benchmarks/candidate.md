@@ -55,6 +55,20 @@ rose to approximately 7 and unrelated vector/p95 cells varied sharply by run
 order. Those `/tmp` diagnostics neither replace nor modify the immutable raw
 attempt-1 evidence.
 
-The retry candidate will receive a new commit, dirty-state digest, three new
-capture IDs, and a fresh explicit quiet-host confirmation after all correctness,
-quality, and platform gates pass.
+## Optimized retry candidate provenance
+
+| Field | Value |
+|---|---|
+| Accepted source commit | `19ecb1d7efaceecf2199f0458b50d3faebc0b3da` |
+| Pre-capture dirty-tree digest | `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855` (empty/clean) |
+| Harness SHA-256 | `c8ca6c94e6f38d54e456462bce2e8fad0d3cffa2b2457f4c2818129b1c62006c` |
+| Rust/Cargo/target | `rustc 1.97.1 (8bab26f4f 2026-07-14)` / `cargo 1.97.1 (c980f4866 2026-06-30)` / `x86_64-unknown-linux-gnu` |
+| Resolved maintenance-lock dependency | `parking_lot 0.12.5` |
+| Environment contract | Same filesystem, temporary-data root, CPU set `12-19`, workload matrix, and frozen baseline contract recorded in `README.md` |
+| Build verification | Complete debug/release quality gates, Windows GNU cross-check, and byte-identical 36-cell baseline/candidate smoke traversals GREEN |
+| Acceptance capture IDs | Pending: `candidate-retry-1`, `candidate-retry-2`, `candidate-retry-3` |
+
+The accepted source commit contains the optimization and immutable attempt-1
+evidence. This documentation-only provenance update does not change its release
+binary. Native platform CI and a fresh explicit quiet-host confirmation remain
+required before the three optimized acceptance matrices are captured.
