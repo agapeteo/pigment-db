@@ -155,6 +155,9 @@ fn windows_workflow_runs_native_boundary_and_private_physical_fault_models() {
         "cargo test durability::windows::tests -- --test-threads=1",
         "cargo test wal::durability_tests:: -- --test-threads=1",
         "cargo test compaction::recovery_tests:: -- --test-threads=1",
+        "::error title=Windows native durability boundary::",
+        "::error title=Windows WAL durability fault models::",
+        "::error title=Windows compaction recovery fault models::",
     ] {
         assert!(
             workflow.contains(required),
