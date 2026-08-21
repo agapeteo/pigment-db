@@ -886,6 +886,69 @@ fn successful_cutover_installs_fresh_writer_and_rotates_only_replacement() {
 }
 
 #[test]
+fn replacement_reopen_failure_preserves_live_reads_and_fails_closed_before_io() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = DurableKeyValueStore::try_init_new(directory.path())
+        .unwrap()
+        .into_store();
+    store.put(b"snapshot".to_vec(), b"readable".to_vec());
+    let capture = store
+        .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
+        .unwrap();
+    let staged = super::prepare_online_staging(capture, |_| Ok(())).unwrap();
+    let paths = staged.prepared.paths.clone();
+    store.put(b"delta".to_vec(), b"also-readable".to_vec());
+
+    let error = match store.complete_online_cutover_with_reopen_probe(staged, |_| {
+        Err(std::io::Error::other(
+            "scripted authoritative replacement reopen failure",
+        ))
+    }) {
+        Ok(_) => panic!("scripted replacement reopen unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        crate::CompactionError::Io {
+            operation: crate::CompactionOperation::ReopenReplacement,
+            ..
+        }
+    ));
+
+    assert_eq!(store.get(b"snapshot"), Some(b"readable".to_vec()));
+    assert_eq!(store.get(b"delta"), Some(b"also-readable".to_vec()));
+    assert!(paths.previous.is_dir());
+    assert!(!paths.staging.exists());
+    assert!(directory.path().join("kv.wal.dat").is_file());
+    assert_eq!(
+        crate::compaction::publication::read_published_manifest(&paths)
+            .unwrap()
+            .unwrap()
+            .phase,
+        crate::compaction::manifest::ManifestPhase::PreviousPublished
+    );
+
+    let evidence =
+        crate::test_support::maintenance_fixtures::snapshot_directory(directory.path()).unwrap();
+    assert!(store
+        .try_put(b"rejected-put".to_vec(), b"never-published".to_vec())
+        .is_err());
+    assert!(store.try_remove(b"snapshot").is_err());
+    assert!(store
+        .try_compute(b"delta".to_vec(), |_| b"never-published".to_vec())
+        .is_err());
+    assert_eq!(store.get(b"snapshot"), Some(b"readable".to_vec()));
+    assert_eq!(store.get(b"delta"), Some(b"also-readable".to_vec()));
+    assert_eq!(
+        crate::test_support::maintenance_fixtures::snapshot_directory(directory.path()).unwrap(),
+        evidence,
+        "failed-closed mutations must not touch WAL or maintenance evidence"
+    );
+    assert!(!store.has_delta_recorder_probe());
+    assert!(store.maintenance_probe().try_begin_online().is_ok());
+}
+
+#[test]
 fn paused_first_attempt_keeps_progress_and_losing_second_call_artifact_free() {
     let directory = tempfile::tempdir().unwrap();
     let store = Arc::new(

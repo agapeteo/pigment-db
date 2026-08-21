@@ -277,6 +277,7 @@ enum WalFormat {
 enum WalHealth {
     Ready,
     WriterDetached { token: u64 },
+    MaintenanceIndeterminate { detail: String },
     FailedRollback { original: String, rollback: String },
 }
 
@@ -499,6 +500,28 @@ impl<W: Write> WalStorage<W> {
         state.frame_buffer = Vec::new();
         state.writer = Some(writer);
         state.health = WalHealth::Ready;
+        Ok(())
+    }
+
+    pub(crate) fn mark_online_maintenance_indeterminate(
+        &self,
+        token: u64,
+        detail: String,
+    ) -> std::io::Result<()> {
+        let mut state = self
+            .wal_state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.online_owner_token != Some(token)
+            || !matches!(state.health, WalHealth::WriterDetached { token: owner } if owner == token)
+            || state.writer.is_some()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "only the detached online attempt may fail its WAL closed",
+            ));
+        }
+        state.health = WalHealth::MaintenanceIndeterminate { detail };
         Ok(())
     }
 }
@@ -1735,6 +1758,9 @@ fn ensure_ready(health: &WalHealth) -> std::io::Result<()> {
             std::io::ErrorKind::WouldBlock,
             format!("WAL writer is temporarily detached by online attempt {token}"),
         )),
+        WalHealth::MaintenanceIndeterminate { detail } => Err(std::io::Error::other(format!(
+            "WAL is failed closed after indeterminate online maintenance ({detail}); reopen and recover before another mutation"
+        ))),
         WalHealth::FailedRollback { original, rollback } => {
             Err(std::io::Error::other(MutationFailure::FailedClosed {
                 original: original.clone(),

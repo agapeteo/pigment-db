@@ -132,7 +132,18 @@ impl DurableKeyValueStore<File> {
     #[cfg(test)]
     pub(crate) fn complete_online_cutover_probe<'a>(
         &'a self,
+        staged: crate::compaction::ValidatedOnlineStaging<'a, File>,
+    ) -> Result<crate::compaction::CompletedOnlineCutover, crate::CompactionError> {
+        self.complete_online_cutover_with_reopen_probe(staged, |active_path| {
+            OpenOptions::new().append(true).open(active_path)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_online_cutover_with_reopen_probe<'a>(
+        &'a self,
         mut staged: crate::compaction::ValidatedOnlineStaging<'a, File>,
+        reopen: impl FnOnce(&Path) -> std::io::Result<File>,
     ) -> Result<crate::compaction::CompletedOnlineCutover, crate::CompactionError> {
         let completed = {
             let _exclusive = self.maintenance.exclusive();
@@ -174,46 +185,53 @@ impl DurableKeyValueStore<File> {
                 }
             })?;
             let closed = detached.close();
-            crate::compaction::publication::publish_online_previous(
-                &staged.prepared.paths,
-                &mut staged.prepared.manifest,
-            )?;
-            let expected_len = staged
-                .replacement_inventory
-                .first()
-                .ok_or_else(|| crate::CompactionError::InvalidArtifact {
-                    path: staged.prepared.paths.staging.clone(),
-                })?
-                .length;
-            let (active_path, writer) =
-                crate::compaction::publication::publish_online_replacement_with_reopen(
+            let publication = (|| {
+                crate::compaction::publication::publish_online_previous(
                     &staged.prepared.paths,
                     &mut staged.prepared.manifest,
-                    |active_path| {
-                        let writer = OpenOptions::new().append(true).open(active_path)?;
-                        if writer.metadata()?.len() != expected_len {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "online replacement length changed before writer handoff",
-                            ));
-                        }
-                        Ok(writer)
-                    },
                 )?;
-            self.wal
-                .install_online_replacement_writer(
-                    closed,
-                    writer,
-                    active_path,
-                    expected_len,
-                    staged.staging.granularity_nanos,
-                    staged.staging.last_bucket,
-                )
-                .map_err(|source| crate::CompactionError::Io {
-                    operation: crate::CompactionOperation::ReopenReplacement,
-                    path: staged.prepared.paths.manifest.clone(),
-                    source,
-                })?;
+                let expected_len = staged
+                    .replacement_inventory
+                    .first()
+                    .ok_or_else(|| crate::CompactionError::InvalidArtifact {
+                        path: staged.prepared.paths.staging.clone(),
+                    })?
+                    .length;
+                let (active_path, writer) =
+                    crate::compaction::publication::publish_online_replacement_with_reopen(
+                        &staged.prepared.paths,
+                        &mut staged.prepared.manifest,
+                        |active_path| {
+                            let writer = reopen(active_path)?;
+                            if writer.metadata()?.len() != expected_len {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "online replacement length changed before writer handoff",
+                                ));
+                            }
+                            Ok(writer)
+                        },
+                    )?;
+                self.wal
+                    .install_online_replacement_writer(
+                        closed,
+                        writer,
+                        active_path,
+                        expected_len,
+                        staged.staging.granularity_nanos,
+                        staged.staging.last_bucket,
+                    )
+                    .map_err(|source| crate::CompactionError::Io {
+                        operation: crate::CompactionOperation::ReopenReplacement,
+                        path: staged.prepared.paths.manifest.clone(),
+                        source,
+                    })?;
+                Ok::<(), crate::CompactionError>(())
+            })();
+            if let Err(error) = publication {
+                crate::compaction::fail_online_publication_closed(&self.wal, token, &error)?;
+                return Err(error);
+            }
             crate::compaction::CompletedOnlineCutover {
                 replayed: applied.replayed,
                 paths: staged.prepared.paths.clone(),

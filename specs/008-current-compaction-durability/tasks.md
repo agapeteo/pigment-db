@@ -233,8 +233,8 @@
 - [X] T131 [US3] Move attempt compare/exchange before artifact work and bind all recorder/artifact ownership to the winning token in `src/maintenance_coordination.rs` and `src/compaction/mod.rs`, then run T130 GREEN
 - [X] T132 [US3] Write and run a runtime RED proving staging create/write/sync/reopen/mismatch failures leave the original writer authoritative and clear attempt/recorder state in `src/compaction/online_tests.rs`
 - [X] T133 [US3] Implement pre-publication RAII cleanup for only invocation-owned staging in `src/maintenance_coordination.rs` and `src/compaction/mod.rs`, then run T132 GREEN
-- [ ] T134 [US3] Write and run a runtime RED proving indeterminate namespace authority preserves readable live state/evidence and rejects every later mutation before I/O until reopen in `src/compaction/online_tests.rs`
-- [ ] T135 [US3] Extend internal WAL health for maintenance indeterminacy and replacement-reopen failure in `src/wal/mod.rs` and `src/compaction/mod.rs`, then run T134 GREEN
+- [X] T134 [US3] Write and run a runtime RED proving indeterminate namespace authority preserves readable live state/evidence and rejects every later mutation before I/O until reopen in `src/compaction/online_tests.rs`
+- [X] T135 [US3] Extend internal WAL health for maintenance indeterminacy and replacement-reopen failure in `src/wal/mod.rs` and `src/compaction/mod.rs`, then run T134 GREEN
 - [ ] T136 [US3] Write and run a runtime RED proving post-publication cleanup failure reports pending while replacement stays readable/writable and cleanup converges on reopen or next explicit compaction in `src/compaction/online_tests.rs`
 - [ ] T137 [US3] Implement replacement-prefix validation and foreground cleanup retry without background scheduling in `src/compaction/recovery.rs`, `src/compaction/mod.rs`, and all file-store initializers, then run T136 GREEN
 - [ ] T138 [US3] Write and run a runtime RED proving panic/unwind/cancellation at every pre-publication checkpoint clears only the matching recorder and resets the attempt flag after lock guards drop in `src/compaction/online_tests.rs`

@@ -383,6 +383,19 @@ pub(crate) fn finalize_online_prepared<W: Write>(
     Ok(())
 }
 
+pub(crate) fn fail_online_publication_closed<W: Write>(
+    wal: &crate::wal::WalStorage<W>,
+    token: u64,
+    error: &CompactionError,
+) -> Result<(), CompactionError> {
+    wal.mark_online_maintenance_indeterminate(token, error.to_string())
+        .map_err(|source| CompactionError::FailedClosed {
+            detail: format!(
+                "online publication failed ({error}) and the detached WAL could not be marked indeterminate: {source}"
+            ),
+        })
+}
+
 pub(crate) fn begin_online_capture<'a, W: Write>(
     coordinator: &'a crate::maintenance_coordination::MaintenanceCoordinator,
     wal: &'a crate::wal::WalStorage<W>,
