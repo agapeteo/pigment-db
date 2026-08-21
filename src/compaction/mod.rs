@@ -64,6 +64,13 @@ pub(crate) struct OnlineDeltaSummary {
     pub(crate) group_frame_counts: Vec<usize>,
 }
 
+#[allow(dead_code)]
+pub(crate) struct CompletedOnlineCutover {
+    pub(crate) replayed: usize,
+    pub(crate) paths: MaintenanceArtifactPaths,
+    pub(crate) manifest: crate::compaction::manifest::CompactionManifest,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OnlineStagingStage {
     Encoding,
@@ -305,6 +312,41 @@ pub(crate) fn validate_online_staging_against_live<W: Write>(
         std::slice::from_ref(&current),
         std::slice::from_ref(&staged.staging),
     )
+}
+
+pub(crate) fn finalize_online_prepared<W: Write>(
+    staged: &mut ValidatedOnlineStaging<'_, W>,
+    live_state: CapturedLogicalState,
+    metadata: crate::wal::OnlineCaptureMetadata,
+) -> Result<(), CompactionError> {
+    validate_online_staging_against_live(staged, live_state.clone(), metadata)?;
+    let store_dir = staged.prepared.paths.manifest.parent().ok_or_else(|| {
+        CompactionError::InvalidArtifact {
+            path: staged.prepared.paths.manifest.clone(),
+        }
+    })?;
+    let inspected_family = match staged.prepared.capture.family {
+        StoreFamily::KeyValue => InspectedFamily::KeyValue,
+        StoreFamily::KeySet => InspectedFamily::KeySet,
+        StoreFamily::KeyMap => InspectedFamily::KeyMap,
+    };
+    let inspection = inspect_open_family(store_dir, inspected_family).map_err(|error| {
+        crate::maintenance::map_inspection_error(store_dir.to_path_buf(), error)
+    })?;
+    let (current, source_inventory) =
+        capture_online_family(store_dir, &inspection, live_state, metadata)?;
+    compare_captured_families(
+        std::slice::from_ref(&current),
+        std::slice::from_ref(&staged.staging),
+    )?;
+    crate::compaction::publication::publish_online_finalized_prepared(
+        &staged.prepared.paths,
+        &mut staged.prepared.manifest,
+        source_inventory,
+        staged.replacement_inventory.clone(),
+    )?;
+    staged.prepared.capture = current;
+    Ok(())
 }
 
 pub(crate) fn begin_online_capture<'a, W: Write>(

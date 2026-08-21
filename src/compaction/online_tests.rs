@@ -807,6 +807,82 @@ fn bounded_delta_zero_exact_and_one_group_over_preserve_original_authority() {
     }
 }
 
+#[test]
+fn successful_cutover_installs_fresh_writer_and_rotates_only_replacement() {
+    let directory = tempfile::tempdir().unwrap();
+    let options = crate::DurableStoreOptions::default()
+        .with_timestamp_granularity(
+            crate::TimestampGranularity::try_from(Duration::from_nanos(1)).unwrap(),
+        )
+        .with_wal_segment_size(crate::WalSegmentSize::try_from(1_u64).unwrap());
+    let store = DurableKeyValueStore::try_init_new_with_probe_options(directory.path(), options)
+        .unwrap()
+        .into_store();
+    store.install_clock_probe(online_test_clock);
+    ONLINE_TEST_CLOCK.store(100, Ordering::SeqCst);
+    store.put(b"snapshot".to_vec(), vec![b'x'; 256]);
+
+    let active = directory.path().join("kv.wal.dat");
+    let old_active = std::fs::read(&active).unwrap();
+    let capture = store
+        .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
+        .unwrap();
+    let staged = super::prepare_online_staging(capture, |_| {}).unwrap();
+    let completed = store.complete_online_cutover_probe(staged).unwrap();
+    assert_eq!(completed.replayed, 0);
+    assert_eq!(
+        completed.manifest.phase,
+        crate::compaction::manifest::ManifestPhase::ReplacementPublished
+    );
+    assert!(completed.manifest.source_finalized);
+    assert!(completed.paths.previous.is_dir());
+    let previous_active = completed.paths.previous.join("kv.wal.dat");
+    assert_eq!(std::fs::read(&previous_active).unwrap(), old_active);
+    assert!(!directory
+        .path()
+        .join("kv.wal.dat.segment-00000000000000000000")
+        .exists());
+
+    let replacement_before_mutation = std::fs::read(&active).unwrap();
+    let installed = store.online_wal_state_probe();
+    assert_eq!(installed.offset, replacement_before_mutation.len() as u64);
+    assert_eq!(
+        installed.active_len,
+        replacement_before_mutation.len() as u64
+    );
+    assert_eq!(installed.granularity_nanos, 1);
+    assert_eq!(installed.last_bucket, 100);
+    assert_eq!(installed.frame_buffer_len, 0);
+    assert_eq!(installed.rotation_segment_id, Some(0));
+    assert_eq!(installed.rotation_segment_base, Some(0));
+    assert_eq!(installed.force_before_next_mutation, Some(false));
+
+    ONLINE_TEST_CLOCK.store(200, Ordering::SeqCst);
+    store.put(b"after-cutover".to_vec(), b"accepted".to_vec());
+    let sealed_replacement = directory
+        .path()
+        .join("kv.wal.dat.segment-00000000000000000000");
+    assert_eq!(
+        std::fs::read(&sealed_replacement).unwrap(),
+        replacement_before_mutation
+    );
+    assert_eq!(std::fs::read(&previous_active).unwrap(), old_active);
+    assert_eq!(store.get(b"after-cutover"), Some(b"accepted".to_vec()));
+    let after = store.online_wal_state_probe();
+    assert_eq!(after.granularity_nanos, 1);
+    assert_eq!(after.last_bucket, 200);
+    assert_eq!(after.rotation_segment_id, Some(1));
+    assert_eq!(
+        after.rotation_segment_base,
+        Some(replacement_before_mutation.len() as u64)
+    );
+    assert_eq!(after.active_len, std::fs::metadata(&active).unwrap().len());
+    assert_eq!(
+        after.offset,
+        after.rotation_segment_base.unwrap() + after.active_len
+    );
+}
+
 fn one_put_delta_encoded_len() -> u64 {
     let directory = tempfile::tempdir().unwrap();
     let store = DurableKeyValueStore::try_init_new(directory.path())

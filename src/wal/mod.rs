@@ -71,6 +71,19 @@ pub(crate) struct OnlineCaptureMetadata {
     pub(crate) durability_policy: crate::config::DurabilityPolicy,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OnlineWalStateProbe {
+    pub(crate) offset: u64,
+    pub(crate) active_len: u64,
+    pub(crate) granularity_nanos: u64,
+    pub(crate) last_bucket: u64,
+    pub(crate) frame_buffer_len: usize,
+    pub(crate) rotation_segment_id: Option<u64>,
+    pub(crate) rotation_segment_base: Option<u64>,
+    pub(crate) force_before_next_mutation: Option<bool>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RecordedFrame {
     action: u8,
@@ -432,6 +445,58 @@ impl<W: Write> WalStorage<W> {
                 "detached WAL writer was already consumed",
             )
         })?;
+        state.writer = Some(writer);
+        state.health = WalHealth::Ready;
+        Ok(())
+    }
+
+    pub(crate) fn install_online_replacement_writer(
+        &self,
+        closed: ClosedWalWriter,
+        writer: W,
+        active_path: PathBuf,
+        active_len: u64,
+        granularity_nanos: u64,
+        last_bucket: u64,
+    ) -> std::io::Result<()> {
+        if active_len < format::V2CodecProbe::HEADER_LEN as u64 || granularity_nanos == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "online replacement metadata is not a complete current V2 segment",
+            ));
+        }
+        let mut state = self
+            .wal_state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let token = closed.token;
+        if state.online_owner_token != Some(token)
+            || !matches!(state.health, WalHealth::WriterDetached { token: owner } if owner == token)
+            || state.writer.is_some()
+            || state.delta_recorder.is_some()
+            || !matches!(state.format, WalFormat::V2)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "online replacement writer does not match the detached WAL owner",
+            ));
+        }
+        let rotation = state.rotation.as_mut().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "file-backed online replacement has no rotation configuration",
+            )
+        })?;
+        rotation.state.active_path = active_path;
+        rotation.state.segment_id = 0;
+        rotation.state.segment_base = 0;
+        rotation.state.force_before_next_mutation = false;
+        rotation.state.failed_closed = false;
+        state.offset = active_len;
+        state.active_len = active_len;
+        state.granularity_nanos = granularity_nanos;
+        state.last_bucket = last_bucket;
+        state.frame_buffer = Vec::new();
         state.writer = Some(writer);
         state.health = WalHealth::Ready;
         Ok(())
@@ -943,6 +1008,33 @@ impl<W: Write> WalStorage<W> {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clock = clock;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn online_wal_state_probe(&self) -> OnlineWalStateProbe {
+        let state = self
+            .wal_state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        OnlineWalStateProbe {
+            offset: state.offset,
+            active_len: state.active_len,
+            granularity_nanos: state.granularity_nanos,
+            last_bucket: state.last_bucket,
+            frame_buffer_len: state.frame_buffer.len(),
+            rotation_segment_id: state
+                .rotation
+                .as_ref()
+                .map(|rotation| rotation.state.segment_id),
+            rotation_segment_base: state
+                .rotation
+                .as_ref()
+                .map(|rotation| rotation.state.segment_base),
+            force_before_next_mutation: state
+                .rotation
+                .as_ref()
+                .map(|rotation| rotation.state.force_before_next_mutation),
+        }
     }
 
     pub(crate) fn set_runtime_policy(&self, policy: crate::config::DurabilityPolicy) {

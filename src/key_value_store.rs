@@ -1,4 +1,6 @@
 use std::fs::File;
+#[cfg(test)]
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -125,6 +127,101 @@ impl DurableKeyValueStore<File> {
             accepted_buckets: applied.accepted_buckets,
             group_frame_counts: applied.group_frame_counts,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_online_cutover_probe<'a>(
+        &'a self,
+        mut staged: crate::compaction::ValidatedOnlineStaging<'a, File>,
+    ) -> Result<crate::compaction::CompletedOnlineCutover, crate::CompactionError> {
+        let completed = {
+            let _exclusive = self.maintenance.exclusive();
+            let delta = staged.prepared.attempt.detach_recorder().ok_or_else(|| {
+                crate::CompactionError::FailedClosed {
+                    detail: "online compaction lost its matching delta recorder".to_owned(),
+                }
+            })?;
+            let applied =
+                match crate::compaction::apply_online_delta_to_staging(&mut staged, &delta) {
+                    Ok(applied) => applied,
+                    Err(error @ crate::CompactionError::ConcurrentDeltaLimitExceeded { .. }) => {
+                        crate::compaction::abandon_online_prepublication(&staged)?;
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                };
+            let live_state = crate::compaction::CapturedLogicalState::Value(
+                self.store
+                    .iter()
+                    .map(|entry| (entry.key().clone(), entry.value().clone()))
+                    .collect(),
+            );
+            let metadata = self.wal.online_capture_metadata().map_err(|source| {
+                crate::CompactionError::Io {
+                    operation: crate::CompactionOperation::ValidateStaging,
+                    path: staged.prepared.paths.staging.clone(),
+                    source,
+                }
+            })?;
+            crate::compaction::finalize_online_prepared(&mut staged, live_state, metadata)?;
+
+            let token = staged.prepared.attempt.token();
+            let detached = self.wal.take_online_writer(token).map_err(|source| {
+                crate::CompactionError::Io {
+                    operation: crate::CompactionOperation::PublishPrevious,
+                    path: staged.prepared.paths.manifest.clone(),
+                    source,
+                }
+            })?;
+            let closed = detached.close();
+            crate::compaction::publication::publish_online_previous(
+                &staged.prepared.paths,
+                &mut staged.prepared.manifest,
+            )?;
+            let expected_len = staged
+                .replacement_inventory
+                .first()
+                .ok_or_else(|| crate::CompactionError::InvalidArtifact {
+                    path: staged.prepared.paths.staging.clone(),
+                })?
+                .length;
+            let (active_path, writer) =
+                crate::compaction::publication::publish_online_replacement_with_reopen(
+                    &staged.prepared.paths,
+                    &mut staged.prepared.manifest,
+                    |active_path| {
+                        let writer = OpenOptions::new().append(true).open(active_path)?;
+                        if writer.metadata()?.len() != expected_len {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "online replacement length changed before writer handoff",
+                            ));
+                        }
+                        Ok(writer)
+                    },
+                )?;
+            self.wal
+                .install_online_replacement_writer(
+                    closed,
+                    writer,
+                    active_path,
+                    expected_len,
+                    staged.staging.granularity_nanos,
+                    staged.staging.last_bucket,
+                )
+                .map_err(|source| crate::CompactionError::Io {
+                    operation: crate::CompactionOperation::ReopenReplacement,
+                    path: staged.prepared.paths.manifest.clone(),
+                    source,
+                })?;
+            crate::compaction::CompletedOnlineCutover {
+                replayed: applied.replayed,
+                paths: staged.prepared.paths.clone(),
+                manifest: staged.prepared.manifest.clone(),
+            }
+        };
+        drop(staged);
+        Ok(completed)
     }
 
     /// Returns exact storage usage for this open key/value generation.
@@ -358,6 +455,16 @@ impl<W: Write> DurableKeyValueStore<W> {
     #[cfg(test)]
     pub(crate) fn inject_live_value_probe(&self, key: Vec<u8>, value: Vec<u8>) {
         self.store.insert(key, value);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_clock_probe(&self, clock: fn() -> u64) {
+        self.wal.install_clock_probe(clock);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn online_wal_state_probe(&self) -> crate::wal::OnlineWalStateProbe {
+        self.wal.online_wal_state_probe()
     }
 
     #[cfg(test)]

@@ -410,6 +410,171 @@ pub(crate) fn online_publication_ready(
     })
 }
 
+pub(crate) fn publish_online_previous(
+    paths: &MaintenanceArtifactPaths,
+    manifest: &mut CompactionManifest,
+) -> Result<(), CompactionError> {
+    online_publication_ready(manifest)?;
+    let anchor = paths
+        .manifest
+        .parent()
+        .ok_or_else(|| CompactionError::InvalidArtifact {
+            path: paths.manifest.clone(),
+        })?;
+    if !crate::compaction::recovery::source_descriptors_match(anchor, manifest) {
+        return Err(CompactionError::AuthorityUndetermined {
+            paths: manifest
+                .source_inventory
+                .iter()
+                .map(|descriptor| anchor.join(&descriptor.relative_path))
+                .collect(),
+        });
+    }
+    match fs::symlink_metadata(&paths.previous) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(CompactionError::Io {
+                operation: CompactionOperation::PublishPrevious,
+                path: paths.previous.clone(),
+                source,
+            });
+        }
+        Ok(_) => {
+            return Err(CompactionError::Io {
+                operation: CompactionOperation::PublishPrevious,
+                path: paths.previous.clone(),
+                source: io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "online previous-generation location already exists",
+                ),
+            });
+        }
+    }
+    fs::create_dir(&paths.previous).map_err(|source| CompactionError::Io {
+        operation: CompactionOperation::PublishPrevious,
+        path: paths.previous.clone(),
+        source,
+    })?;
+    for descriptor in &manifest.source_inventory {
+        let file_name = descriptor.relative_path.file_name().ok_or_else(|| {
+            CompactionError::InvalidArtifact {
+                path: anchor.join(&descriptor.relative_path),
+            }
+        })?;
+        let source_path = anchor.join(&descriptor.relative_path);
+        let previous_path = paths.previous.join(file_name);
+        fs::rename(&source_path, &previous_path).map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::PublishPrevious,
+            path: previous_path,
+            source,
+        })?;
+    }
+    if manifest.durability == DurabilityPolicy::Physical {
+        crate::durability::synchronize_directory(&paths.previous).map_err(|source| {
+            CompactionError::Io {
+                operation: CompactionOperation::PublishPrevious,
+                path: paths.previous.clone(),
+                source,
+            }
+        })?;
+        crate::durability::synchronize_directory(anchor).map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::PublishPrevious,
+            path: anchor.to_path_buf(),
+            source,
+        })?;
+    }
+    let mut next = manifest.clone();
+    next.phase = ManifestPhase::PreviousPublished;
+    publish_manifest_for_policy(paths, &next, manifest.durability)?;
+    *manifest = next;
+    Ok(())
+}
+
+pub(crate) fn publish_online_replacement_with_reopen<T>(
+    paths: &MaintenanceArtifactPaths,
+    manifest: &mut CompactionManifest,
+    reopen: impl FnOnce(&Path) -> io::Result<T>,
+) -> Result<(PathBuf, T), CompactionError> {
+    if manifest.mode != ManifestMode::OnlineFamily
+        || manifest.phase != ManifestPhase::PreviousPublished
+        || !manifest.source_finalized
+    {
+        return Err(CompactionError::FailedClosed {
+            detail: "online replacement publication requires PreviousPublished authority"
+                .to_owned(),
+        });
+    }
+    let ManifestScope::Family { active_name, .. } = &manifest.scope else {
+        return Err(CompactionError::InvalidArtifact {
+            path: paths.manifest.clone(),
+        });
+    };
+    let anchor = paths
+        .manifest
+        .parent()
+        .ok_or_else(|| CompactionError::InvalidArtifact {
+            path: paths.manifest.clone(),
+        })?;
+    let replacement =
+        manifest
+            .replacement_inventory
+            .first()
+            .ok_or_else(|| CompactionError::InvalidArtifact {
+                path: paths.manifest.clone(),
+            })?;
+    verify_descriptor(anchor, replacement).map_err(|_| CompactionError::InvalidArtifact {
+        path: paths.staging.clone(),
+    })?;
+    let active_path = anchor.join(active_name);
+    match fs::symlink_metadata(&active_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(CompactionError::Io {
+                operation: CompactionOperation::PublishReplacement,
+                path: active_path,
+                source,
+            });
+        }
+        Ok(_) => {
+            return Err(CompactionError::Io {
+                operation: CompactionOperation::PublishReplacement,
+                path: active_path,
+                source: io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "online canonical replacement already exists",
+                ),
+            });
+        }
+    }
+    fs::rename(&paths.staging, &active_path).map_err(|source| CompactionError::Io {
+        operation: CompactionOperation::PublishReplacement,
+        path: active_path.clone(),
+        source,
+    })?;
+    synchronize_publication_parent(
+        &active_path,
+        manifest.durability,
+        CompactionOperation::PublishReplacement,
+    )?;
+    let mut canonical_descriptor = replacement.clone();
+    canonical_descriptor.relative_path = active_name.clone();
+    verify_descriptor(anchor, &canonical_descriptor).map_err(|_| {
+        CompactionError::InvalidArtifact {
+            path: active_path.clone(),
+        }
+    })?;
+    let reopened = reopen(&active_path).map_err(|source| CompactionError::Io {
+        operation: CompactionOperation::ReopenReplacement,
+        path: active_path.clone(),
+        source,
+    })?;
+    let mut next = manifest.clone();
+    next.phase = ManifestPhase::ReplacementPublished;
+    publish_manifest_for_policy(paths, &next, manifest.durability)?;
+    *manifest = next;
+    Ok((active_path, reopened))
+}
+
 fn native_leaf(path: &Path) -> Result<PathBuf, CompactionError> {
     path.file_name()
         .map(PathBuf::from)
