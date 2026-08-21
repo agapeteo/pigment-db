@@ -229,8 +229,8 @@
 - [X] T127 [US3] Make the private WAL writer detachable and add health-checked take/reinstall seams in `src/wal/mod.rs`, then run T126 GREEN and existing durability tests
 - [X] T128 [US3] Write and run a runtime RED proving successful cutover installs replacement offset/buffer/granularity/bucket/rotation state and an immediate mutation plus forced rotation targets only replacement in `src/compaction/online_tests.rs`
 - [X] T129 [US3] Implement writer and rotation-state handoff after shared manifest publication in `src/wal/mod.rs`, `src/compaction/mod.rs`, and `src/compaction/publication.rs`, then run T128 GREEN
-- [ ] T130 [US3] Write and run a runtime RED proving a paused first compaction permits reads/writes while a second same-instance private call fails immediately without artifacts or recorder replacement in `src/compaction/online_tests.rs`
-- [ ] T131 [US3] Move attempt compare/exchange before artifact work and bind all recorder/artifact ownership to the winning token in `src/maintenance_coordination.rs` and `src/compaction/mod.rs`, then run T130 GREEN
+- [X] T130 [US3] Write and run a runtime RED proving a paused first compaction permits reads/writes while a second same-instance private call fails immediately without artifacts or recorder replacement in `src/compaction/online_tests.rs`
+- [X] T131 [US3] Move attempt compare/exchange before artifact work and bind all recorder/artifact ownership to the winning token in `src/maintenance_coordination.rs` and `src/compaction/mod.rs`, then run T130 GREEN
 - [ ] T132 [US3] Write and run a runtime RED proving staging create/write/sync/reopen/mismatch failures leave the original writer authoritative and clear attempt/recorder state in `src/compaction/online_tests.rs`
 - [ ] T133 [US3] Implement pre-publication RAII cleanup for only invocation-owned staging in `src/maintenance_coordination.rs` and `src/compaction/mod.rs`, then run T132 GREEN
 - [ ] T134 [US3] Write and run a runtime RED proving indeterminate namespace authority preserves readable live state/evidence and rejects every later mutation before I/O until reopen in `src/compaction/online_tests.rs`

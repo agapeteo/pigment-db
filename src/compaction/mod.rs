@@ -396,6 +396,7 @@ pub(crate) fn begin_online_capture<'a, W: Write>(
         )?;
         let manifest = publish_online_prepared(
             &paths,
+            attempt.token(),
             capture.family,
             PathBuf::from(inspected_family.active_name()),
             metadata.durability_policy,

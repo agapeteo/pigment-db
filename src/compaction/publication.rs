@@ -357,13 +357,16 @@ fn next_operation_id() -> [u8; 16] {
 
 pub(crate) fn publish_online_prepared(
     paths: &MaintenanceArtifactPaths,
+    attempt_token: u64,
     family: crate::StoreFamily,
     active_name: PathBuf,
     durability: DurabilityPolicy,
     source_inventory: Vec<super::manifest::ArtifactDescriptor>,
 ) -> Result<CompactionManifest, CompactionError> {
+    let mut operation_id = next_operation_id();
+    operation_id[..8].copy_from_slice(&attempt_token.to_le_bytes());
     let manifest = CompactionManifest::online_prepared(
-        next_operation_id(),
+        operation_id,
         family,
         active_name,
         durability,

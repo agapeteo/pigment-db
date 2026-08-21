@@ -883,6 +883,77 @@ fn successful_cutover_installs_fresh_writer_and_rotates_only_replacement() {
     );
 }
 
+#[test]
+fn paused_first_attempt_keeps_progress_and_losing_second_call_artifact_free() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        DurableKeyValueStore::try_init_new(directory.path())
+            .unwrap()
+            .into_store(),
+    );
+    store.put(b"snapshot".to_vec(), b"captured".to_vec());
+    let (observer, controller) =
+        MaintenanceObserver::controlled([MaintenanceCheckpoint::StagingEncode]);
+    let (ownership_tx, ownership_rx) = mpsc::sync_channel(0);
+    let (drop_tx, drop_rx) = mpsc::sync_channel(0);
+    let worker_store = Arc::clone(&store);
+    let worker = std::thread::spawn(move || {
+        let capture = worker_store
+            .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
+            .unwrap();
+        ownership_tx
+            .send((
+                capture.attempt.token(),
+                capture.manifest.operation_id,
+                capture.paths.clone(),
+            ))
+            .unwrap();
+        let staged = super::prepare_online_staging(capture, |stage| {
+            if stage == super::OnlineStagingStage::Encoding {
+                observer.checkpoint(MaintenanceCheckpoint::StagingEncode);
+            }
+        })
+        .unwrap();
+        drop_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        drop(staged);
+    });
+
+    let (winning_token, operation_id, paths) =
+        ownership_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    controller.wait_until_reached(MaintenanceCheckpoint::StagingEncode);
+    assert_eq!(
+        u64::from_le_bytes(operation_id[..8].try_into().unwrap()),
+        winning_token
+    );
+    let manifest_before_loser = std::fs::read(&paths.manifest).unwrap();
+    assert!(store
+        .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
+        .is_err());
+    assert_eq!(
+        std::fs::read(&paths.manifest).unwrap(),
+        manifest_before_loser
+    );
+    assert!(!paths.manifest_next.exists());
+    assert!(!paths.staging.exists());
+    assert!(!paths.previous.exists());
+    assert!(store.has_delta_recorder_probe());
+    assert_eq!(store.delta_group_count_probe(), 0);
+
+    assert_eq!(store.get(b"snapshot"), Some(b"captured".to_vec()));
+    store.put(b"while-paused".to_vec(), b"accepted".to_vec());
+    assert_eq!(store.get(b"while-paused"), Some(b"accepted".to_vec()));
+    assert_eq!(store.delta_group_count_probe(), 1);
+    assert_eq!(
+        std::fs::read(&paths.manifest).unwrap(),
+        manifest_before_loser
+    );
+
+    controller.release(MaintenanceCheckpoint::StagingEncode);
+    drop_tx.send(()).unwrap();
+    worker.join().unwrap();
+    assert!(!store.has_delta_recorder_probe());
+}
+
 fn one_put_delta_encoded_len() -> u64 {
     let directory = tempfile::tempdir().unwrap();
     let store = DurableKeyValueStore::try_init_new(directory.path())
