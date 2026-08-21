@@ -297,7 +297,7 @@
 - [ ] T170 [US4] Keep buffered dispatch on standard-library namespace operations and Linux/macOS physical rename-plus-directory-sync behavior unchanged in `src/durability.rs`, then rerun T169 and existing durability suites GREEN
 - [ ] T171 [P] [US4] Run public physical construction/open, ordinary mutation, compute batch, rollback, rotation, recovery, and three-reopen matrices for every family in `tests/windows_physical_durability/contract.rs`
 - [ ] T172 [P] [US4] Run closed/online compaction and every manifest/cleanup cut under real and fault-modeled Windows physical policy in `tests/windows_physical_durability/publication.rs`
-- [ ] T173 [US4] Replace Windows physical-unsupported CI assertions with the full support matrix and unsafe-boundary scan in `.github/workflows/recovery.yml`, `tests/durable_write_policy/contract.rs`, and `src/wal/durability_tests.rs`
+- [X] T173 [US4] Replace Windows physical-unsupported CI assertions with the full support matrix and unsafe-boundary scan in `.github/workflows/recovery.yml`, `tests/durable_write_policy/contract.rs`, and `src/wal/durability_tests.rs`
 - [ ] T174 [US4] Run the Windows matrix plus Linux/macOS compatibility jobs and record SC-008/SC-010 platform evidence in `specs/008-current-compaction-durability/quickstart.md`
 
 **Checkpoint**: Windows physical durability is explicit, preflighted, write-through, and never silently downgraded.
@@ -331,7 +331,7 @@
 
 - [ ] T185 [P] Add public API rustdoc examples, cleanup/failed-closed guidance, lock/availability semantics, and Windows physical preflight documentation in `src/maintenance.rs`, `src/key_value_store.rs`, `src/key_set_store.rs`, `src/key_map_store.rs`, and `src/durability.rs`
 - [ ] T186 [P] Update end-to-end validation results, exact commands, platform prerequisites, and recovery/performance evidence links in `specs/008-current-compaction-durability/quickstart.md` and `specs/008-current-compaction-durability/benchmarks/README.md`
-- [ ] T187 [P] Add and run a static source scan proving unsafe code and `windows-sys` usage exist only in `src/durability/windows.rs` and target-specific `Cargo.toml` configuration via `tests/ci_workflow.rs` and `.github/workflows/recovery.yml`
+- [X] T187 [P] Add and run a static source scan proving unsafe code and `windows-sys` usage exist only in `src/durability/windows.rs` and target-specific `Cargo.toml` configuration via `tests/ci_workflow.rs` and `.github/workflows/recovery.yml`
 - [ ] T188 Run `cargo test --all-targets --all-features -- --test-threads=1` and record zero failures in `specs/008-current-compaction-durability/quickstart.md`
 - [ ] T189 Run `cargo test --release --all-targets --all-features -- --test-threads=1` and record zero failures in `specs/008-current-compaction-durability/quickstart.md`
 - [ ] T190 Run `cargo fmt --all -- --check` and record the GREEN result in `specs/008-current-compaction-durability/quickstart.md`

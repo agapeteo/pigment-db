@@ -44,11 +44,10 @@ jobs:
           cargo test --test ordered_map_append -- --test-threads=1
           cargo test --test v2_wal_segments -- --test-threads=1
       - name: Physical durability capability and publication matrix
-        if: runner.os != 'Windows'
         run: cargo test --test durable_write_policy public_ -- --test-threads=1
-      - name: Windows buffered and explicit physical rejection matrix
+      - name: Windows physical durability and buffered compatibility matrix
         if: runner.os == 'Windows'
-        run: cargo test --test durable_write_policy windows_ -- --test-threads=1
+        run: cargo test --test windows_physical_durability -- --test-threads=1
       - name: Set compute publication faults
         run: cargo test key_set_store::tests:: -- --test-threads=1
       - name: Map compute publication faults

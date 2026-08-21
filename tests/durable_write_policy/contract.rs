@@ -106,19 +106,12 @@ fn public_policy_and_failure_contracts_are_structured() {
 
 #[cfg(target_os = "windows")]
 #[test]
-fn windows_physical_file_construction_is_explicitly_unsupported() {
-    let directory = super::support::scratch_directory("pigment-windows-physical-");
+fn windows_physical_file_construction_is_supported_for_every_family() {
     let options = DurableStoreOptions::default().with_durability_policy(DurabilityPolicy::Physical);
-    let error = match DurableKeyValueStore::try_init_new_with_options(directory.path(), options) {
-        Err(error) => error,
-        Ok(_) => panic!("Windows must not silently downgrade physical durability"),
-    };
-    assert!(matches!(
-        error,
-        pigment_db::RecoveryError::UnsupportedDurability {
-            source: DurabilitySupportError::UnsupportedPlatform {
-                platform: "windows"
-            }
-        }
-    ));
+    let values = super::support::scratch_directory("pigment-windows-physical-value-");
+    drop(DurableKeyValueStore::try_init_new_with_options(values.path(), options).unwrap());
+    let sets = super::support::scratch_directory("pigment-windows-physical-set-");
+    drop(DurableKeySetStore::try_init_new_with_options(sets.path(), options).unwrap());
+    let maps = super::support::scratch_directory("pigment-windows-physical-map-");
+    drop(DurableKeyMapStore::try_init_new_with_options(maps.path(), options).unwrap());
 }

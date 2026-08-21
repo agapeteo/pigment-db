@@ -107,3 +107,39 @@ fn maintenance_public_api_is_narrow_while_implementation_modules_remain_private(
     let wal = fs::read_to_string(root.join("src/wal/mod.rs")).expect("read WAL module root");
     assert!(wal.contains("#[cfg(test)]\nmod maintenance_tests;"));
 }
+
+#[test]
+fn windows_unsafe_and_dependency_are_confined_to_the_durability_boundary() {
+    fn rust_files(directory: &Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_files(&path, files);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                files.push(path);
+            }
+        }
+    }
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let boundary = root.join("src/durability/windows.rs");
+    let mut files = Vec::new();
+    rust_files(&root.join("src"), &mut files);
+    let unsafe_files = files
+        .into_iter()
+        .filter(|path| {
+            fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .any(|line| line.contains("unsafe {") || line.contains("unsafe fn"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(unsafe_files, [boundary]);
+
+    let crate_root = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+    assert!(crate_root.contains("#![deny(unsafe_code)]"));
+    let cargo = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    assert!(cargo.contains("[target.'cfg(windows)'.dependencies]"));
+    assert_eq!(cargo.matches("windows-sys").count(), 1);
+    assert!(cargo.contains("features = [\"Win32_Storage_FileSystem\"]"));
+}
