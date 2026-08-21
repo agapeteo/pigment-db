@@ -61,7 +61,17 @@ jobs:
         run: cargo test --test durable_write_policy public_ -- --test-threads=1
       - name: Windows physical durability and buffered compatibility matrix
         if: runner.os == 'Windows'
-        run: cargo test --test windows_physical_durability -- --test-threads=1
+        shell: pwsh
+        run: |
+          $output = & cargo test --test windows_physical_durability -- --test-threads=1 --nocapture 2>&1
+          $exit_code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          if ($exit_code -ne 0) {
+            $details = ($output | Select-Object -Last 100) -join "`n"
+            $details = $details.Replace("%", "%25").Replace("`r", "%0D").Replace("`n", "%0A")
+            Write-Output "::error title=Windows physical durability tests::$details"
+            exit $exit_code
+          }
       - name: Set compute publication faults
         run: |
           cargo test key_set_store::tests:: -- --test-threads=1
