@@ -571,33 +571,84 @@ pub(crate) struct PublishedFresh {
     handle: std::fs::File,
 }
 
+#[allow(dead_code)]
 pub(crate) fn publish_fresh_header(
     staging: std::fs::File,
     paths: &ArtifactPaths,
     inject_failure: bool,
     registry: &mut FreshCleanupRegistry,
 ) -> Result<PublishedFresh, FreshPublicationFailure> {
-    let publish_result = if inject_failure {
-        Err(io::Error::other("injected fresh-header publish failure"))
-    } else if paths.active.exists() {
+    publish_fresh_header_with_policy(
+        staging,
+        paths,
+        inject_failure,
+        registry,
+        DurabilityPolicy::Buffered,
+    )
+}
+
+fn publish_fresh_buffered(
+    staging: std::fs::File,
+    paths: &ArtifactPaths,
+) -> io::Result<std::fs::File> {
+    if paths.active.exists() {
         Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             "active path appeared before publication",
         ))
     } else {
-        fs::rename(&paths.staging, &paths.active)
+        fs::rename(&paths.staging, &paths.active)?;
+        Ok(staging)
+    }
+}
+
+fn publish_fresh_header_with_policy(
+    staging: std::fs::File,
+    paths: &ArtifactPaths,
+    inject_failure: bool,
+    registry: &mut FreshCleanupRegistry,
+    durability_policy: DurabilityPolicy,
+) -> Result<PublishedFresh, FreshPublicationFailure> {
+    let publish_result = if inject_failure {
+        drop(staging);
+        Err(io::Error::other("injected fresh-header publish failure"))
+    } else {
+        #[cfg(target_os = "windows")]
+        {
+            if durability_policy == DurabilityPolicy::Physical {
+                drop(staging);
+                crate::durability::move_windows_namespace_write_through(
+                    &paths.staging,
+                    &paths.active,
+                    crate::durability::WindowsNamespaceMoveMode::NoReplace,
+                )
+                .and_then(|()| {
+                    OpenOptions::new()
+                        .read(true)
+                        .append(true)
+                        .open(&paths.active)
+                })
+            } else {
+                publish_fresh_buffered(staging, paths)
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let _ = durability_policy;
+            publish_fresh_buffered(staging, paths)
+        }
     };
 
-    if publish_result.is_err() {
-        drop(staging);
-        Err(fail_fresh_before_publish_at(
+    match publish_result {
+        Err(_) => Err(fail_fresh_before_publish_at(
             RecoveryOperation::Publish,
             paths.active.clone(),
             registry,
-        ))
-    } else {
-        registry.commit_staging(&paths.staging);
-        Ok(PublishedFresh { handle: staging })
+        )),
+        Ok(handle) => {
+            registry.commit_staging(&paths.staging);
+            Ok(PublishedFresh { handle })
+        }
     }
 }
 
@@ -642,15 +693,19 @@ pub(crate) fn initialize_fresh_v1(
     };
     let staging =
         prepare_fresh_append(staging, false, &mut registry).map_err(fresh_publication_error)?;
-    let published = publish_fresh_header(staging, paths, false, &mut registry)
-        .map_err(fresh_publication_error)?;
+    let published =
+        publish_fresh_header_with_policy(staging, paths, false, &mut registry, durability_policy)
+            .map_err(fresh_publication_error)?;
     if durability_policy == DurabilityPolicy::Physical {
-        let parent = paths
-            .active
-            .parent()
-            .expect("WAL artifact must have a parent directory");
-        synchronize_directory(parent)
-            .map_err(|source| io_failure(RecoveryOperation::Publish, parent, source))?;
+        #[cfg(not(target_os = "windows"))]
+        {
+            let parent = paths
+                .active
+                .parent()
+                .expect("WAL artifact must have a parent directory");
+            synchronize_directory(parent)
+                .map_err(|source| io_failure(RecoveryOperation::Publish, parent, source))?;
+        }
     }
     let handle = match handoff_fresh_handle(published) {
         Ok(handle) => handle,
@@ -705,15 +760,19 @@ pub(crate) fn initialize_fresh_v2(
         &mut registry,
     )
     .map_err(fresh_publication_error)?;
-    let published = publish_fresh_header(staging, paths, false, &mut registry)
-        .map_err(fresh_publication_error)?;
+    let published =
+        publish_fresh_header_with_policy(staging, paths, false, &mut registry, durability_policy)
+            .map_err(fresh_publication_error)?;
     if durability_policy == DurabilityPolicy::Physical {
-        let parent = paths
-            .active
-            .parent()
-            .expect("WAL artifact must have a parent directory");
-        synchronize_directory(parent)
-            .map_err(|source| io_failure(RecoveryOperation::Publish, parent, source))?;
+        #[cfg(not(target_os = "windows"))]
+        {
+            let parent = paths
+                .active
+                .parent()
+                .expect("WAL artifact must have a parent directory");
+            synchronize_directory(parent)
+                .map_err(|source| io_failure(RecoveryOperation::Publish, parent, source))?;
+        }
     }
     let handle = match handoff_fresh_handle(published) {
         Ok(handle) => handle,

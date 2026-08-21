@@ -156,6 +156,27 @@ pub(crate) fn preflight_windows_namespace(directory: &Path) -> Result<(), Durabi
         .map_err(|source| unavailable(DurabilityCapability::DirectoryEntry, directory, source))
 }
 
+#[cfg(target_os = "windows")]
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WindowsNamespaceMoveMode {
+    NoReplace,
+    ReplaceExisting,
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn move_windows_namespace_write_through(
+    source: &Path,
+    destination: &Path,
+    mode: WindowsNamespaceMoveMode,
+) -> io::Result<()> {
+    let mode = match mode {
+        WindowsNamespaceMoveMode::NoReplace => windows::NamespaceMoveMode::NoReplace,
+        WindowsNamespaceMoveMode::ReplaceExisting => windows::NamespaceMoveMode::ReplaceExisting,
+    };
+    windows::move_file_write_through(source, destination, mode)
+}
+
 #[cfg(test)]
 static PREFLIGHT_FAULTS: Mutex<Vec<(DurabilityCapability, PathBuf, io::ErrorKind)>> =
     Mutex::new(Vec::new());
