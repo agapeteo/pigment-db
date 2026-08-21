@@ -94,11 +94,13 @@ impl DurableKeyValueStore<File> {
             })?;
             crate::compaction::apply_online_delta_to_staging(&mut staged, &delta)
         };
-        let (replayed, encoded_bytes) = applied?;
+        let applied = applied?;
         Ok(crate::compaction::AppliedOnlineDelta {
             staged,
-            replayed,
-            encoded_bytes,
+            replayed: applied.replayed,
+            encoded_bytes: applied.encoded_bytes,
+            accepted_buckets: applied.accepted_buckets,
+            group_frame_counts: applied.group_frame_counts,
         })
     }
 

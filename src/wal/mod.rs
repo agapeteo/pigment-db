@@ -173,6 +173,16 @@ impl DeltaRecorder {
     pub(crate) const fn wal_healthy(&self) -> bool {
         self.wal_healthy
     }
+
+    pub(crate) fn group_metadata(&self) -> (Vec<u64>, Vec<usize>) {
+        (
+            self.groups
+                .iter()
+                .map(|group| group.timestamp_bucket)
+                .collect(),
+            self.groups.iter().map(|group| group.frames.len()).collect(),
+        )
+    }
 }
 
 impl<W: Write> WalState<W> {
@@ -813,6 +823,14 @@ impl<W: Write> WalStorage<W> {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .delta_recorder
             .is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_clock_probe(&self, clock: fn() -> u64) {
+        self.wal_state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clock = clock;
     }
 
     pub(crate) fn set_runtime_policy(&self, policy: crate::config::DurabilityPolicy) {

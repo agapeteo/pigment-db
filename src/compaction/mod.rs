@@ -53,6 +53,15 @@ pub(crate) struct AppliedOnlineDelta<'a, W: Write> {
     pub(crate) staged: ValidatedOnlineStaging<'a, W>,
     pub(crate) replayed: usize,
     pub(crate) encoded_bytes: u64,
+    pub(crate) accepted_buckets: Vec<u64>,
+    pub(crate) group_frame_counts: Vec<usize>,
+}
+
+pub(crate) struct OnlineDeltaSummary {
+    pub(crate) replayed: usize,
+    pub(crate) encoded_bytes: u64,
+    pub(crate) accepted_buckets: Vec<u64>,
+    pub(crate) group_frame_counts: Vec<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,7 +163,7 @@ pub(crate) fn prepare_online_staging<'a, W: Write>(
 pub(crate) fn apply_online_delta_to_staging<W: Write>(
     staged: &mut ValidatedOnlineStaging<'_, W>,
     delta: &crate::wal::DeltaRecorder,
-) -> Result<(usize, u64), CompactionError> {
+) -> Result<OnlineDeltaSummary, CompactionError> {
     if delta.overflowed() {
         return Err(CompactionError::ConcurrentDeltaLimitExceeded {
             limit: delta.limit(),
@@ -254,7 +263,13 @@ pub(crate) fn apply_online_delta_to_staging<W: Write>(
         &staged.prepared.paths.staging,
         staged.prepared.capture.family,
     )?;
-    Ok((delta.group_count(), encoded_len))
+    let (accepted_buckets, group_frame_counts) = delta.group_metadata();
+    Ok(OnlineDeltaSummary {
+        replayed: delta.group_count(),
+        encoded_bytes: encoded_len,
+        accepted_buckets,
+        group_frame_counts,
+    })
 }
 
 pub(crate) fn begin_online_capture<'a, W: Write>(

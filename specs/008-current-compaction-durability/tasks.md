@@ -216,8 +216,8 @@
 - [X] T117 [US3] Encode, synchronize, reopen, and validate current-V2 staging strictly outside exclusive maintenance in `src/compaction/mod.rs` and `src/wal/replay.rs`, then run T116 GREEN
 - [X] T118 [US3] Write and run a runtime RED for same-key, distinct-key, put/remove, and delete/recreate accepted deltas replaying exactly once in WAL order in `src/compaction/online_tests.rs`
 - [X] T119 [US3] Implement ordered single-action delta application with regenerated current-V2 framing in `src/compaction/mod.rs` and `src/wal/replay.rs`, then run T118 GREEN
-- [ ] T120 [US3] Write and run a runtime RED for compute/ordinary overlap, atomic multi-change batches, accepted timestamps, and final last-bucket continuity in `src/compaction/online_tests.rs`
-- [ ] T121 [US3] Implement atomic grouped delta replay and timestamp continuity in `src/compaction/mod.rs` and `src/wal/replay.rs`, then run T120 GREEN
+- [X] T120 [US3] Write and run a runtime RED for compute/ordinary overlap, atomic multi-change batches, accepted timestamps, and final last-bucket continuity in `src/compaction/online_tests.rs`
+- [X] T121 [US3] Implement atomic grouped delta replay and timestamp continuity in `src/compaction/mod.rs` and `src/wal/replay.rs`, then run T120 GREEN
 - [ ] T122 [US3] Write and run a runtime RED proving cutover reopens staging and compares exact current live state/family/granularity/bucket before any namespace publication in `src/compaction/online_tests.rs`
 - [ ] T123 [US3] Implement exclusive final-state capture and exact pre-publication validation in `src/compaction/mod.rs`, then run T122 GREEN
 - [ ] T124 [US3] Write and run one table-driven runtime RED for the single bounded-delta contract at zero, exact, and one-group-over limits, proving overflow aborts at cutover while the original WAL and later mutations remain writable/recoverable in `src/compaction/online_tests.rs`

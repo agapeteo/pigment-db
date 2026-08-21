@@ -44,6 +44,70 @@ pub struct DurableKeySetStore<W: Write> {
 }
 
 impl DurableKeySetStore<File> {
+    #[cfg(test)]
+    pub(crate) fn begin_online_capture_probe(
+        &self,
+        max_delta_bytes: u64,
+        observer: crate::test_support::maintenance_schedule::MaintenanceObserver,
+    ) -> Result<crate::compaction::PreparedOnlineCapture<'_, File>, crate::CompactionError> {
+        let store_dir = self
+            .file_backing
+            .as_deref()
+            .expect("online compaction requires file backing");
+        crate::compaction::begin_online_capture(
+            &self.maintenance,
+            &self.wal,
+            store_dir,
+            crate::compaction::inspection::InspectedFamily::KeySet,
+            max_delta_bytes,
+            || {
+                crate::compaction::CapturedLogicalState::Set(
+                    self.store
+                        .iter()
+                        .map(|entry| (entry.key().clone(), entry.value().clone()))
+                        .collect(),
+                )
+            },
+            |stage| {
+                let checkpoint = match stage {
+                    crate::compaction::OnlineCaptureStage::SnapshotCaptured => {
+                        crate::test_support::maintenance_schedule::MaintenanceCheckpoint::SnapshotCapture
+                    }
+                    crate::compaction::OnlineCaptureStage::RecorderActivated => {
+                        crate::test_support::maintenance_schedule::MaintenanceCheckpoint::RecorderActivation
+                    }
+                    crate::compaction::OnlineCaptureStage::ManifestPrepared => {
+                        crate::test_support::maintenance_schedule::MaintenanceCheckpoint::ManifestPrepared
+                    }
+                };
+                observer.checkpoint(checkpoint);
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_online_delta_probe<'a>(
+        &'a self,
+        mut staged: crate::compaction::ValidatedOnlineStaging<'a, File>,
+    ) -> Result<crate::compaction::AppliedOnlineDelta<'a, File>, crate::CompactionError> {
+        let applied = {
+            let _exclusive = self.maintenance.exclusive();
+            let delta = staged.prepared.attempt.detach_recorder().ok_or_else(|| {
+                crate::CompactionError::FailedClosed {
+                    detail: "online compaction lost its matching delta recorder".to_owned(),
+                }
+            })?;
+            crate::compaction::apply_online_delta_to_staging(&mut staged, &delta)
+        }?;
+        Ok(crate::compaction::AppliedOnlineDelta {
+            staged,
+            replayed: applied.replayed,
+            encoded_bytes: applied.encoded_bytes,
+            accepted_buckets: applied.accepted_buckets,
+            group_frame_counts: applied.group_frame_counts,
+        })
+    }
+
     /// Returns exact storage usage for this open key/set generation.
     ///
     /// Vector-backed stores intentionally do not expose filesystem maintenance:
@@ -265,6 +329,17 @@ impl<W: Write> DurableKeySetStore<W> {
     #[cfg(test)]
     pub(crate) fn has_delta_recorder_probe(&self) -> bool {
         self.wal.has_delta_recorder_probe()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_clock_probe(&self, clock: fn() -> u64) {
+        self.wal.install_clock_probe(clock);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn timestamp_state_probe(&self) -> (u64, u64) {
+        let metadata = self.wal.online_capture_metadata().unwrap();
+        (metadata.granularity_nanos, metadata.last_bucket)
     }
 
     #[cfg(test)]

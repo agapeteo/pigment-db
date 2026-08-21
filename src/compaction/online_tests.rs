@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::pin::pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -600,6 +601,70 @@ fn single_action_delta_replays_once_in_wal_acceptance_order() {
     assert!(!snapshot.contains_key(b"remove".as_slice()));
     assert_eq!(snapshot.get(b"recreate".as_slice()), Some(&b"new".to_vec()));
     assert_eq!(snapshot.len(), store.size());
+    drop(applied);
+}
+
+static ONLINE_TEST_CLOCK: AtomicU64 = AtomicU64::new(0);
+
+fn online_test_clock() -> u64 {
+    ONLINE_TEST_CLOCK.load(Ordering::SeqCst)
+}
+
+#[test]
+fn compute_delta_groups_remain_atomic_and_preserve_accepted_timestamps() {
+    let directory = tempfile::tempdir().unwrap();
+    let options = crate::DurableStoreOptions::default().with_timestamp_granularity(
+        crate::TimestampGranularity::try_from(Duration::from_nanos(1)).unwrap(),
+    );
+    let store = DurableKeySetStore::try_init_new_with_options(directory.path(), options)
+        .unwrap()
+        .into_store();
+    store.install_clock_probe(online_test_clock);
+    ONLINE_TEST_CLOCK.store(100, Ordering::SeqCst);
+    store.append(b"group".to_vec(), b"keep".to_vec());
+    store.append(b"group".to_vec(), b"remove".to_vec());
+    let capture = store
+        .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
+        .unwrap();
+    let staged = super::prepare_online_staging(capture, |_| {}).unwrap();
+
+    ONLINE_TEST_CLOCK.store(200, Ordering::SeqCst);
+    store.append(b"group".to_vec(), b"ordinary-before".to_vec());
+    ONLINE_TEST_CLOCK.store(300, Ordering::SeqCst);
+    store
+        .try_compute(b"group".to_vec(), |working| {
+            working.remove(b"remove".as_slice());
+            working.insert(b"compute-a".to_vec());
+            working.insert(b"compute-b".to_vec());
+        })
+        .unwrap();
+    ONLINE_TEST_CLOCK.store(400, Ordering::SeqCst);
+    store.append(b"group".to_vec(), b"ordinary-after".to_vec());
+    assert_eq!(store.delta_group_count_probe(), 3);
+
+    let applied = store.apply_online_delta_probe(staged).unwrap();
+    assert_eq!(applied.replayed, 3);
+    assert_eq!(applied.group_frame_counts, vec![1, 3, 1]);
+    assert_eq!(applied.accepted_buckets, vec![200, 300, 400]);
+    assert_eq!(applied.staged.staging.granularity_nanos, 1);
+    assert_eq!(applied.staged.staging.last_bucket, 400);
+    assert_eq!(store.timestamp_state_probe(), (1, 400));
+    let crate::compaction::CapturedLogicalState::Set(snapshot) = &applied.staged.staging.state
+    else {
+        panic!("key/set delta application returned the wrong family state");
+    };
+    let final_set = snapshot.get(b"group".as_slice()).unwrap();
+    for expected in [
+        b"keep".as_slice(),
+        b"ordinary-before".as_slice(),
+        b"compute-a".as_slice(),
+        b"compute-b".as_slice(),
+        b"ordinary-after".as_slice(),
+    ] {
+        assert!(final_set.contains(expected));
+    }
+    assert!(!final_set.contains(b"remove".as_slice()));
+    assert_eq!(final_set.len(), 5);
     drop(applied);
 }
 
