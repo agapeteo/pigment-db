@@ -171,6 +171,47 @@ The checkpoint completed with zero failures:
 - `cargo fmt --all -- --check`;
 - `cargo clippy --all-targets --all-features -- -D warnings`.
 
+### User Story 3 online-compaction GREEN checkpoint (2026-08-20)
+
+SC-004 is GREEN. The deterministic private schedule covered same-key and
+independent-key changes, put/remove and delete/recreate overlap, atomic compute
+batches, acceptance timestamps, rejected and no-op work, failed persistence,
+async conflict/cancellation, and panic unwinding. The public all-family matrix
+observed nonzero concurrent replay, compared exact live state after cutover,
+and reproduced that state through three consecutive reopenings.
+
+SC-005 is GREEN. Encoding and staging validation completed while mutations
+acquired shared maintenance and while direct reads bypassed maintenance. The
+private checkpoint trace proved that disk-heavy staging held exclusive
+maintenance for zero operations. Public key/value, key/set, and key/map tests
+each observed both read and mutation progress before compaction returned.
+
+SC-006 is GREEN. Zero, exact, and one-group-over delta boundaries either
+completed or returned `ConcurrentDeltaLimitExceeded` while preserving the
+original writable authority. Successful cutover, ordinary abort, every staged
+failure, replacement-reopen failure, cancellation, and every injected panic
+left no matching recorder or stuck attempt. Public zero-byte overflow tests
+then accepted a later mutation and reopened exact state for every family.
+
+The checkpoint completed with zero failures:
+
+- `cargo test --lib compaction::online_tests -- --test-threads=1` (16 passed);
+- `cargo test --lib wal::maintenance_tests -- --test-threads=1` (10 passed);
+- `cargo test --test online_compaction -- --test-threads=1` (5 passed);
+- `cargo test --test mutation_ordering -- --test-threads=1` (30 passed, 4
+  release-only tests ignored);
+- `cargo test --test compute_persistence --test async_compute_conflicts --
+  --test-threads=1` (23 passed, 1 release-only benchmark ignored);
+- `cargo test --test durable_write_policy --test recovery --test
+  v2_wal_segments -- --test-threads=1` (46 passed, 5 release-only benchmarks
+  ignored);
+- `cargo test --all-targets --all-features -- --test-threads=1` (all debug
+  library, binary, integration, recovery subprocess, durability, rotation,
+  compute, async, and documentation targets passed; release-only benchmarks
+  remained intentionally ignored);
+- `cargo fmt --all -- --check`;
+- `cargo clippy --all-targets --all-features -- -D warnings`.
+
 ## 7. Expected caller usage
 
 Callers inspect and choose when to compact; Pigment DB schedules nothing. Closed callers drop every same-process store before `compact_directory_in_place`. Online callers invoke `try_compact_online` on exactly one file-backed store and may choose a delta bound; policy is inherited. `CleanupStatus::Pending` means replacement publication succeeded and ordinary use may continue, with cleanup retried at reopen or a later explicit compaction. `MigrationRequired` means the caller must run `pigment-db-migrate` separately.
