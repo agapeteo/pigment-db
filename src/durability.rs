@@ -407,3 +407,28 @@ impl DurabilityHarnessProbe {
         Self
     }
 }
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn buffered_namespace_dispatch_uses_no_native_write_through_calls() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("buffered-source");
+        let destination = directory.path().join("buffered-destination");
+        std::fs::write(&source, b"established bytes").unwrap();
+        windows::reset_native_move_calls();
+
+        move_namespace(
+            &source,
+            &destination,
+            DurabilityPolicy::Buffered,
+            NamespaceMoveMode::NoReplace,
+        )
+        .unwrap();
+
+        assert_eq!(windows::native_move_calls(), 0);
+        assert_eq!(std::fs::read(destination).unwrap(), b"established bytes");
+    }
+}

@@ -17,6 +17,21 @@ use windows_sys::Win32::Storage::FileSystem::{
     MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MOVE_FILE_FLAGS,
 };
 
+#[cfg(test)]
+thread_local! {
+    static NATIVE_MOVE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_native_move_calls() {
+    NATIVE_MOVE_CALLS.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn native_move_calls() -> usize {
+    NATIVE_MOVE_CALLS.get()
+}
+
 #[derive(Debug)]
 struct WidePath {
     units: Vec<u16>,
@@ -224,6 +239,8 @@ pub(super) fn move_file_write_through(
     destination: &Path,
     mode: NamespaceMoveMode,
 ) -> io::Result<()> {
+    #[cfg(test)]
+    NATIVE_MOVE_CALLS.set(NATIVE_MOVE_CALLS.get() + 1);
     let source = WidePath::try_from(source)?;
     let destination = WidePath::try_from(destination)?;
     // SAFETY: both pointers reference owned, NUL-terminated UTF-16 buffers
