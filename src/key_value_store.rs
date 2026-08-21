@@ -92,7 +92,22 @@ impl DurableKeyValueStore<File> {
                     detail: "online compaction lost its matching delta recorder".to_owned(),
                 }
             })?;
-            crate::compaction::apply_online_delta_to_staging(&mut staged, &delta)
+            let applied = crate::compaction::apply_online_delta_to_staging(&mut staged, &delta)?;
+            let live_state = crate::compaction::CapturedLogicalState::Value(
+                self.store
+                    .iter()
+                    .map(|entry| (entry.key().clone(), entry.value().clone()))
+                    .collect(),
+            );
+            let metadata = self.wal.online_capture_metadata().map_err(|source| {
+                crate::CompactionError::Io {
+                    operation: crate::CompactionOperation::ValidateStaging,
+                    path: staged.prepared.paths.staging.clone(),
+                    source,
+                }
+            })?;
+            crate::compaction::validate_online_staging_against_live(&staged, live_state, metadata)?;
+            Ok::<_, crate::CompactionError>(applied)
         };
         let applied = applied?;
         Ok(crate::compaction::AppliedOnlineDelta {
@@ -325,6 +340,11 @@ impl<W: Write> DurableKeyValueStore<W> {
     #[cfg(test)]
     pub(crate) fn has_delta_recorder_probe(&self) -> bool {
         self.wal.has_delta_recorder_probe()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_live_value_probe(&self, key: Vec<u8>, value: Vec<u8>) {
+        self.store.insert(key, value);
     }
 
     #[cfg(test)]

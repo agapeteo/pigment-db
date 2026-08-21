@@ -668,6 +668,39 @@ fn compute_delta_groups_remain_atomic_and_preserve_accepted_timestamps() {
     drop(applied);
 }
 
+#[test]
+fn cutover_rejects_exact_live_mismatch_before_namespace_publication() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = DurableKeyValueStore::try_init_new(directory.path())
+        .unwrap()
+        .into_store();
+    store.put(b"snapshot".to_vec(), b"old".to_vec());
+    let capture = store
+        .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
+        .unwrap();
+    let staged = super::prepare_online_staging(capture, |_| {}).unwrap();
+    let paths = staged.prepared.paths.clone();
+    let initial_manifest = staged.prepared.manifest.clone();
+
+    store.put(b"recorded".to_vec(), b"accepted".to_vec());
+    store.inject_live_value_probe(b"unrecorded".to_vec(), b"must-reject".to_vec());
+    let active = directory.path().join("kv.wal.dat");
+    let active_before_cutover = std::fs::read(&active).unwrap();
+    assert!(store.apply_online_delta_probe(staged).is_err());
+
+    assert_eq!(std::fs::read(&active).unwrap(), active_before_cutover);
+    assert!(!paths.previous.exists());
+    assert!(paths.staging.is_file());
+    assert_eq!(
+        crate::compaction::publication::read_published_manifest(&paths)
+            .unwrap()
+            .unwrap(),
+        initial_manifest
+    );
+    assert!(!initial_manifest.source_finalized);
+    assert!(!store.has_delta_recorder_probe());
+}
+
 fn assert_staging_pause_allows_progress(
     store: &Arc<DurableKeyValueStore<std::fs::File>>,
     key: &[u8],

@@ -272,6 +272,30 @@ pub(crate) fn apply_online_delta_to_staging<W: Write>(
     })
 }
 
+pub(crate) fn validate_online_staging_against_live<W: Write>(
+    staged: &ValidatedOnlineStaging<'_, W>,
+    live_state: CapturedLogicalState,
+    metadata: crate::wal::OnlineCaptureMetadata,
+) -> Result<(), CompactionError> {
+    if metadata.durability_policy != staged.prepared.manifest.durability {
+        return Err(CompactionError::FailedClosed {
+            detail: "online cutover durability policy changed during the attempt".to_owned(),
+        });
+    }
+    let current = CapturedFamily {
+        family: staged.prepared.capture.family,
+        state: live_state,
+        granularity_nanos: metadata.granularity_nanos,
+        last_bucket: metadata.last_bucket,
+        before_bytes: metadata.active_len,
+        sealed_segment_count: 0,
+    };
+    compare_captured_families(
+        std::slice::from_ref(&current),
+        std::slice::from_ref(&staged.staging),
+    )
+}
+
 pub(crate) fn begin_online_capture<'a, W: Write>(
     coordinator: &'a crate::maintenance_coordination::MaintenanceCoordinator,
     wal: &'a crate::wal::WalStorage<W>,
