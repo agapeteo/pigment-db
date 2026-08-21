@@ -150,7 +150,7 @@ fn default_clock_is_floored_to_one_minute_for_each_accepted_mutation() {
     wal.store_put_event(b"second".to_vec(), b"two".to_vec());
 
     let state = wal.wal_state.read().unwrap();
-    let first = &state.writer[V1CodecProbe::HEADER_LEN..];
+    let first = &state.writer.as_ref().unwrap()[V1CodecProbe::HEADER_LEN..];
     let first_length = V1CodecProbe::EMPTY_RECORD_LEN
         + u32::from_le_bytes(first[6..10].try_into().unwrap()) as usize;
     let second = &first[first_length..];
@@ -1339,9 +1339,11 @@ fn vector_backed_storage_exposes_only_a_complete_v1_header() {
     let wal = WalStorage::new_vec_based_v1(&header);
     let state = wal.wal_state.read().unwrap();
 
-    assert_eq!(state.writer, header);
+    assert_eq!(state.writer.as_ref().unwrap().as_slice(), header);
     assert_eq!(state.offset, V1CodecProbe::HEADER_LEN as u64);
-    assert!(V1CodecProbe::header_crc_is_valid(&state.writer));
+    assert!(V1CodecProbe::header_crc_is_valid(
+        state.writer.as_ref().unwrap()
+    ));
 }
 
 #[test]

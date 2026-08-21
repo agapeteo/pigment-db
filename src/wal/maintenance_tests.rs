@@ -2,6 +2,8 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
@@ -27,6 +29,77 @@ use crate::test_support::fault_writer::{
     rollback_scripted, sync_all_scripted, sync_data_scripted, BarrierKind, ScriptedWriter,
     ScriptedWriterHandle, WriterFault,
 };
+
+#[test]
+fn online_writer_detach_is_token_owned_reinstallable_and_closed_before_publication() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let writer = DropObservedWriter {
+        bytes: Vec::new(),
+        dropped: Arc::clone(&dropped),
+    };
+    let wal = WalStorage::new_with_rollback(writer, rollback_drop_observed);
+    wal.wal_state
+        .write()
+        .unwrap()
+        .activate_delta(601, u64::MAX)
+        .unwrap();
+
+    assert!(wal.take_online_writer(602).is_err());
+    assert!(!dropped.load(Ordering::SeqCst));
+    wal.try_store_put_event(b"before".to_vec(), b"accepted".to_vec())
+        .unwrap();
+
+    let writes_before_detach = wal.wal_state.read().unwrap().offset;
+    let mut detached = wal.take_online_writer(601).unwrap();
+    assert!(wal
+        .try_store_put_event(b"detached".to_vec(), b"rejected".to_vec())
+        .is_err());
+    assert_eq!(wal.wal_state.read().unwrap().offset, writes_before_detach);
+    assert!(!dropped.load(Ordering::SeqCst));
+
+    assert!(wal.reinstall_online_writer(602, &mut detached).is_err());
+    assert!(wal.reinstall_online_writer(601, &mut detached).is_ok());
+    wal.try_store_put_event(b"restored".to_vec(), b"accepted".to_vec())
+        .unwrap();
+    assert!(!dropped.load(Ordering::SeqCst));
+
+    let detached = wal.take_online_writer(601).unwrap();
+    let closed = detached.close();
+    assert_eq!(closed.token, 601);
+    assert!(dropped.load(Ordering::SeqCst));
+    let namespace_publication = || {
+        assert!(dropped.load(Ordering::SeqCst));
+        true
+    };
+    assert!(namespace_publication());
+}
+
+struct DropObservedWriter {
+    bytes: Vec<u8>,
+    dropped: Arc<AtomicBool>,
+}
+
+impl Write for DropObservedWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for DropObservedWriter {
+    fn drop(&mut self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+}
+
+fn rollback_drop_observed(writer: &mut DropObservedWriter, checkpoint: usize) -> io::Result<()> {
+    writer.bytes.truncate(checkpoint);
+    Ok(())
+}
 
 #[test]
 fn delta_recorder_is_token_bound_exactly_bounded_and_terminal_on_overflow() {

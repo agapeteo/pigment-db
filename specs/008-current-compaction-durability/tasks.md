@@ -225,8 +225,8 @@
 
 ### Writer handoff and failure semantics
 
-- [ ] T126 [US3] Write and run a runtime RED proving the active writer is detach-token protected, old handles close before namespace publication, and pre-publication failure reinstalls only a proven old writer in `src/wal/maintenance_tests.rs`
-- [ ] T127 [US3] Make the private WAL writer detachable and add health-checked take/reinstall seams in `src/wal/mod.rs`, then run T126 GREEN and existing durability tests
+- [X] T126 [US3] Write and run a runtime RED proving the active writer is detach-token protected, old handles close before namespace publication, and pre-publication failure reinstalls only a proven old writer in `src/wal/maintenance_tests.rs`
+- [X] T127 [US3] Make the private WAL writer detachable and add health-checked take/reinstall seams in `src/wal/mod.rs`, then run T126 GREEN and existing durability tests
 - [ ] T128 [US3] Write and run a runtime RED proving successful cutover installs replacement offset/buffer/granularity/bucket/rotation state and an immediate mutation plus forced rotation targets only replacement in `src/compaction/online_tests.rs`
 - [ ] T129 [US3] Implement writer and rotation-state handoff after shared manifest publication in `src/wal/mod.rs`, `src/compaction/mod.rs`, and `src/compaction/publication.rs`, then run T128 GREEN
 - [ ] T130 [US3] Write and run a runtime RED proving a paused first compaction permits reads/writes while a second same-instance private call fails immediately without artifacts or recorder replacement in `src/compaction/online_tests.rs`

@@ -47,7 +47,7 @@ pub(crate) fn maintenance_test_sentinel() {}
 struct WalState<W: Write> {
     offset: u64,
     active_len: u64,
-    writer: W,
+    writer: Option<W>,
     rollback: Option<fn(&mut W, usize) -> std::io::Result<()>>,
     health: WalHealth,
     format: WalFormat,
@@ -60,6 +60,7 @@ struct WalState<W: Write> {
     rotation: Option<RotationSupport<W>>,
     frame_buffer: Vec<u8>,
     delta_recorder: Option<DeltaRecorder>,
+    online_owner_token: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -187,14 +188,26 @@ impl DeltaRecorder {
 
 impl<W: Write> WalState<W> {
     fn activate_delta(&mut self, token: u64, limit: u64) -> Result<(), ()> {
-        if self.delta_recorder.is_some() || !matches!(&self.health, WalHealth::Ready) {
+        if self.delta_recorder.is_some()
+            || self.online_owner_token.is_some()
+            || !matches!(&self.health, WalHealth::Ready)
+        {
             return Err(());
         }
         self.delta_recorder = Some(DeltaRecorder::new(token, limit));
+        self.online_owner_token = Some(token);
         Ok(())
     }
 
     fn detach_delta(&mut self, token: u64) -> Option<DeltaRecorder> {
+        let detached = self.detach_delta_for_online(token);
+        if detached.is_some() && self.online_owner_token == Some(token) {
+            self.online_owner_token = None;
+        }
+        detached
+    }
+
+    fn detach_delta_for_online(&mut self, token: u64) -> Option<DeltaRecorder> {
         if self
             .delta_recorder
             .as_ref()
@@ -250,6 +263,7 @@ enum WalFormat {
 
 enum WalHealth {
     Ready,
+    WriterDetached { token: u64 },
     FailedRollback { original: String, rollback: String },
 }
 
@@ -351,6 +365,79 @@ pub struct WalStorage<W: Write> {
     wal_state: RwLock<WalState<W>>,
 }
 
+pub(crate) struct DetachedWalWriter<W: Write> {
+    token: u64,
+    writer: Option<W>,
+}
+
+pub(crate) struct ClosedWalWriter {
+    token: u64,
+}
+
+impl<W: Write> DetachedWalWriter<W> {
+    pub(crate) fn close(mut self) -> ClosedWalWriter {
+        drop(self.writer.take());
+        ClosedWalWriter { token: self.token }
+    }
+}
+
+impl<W: Write> WalStorage<W> {
+    pub(crate) fn take_online_writer(&self, token: u64) -> std::io::Result<DetachedWalWriter<W>> {
+        let mut state = self
+            .wal_state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ensure_ready(&state.health)?;
+        if state.online_owner_token != Some(token) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "online WAL writer detach token does not own the active attempt",
+            ));
+        }
+        let writer = state.writer.take().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "online WAL writer is already detached",
+            )
+        })?;
+        state.health = WalHealth::WriterDetached { token };
+        Ok(DetachedWalWriter {
+            token,
+            writer: Some(writer),
+        })
+    }
+
+    pub(crate) fn reinstall_online_writer(
+        &self,
+        token: u64,
+        detached: &mut DetachedWalWriter<W>,
+    ) -> std::io::Result<()> {
+        let mut state = self
+            .wal_state
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.online_owner_token != Some(token)
+            || detached.token != token
+            || !matches!(state.health, WalHealth::WriterDetached { token: owner } if owner == token)
+            || state.writer.is_some()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "only the owning online attempt may reinstall its detached WAL writer",
+            ));
+        }
+        let writer = detached.writer.take().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "detached WAL writer was already consumed",
+            )
+        })?;
+        state.writer = Some(writer);
+        state.health = WalHealth::Ready;
+        Ok(())
+    }
+}
+
 impl WalStorage<File> {
     #[allow(dead_code)]
     pub fn new_file_based(file_path: &Path) -> Self {
@@ -366,7 +453,7 @@ impl WalStorage<File> {
         let wal_state = WalState {
             offset: 0,
             active_len: 0,
-            writer: file,
+            writer: Some(file),
             rollback: Some(rollback_file),
             health: WalHealth::Ready,
             format: WalFormat::Legacy,
@@ -379,6 +466,7 @@ impl WalStorage<File> {
             rotation: None,
             frame_buffer: Vec::new(),
             delta_recorder: None,
+            online_owner_token: None,
         };
         let wal_state = RwLock::new(wal_state);
 
@@ -448,7 +536,7 @@ impl WalStorage<File> {
             wal_state: RwLock::new(WalState {
                 offset,
                 active_len: validated_len,
-                writer: file,
+                writer: Some(file),
                 rollback: Some(rollback_file),
                 health: WalHealth::Ready,
                 format,
@@ -461,6 +549,7 @@ impl WalStorage<File> {
                 rotation: None,
                 frame_buffer: Vec::new(),
                 delta_recorder: None,
+                online_owner_token: None,
             }),
         })
     }
@@ -480,7 +569,7 @@ impl WalStorage<File> {
             wal_state: RwLock::new(WalState {
                 offset: u64::from(offset),
                 active_len: u64::from(offset),
-                writer: file,
+                writer: Some(file),
                 rollback: Some(rollback_file),
                 health: WalHealth::Ready,
                 format: WalFormat::V1,
@@ -493,6 +582,7 @@ impl WalStorage<File> {
                 rotation: None,
                 frame_buffer: Vec::new(),
                 delta_recorder: None,
+                online_owner_token: None,
             }),
         }
     }
@@ -507,7 +597,7 @@ impl WalStorage<File> {
             wal_state: RwLock::new(WalState {
                 offset,
                 active_len: offset,
-                writer: file,
+                writer: Some(file),
                 rollback: Some(rollback_file),
                 health: WalHealth::Ready,
                 format: WalFormat::V2,
@@ -520,13 +610,20 @@ impl WalStorage<File> {
                 rotation: None,
                 frame_buffer: Vec::new(),
                 delta_recorder: None,
+                online_owner_token: None,
             }),
         }
     }
 
     #[allow(dead_code)]
     pub(crate) fn sync_all(&self) -> std::io::Result<()> {
-        self.wal_state.read().unwrap().writer.sync_all()
+        let state = self.wal_state.read().unwrap();
+        ensure_ready(&state.health)?;
+        state
+            .writer
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("ready WAL has no attached writer"))?
+            .sync_all()
     }
 
     pub(crate) fn enable_file_rotation(
@@ -696,7 +793,7 @@ impl WalStorage<Vec<u8>> {
         let wal_state = WalState {
             offset: 0,
             active_len: 0,
-            writer: vec,
+            writer: Some(vec),
             rollback: Some(rollback_vec),
             health: WalHealth::Ready,
             format: WalFormat::Legacy,
@@ -709,6 +806,7 @@ impl WalStorage<Vec<u8>> {
             rotation: None,
             frame_buffer: Vec::new(),
             delta_recorder: None,
+            online_owner_token: None,
         };
         let wal_state = RwLock::new(wal_state);
 
@@ -735,7 +833,7 @@ impl WalStorage<Vec<u8>> {
             wal_state: RwLock::new(WalState {
                 offset: header.len() as u64,
                 active_len: header.len() as u64,
-                writer: header.to_vec(),
+                writer: Some(header.to_vec()),
                 rollback: Some(rollback_vec),
                 health: WalHealth::Ready,
                 format: WalFormat::V1,
@@ -748,6 +846,7 @@ impl WalStorage<Vec<u8>> {
                 rotation: None,
                 frame_buffer: Vec::new(),
                 delta_recorder: None,
+                online_owner_token: None,
             }),
         }
     }
@@ -792,18 +891,21 @@ impl<W: Write> WalStorage<W> {
     }
 
     pub(crate) fn clear_delta_recorder(&self, token: u64) {
-        let _ = self
+        let mut state = self
             .wal_state
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .detach_delta(token);
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = state.detach_delta(token);
+        if state.online_owner_token == Some(token) && matches!(state.health, WalHealth::Ready) {
+            state.online_owner_token = None;
+        }
     }
 
     pub(crate) fn detach_delta_recorder(&self, token: u64) -> Option<DeltaRecorder> {
         self.wal_state
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .detach_delta(token)
+            .detach_delta_for_online(token)
     }
 
     #[cfg(test)]
@@ -858,7 +960,7 @@ impl<W: Write> WalStorage<W> {
         barrier: crate::durability::DataBarrier<W>,
     ) -> std::io::Result<()> {
         let mut state = self.wal_state.write().unwrap();
-        crate::durability::synchronize_data(&mut state.writer, barrier)
+        crate::durability::synchronize_data(attached_writer_mut(&mut state), barrier)
     }
 
     #[cfg(test)]
@@ -878,7 +980,7 @@ impl<W: Write> WalStorage<W> {
             wal_state: RwLock::new(WalState {
                 offset: 0,
                 active_len: 0,
-                writer,
+                writer: Some(writer),
                 rollback: Some(rollback),
                 health: WalHealth::Ready,
                 format: WalFormat::Legacy,
@@ -891,6 +993,7 @@ impl<W: Write> WalStorage<W> {
                 rotation: None,
                 frame_buffer: Vec::new(),
                 delta_recorder: None,
+                online_owner_token: None,
             }),
         }
     }
@@ -904,7 +1007,7 @@ impl<W: Write> WalStorage<W> {
             wal_state: RwLock::new(WalState {
                 offset: format::V1CodecProbe::HEADER_LEN as u64,
                 active_len: format::V1CodecProbe::HEADER_LEN as u64,
-                writer,
+                writer: Some(writer),
                 rollback: Some(rollback),
                 health: WalHealth::Ready,
                 format: WalFormat::V1,
@@ -917,6 +1020,7 @@ impl<W: Write> WalStorage<W> {
                 rotation: None,
                 frame_buffer: Vec::new(),
                 delta_recorder: None,
+                online_owner_token: None,
             }),
         }
     }
@@ -944,7 +1048,7 @@ impl<W: Write> WalStorage<W> {
             wal_state: RwLock::new(WalState {
                 offset: format::V2CodecProbe::HEADER_LEN as u64,
                 active_len: format::V2CodecProbe::HEADER_LEN as u64,
-                writer,
+                writer: Some(writer),
                 rollback: Some(rollback),
                 health: WalHealth::Ready,
                 format: WalFormat::V2,
@@ -957,6 +1061,7 @@ impl<W: Write> WalStorage<W> {
                 rotation: None,
                 frame_buffer: Vec::new(),
                 delta_recorder: None,
+                online_owner_token: None,
             }),
         }
     }
@@ -1035,7 +1140,7 @@ impl<W: Write> WalStorage<W> {
                 })?;
                 bytes.extend_from_slice(&frame);
             }
-            if let Err(write_error) = state.writer.write_all(&bytes) {
+            if let Err(write_error) = attached_writer_mut(&mut state).write_all(&bytes) {
                 return Err(rollback_or_fail(
                     &mut state,
                     physical_checkpoint,
@@ -1043,7 +1148,7 @@ impl<W: Write> WalStorage<W> {
                     write_error,
                 ));
             }
-            if let Err(flush_error) = state.writer.flush() {
+            if let Err(flush_error) = attached_writer_mut(&mut state).flush() {
                 return Err(rollback_or_fail(
                     &mut state,
                     physical_checkpoint,
@@ -1110,7 +1215,7 @@ impl<W: Write> WalStorage<W> {
                     })?;
                 bytes.extend_from_slice(&frame);
             }
-            if let Err(write_error) = state.writer.write_all(&bytes) {
+            if let Err(write_error) = attached_writer_mut(&mut state).write_all(&bytes) {
                 return Err(rollback_or_fail(
                     &mut state,
                     physical_checkpoint,
@@ -1118,7 +1223,7 @@ impl<W: Write> WalStorage<W> {
                     write_error,
                 ));
             }
-            if let Err(flush_error) = state.writer.flush() {
+            if let Err(flush_error) = attached_writer_mut(&mut state).flush() {
                 return Err(rollback_or_fail(
                     &mut state,
                     physical_checkpoint,
@@ -1140,7 +1245,7 @@ impl<W: Write> WalStorage<W> {
             return Ok(());
         }
         let (bytes, accepted_offset) = encode_compute_batch(checkpoint, actions)?;
-        if let Err(write_error) = state.writer.write_all(&bytes) {
+        if let Err(write_error) = attached_writer_mut(&mut state).write_all(&bytes) {
             return Err(rollback_or_fail(
                 &mut state,
                 physical_checkpoint,
@@ -1148,7 +1253,7 @@ impl<W: Write> WalStorage<W> {
                 write_error,
             ));
         }
-        if let Err(flush_error) = state.writer.flush() {
+        if let Err(flush_error) = attached_writer_mut(&mut state).flush() {
             return Err(rollback_or_fail(
                 &mut state,
                 physical_checkpoint,
@@ -1316,7 +1421,7 @@ impl<W: Write> WalStorage<W> {
             let accepted_offset = checkpoint.checked_add(frame_len).ok_or_else(|| {
                 std::io::Error::new(std::io::ErrorKind::InvalidData, "V2 WAL offset overflow")
             })?;
-            let write_result = state.writer.write_all(&frame);
+            let write_result = attached_writer_mut(&mut state).write_all(&frame);
             state.frame_buffer = frame;
             if let Err(write_error) = write_result {
                 return Err(rollback_or_fail(
@@ -1326,7 +1431,7 @@ impl<W: Write> WalStorage<W> {
                     write_error,
                 ));
             }
-            if let Err(flush_error) = state.writer.flush() {
+            if let Err(flush_error) = attached_writer_mut(&mut state).flush() {
                 return Err(rollback_or_fail(
                     &mut state,
                     physical_checkpoint,
@@ -1377,7 +1482,7 @@ impl<W: Write> WalStorage<W> {
                 .ok_or_else(|| {
                     std::io::Error::new(std::io::ErrorKind::InvalidData, "V1 WAL offset overflow")
                 })?;
-            if let Err(write_error) = state.writer.write_all(&frame) {
+            if let Err(write_error) = attached_writer_mut(&mut state).write_all(&frame) {
                 return Err(rollback_or_fail(
                     &mut state,
                     physical_checkpoint,
@@ -1385,7 +1490,7 @@ impl<W: Write> WalStorage<W> {
                     write_error,
                 ));
             }
-            if let Err(flush_error) = state.writer.flush() {
+            if let Err(flush_error) = attached_writer_mut(&mut state).flush() {
                 return Err(rollback_or_fail(
                     &mut state,
                     physical_checkpoint,
@@ -1408,7 +1513,7 @@ impl<W: Write> WalStorage<W> {
         }
         action.set_start_offset(checkpoint);
         action.ensure_payload_crc();
-        if let Err(write_error) = write_fallible(&mut state.writer, &action) {
+        if let Err(write_error) = write_fallible(attached_writer_mut(&mut state), &action) {
             return Err(rollback_or_fail(
                 &mut state,
                 physical_checkpoint,
@@ -1485,12 +1590,15 @@ fn maybe_rotate_before<W: Write>(
 
     let mut rotation = state.rotation.take().expect("rotation support checked");
     let prior_segment_id = rotation.state.segment_id;
+    let granularity_nanos = state.granularity_nanos;
+    let last_bucket = state.last_bucket;
+    let durability_policy = state.durability_policy;
     let result = (rotation.rotate)(
-        &mut state.writer,
+        attached_writer_mut(state),
         &mut rotation.state,
-        state.granularity_nanos,
-        state.last_bucket,
-        state.durability_policy,
+        granularity_nanos,
+        last_bucket,
+        durability_policy,
     );
     if result.is_ok() || rotation.state.segment_id != prior_segment_id {
         rotation.state.force_before_next_mutation = false;
@@ -1525,12 +1633,16 @@ fn synchronize_if_physical<W: Write>(state: &mut WalState<W>) -> std::io::Result
     let barrier = state
         .data_barrier
         .ok_or_else(|| std::io::Error::other("physical data barrier is unavailable"))?;
-    crate::durability::synchronize_data(&mut state.writer, barrier)
+    crate::durability::synchronize_data(attached_writer_mut(state), barrier)
 }
 
 fn ensure_ready(health: &WalHealth) -> std::io::Result<()> {
     match health {
         WalHealth::Ready => Ok(()),
+        WalHealth::WriterDetached { token } => Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!("WAL writer is temporarily detached by online attempt {token}"),
+        )),
         WalHealth::FailedRollback { original, rollback } => {
             Err(std::io::Error::other(MutationFailure::FailedClosed {
                 original: original.clone(),
@@ -1538,6 +1650,13 @@ fn ensure_ready(health: &WalHealth) -> std::io::Result<()> {
             }))
         }
     }
+}
+
+fn attached_writer_mut<W: Write>(state: &mut WalState<W>) -> &mut W {
+    state
+        .writer
+        .as_mut()
+        .expect("ready WAL health must have an attached writer")
 }
 
 fn rollback_or_fail<W: Write>(
@@ -1548,7 +1667,7 @@ fn rollback_or_fail<W: Write>(
 ) -> std::io::Error {
     let truncate_result = match state.rollback {
         Some(rollback) => match usize::try_from(checkpoint) {
-            Ok(checkpoint) => rollback(&mut state.writer, checkpoint),
+            Ok(checkpoint) => rollback(attached_writer_mut(state), checkpoint),
             Err(_) => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "rollback checkpoint exceeds platform usize",
@@ -1567,7 +1686,9 @@ fn rollback_or_fail<W: Write>(
     }
     if state.durability_policy == crate::config::DurabilityPolicy::Physical {
         let sync_result = match state.rollback_barrier {
-            Some(barrier) => crate::durability::synchronize_data(&mut state.writer, barrier),
+            Some(barrier) => {
+                crate::durability::synchronize_data(attached_writer_mut(state), barrier)
+            }
             None => Err(std::io::Error::other(
                 "rollback synchronization unavailable",
             )),
@@ -2205,7 +2326,8 @@ fn test_with_vec() {
     wal.store_put_event(b"b".to_vec(), b"B!".to_vec());
     wal.store_delete_event(b"x");
 
-    let map = collect(&wal.wal_state.read().unwrap().writer);
+    let state = wal.wal_state.read().unwrap();
+    let map = collect(state.writer.as_ref().unwrap());
     // let map = read_forward(&wal.wal_state.read().unwrap().writer);
     // let map = read_backward(&wal.wal_state.read().unwrap().writer).unwrap();
     assert_eq!(map.get(b"a".as_slice()), Some(&b"AAA".to_vec()));

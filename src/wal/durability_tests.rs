@@ -64,7 +64,17 @@ fn private_policy_is_per_open_runtime_state_and_is_absent_from_v1_bytes() {
         buffered.wal_state.read().unwrap().writer,
         physical.wal_state.read().unwrap().writer
     );
-    assert_eq!(&buffered.wal_state.read().unwrap().writer[..], &header);
+    assert_eq!(
+        buffered
+            .wal_state
+            .read()
+            .unwrap()
+            .writer
+            .as_ref()
+            .unwrap()
+            .as_slice(),
+        &header
+    );
 }
 
 #[test]
