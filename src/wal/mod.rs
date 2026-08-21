@@ -2483,14 +2483,10 @@ fn test_with_vec() {
 #[test]
 #[ignore]
 fn test_read_backward() {
-    use memmap::MmapOptions;
-
     let file_name = ".../sandbox/dcache/wal.dat.bk";
-    let file = File::open(file_name).unwrap();
-    let content_as_slice = unsafe { MmapOptions::new().map(&file).unwrap() };
-    let bytes = content_as_slice.as_ref();
+    let bytes = std::fs::read(file_name).unwrap();
 
-    let result = read_backward(bytes).unwrap();
+    let result = read_backward(&bytes).unwrap();
 
     println!("result size: {}", result.len());
     for (k, v) in result {

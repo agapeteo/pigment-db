@@ -259,7 +259,7 @@
 
 ### Bounded Windows platform boundary
 
-- [ ] T144 [US4] Add target-specific `windows-sys = 0.61.2` with only `Win32_Storage_FileSystem`, create a private safe namespace stub, and establish crate-wide unsafe denial with the sole module exception in `Cargo.toml`, `Cargo.lock`, `src/lib.rs`, `src/durability.rs`, and `src/durability/windows.rs` without changing public support behavior
+- [X] T144 [US4] Add target-specific `windows-sys = 0.61.2` with only `Win32_Storage_FileSystem`, create a private safe namespace stub, and establish crate-wide unsafe denial with the sole module exception in `Cargo.toml`, `Cargo.lock`, `src/lib.rs`, `src/durability.rs`, and `src/durability/windows.rs` without changing public support behavior
 - [ ] T145 [US4] Write and run a Windows runtime RED for lossless Unicode/supported-long-path UTF-16 conversion, exact terminator lifetime, and interior-NUL rejection through the private safe seam in `src/durability/windows.rs`
 - [ ] T146 [US4] Implement the documented native path conversion and safety invariants inside `src/durability/windows.rs`, then run T145 GREEN
 - [ ] T147 [US4] Write and run a Windows runtime RED for no-replace and replace-existing `MoveFileExW` flag sets, same-volume behavior, destination conflict, and immediate original `last_os_error` preservation in `src/durability/windows.rs`

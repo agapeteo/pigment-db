@@ -5,6 +5,8 @@
 //! for direct per-mutation persistence barriers and crash-safe startup publication.
 //! The policy is selected per opening and is not encoded in WAL bytes.
 
+#![deny(unsafe_code)]
+
 pub mod key_map_store;
 pub mod key_set_store;
 pub mod key_value_store;

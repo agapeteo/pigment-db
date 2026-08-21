@@ -1,5 +1,8 @@
 //! Durability capability errors and internal barrier implementation.
 
+#[cfg(target_os = "windows")]
+mod windows;
+
 use crate::config::DurabilityPolicy;
 use std::error::Error;
 use std::fmt;
