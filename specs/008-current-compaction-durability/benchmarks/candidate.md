@@ -1,6 +1,6 @@
 # Candidate Capture
 
-Status: **ATTEMPT 1 FAILED — preserved; optimized retry candidate pending**.
+Status: **FINAL COUNTERBALANCED RETRY PASSED — prior failures preserved**.
 
 ## Attempt 1 provenance
 
@@ -46,7 +46,7 @@ stores, replaces only that maintenance gate with a compact userspace
 read/write lock, and makes vector-backed stores bypass filesystem-maintenance
 coordination because they expose neither storage inspection nor online
 compaction. A new deterministic RED–GREEN test proves the vector behavior;
-the existing all-mutation ordering tests now exercise the file-backed stores
+the existing file-backed all-mutation ordering tests now exercise those stores
 to preserve the required maintenance → logical key/shard → WAL ordering.
 
 Several diagnostic matrices were intentionally excluded from acceptance. They
@@ -66,9 +66,43 @@ attempt-1 evidence.
 | Resolved maintenance-lock dependency | `parking_lot 0.12.5` |
 | Environment contract | Same filesystem, temporary-data root, CPU set `12-19`, workload matrix, and frozen baseline contract recorded in `README.md` |
 | Build verification | Complete debug/release quality gates, Windows GNU cross-check, and byte-identical 36-cell baseline/candidate smoke traversals GREEN |
-| Acceptance capture IDs | Pending: `candidate-retry-1`, `candidate-retry-2`, `candidate-retry-3` |
+| Candidate commit recorded by capture | `180e16a965285dd3edfc494bfdeff2b1fe7dcd3c` (documentation-only descendant of accepted source) |
+| Final capture IDs | `candidate-retry-p2-1`, `candidate-retry-p2-2`, `candidate-retry-p2-3` |
 
 The accepted source commit contains the optimization and immutable attempt-1
-evidence. This documentation-only provenance update does not change its release
-binary. Native platform CI and a fresh explicit quiet-host confirmation remain
-required before the three optimized acceptance matrices are captured.
+evidence. The documentation-only descendant does not change its release binary.
+Native Linux, macOS, and Windows CI passed before the approved quiet capture.
+
+## Optimized ordinal retry — preserved failure
+
+The first optimized retry (`candidate-retry-1` through
+`candidate-retry-3`) completed all 108 cells against the prior-day baseline.
+It passed 33/36 median cells but failed three unrelated one-worker throughput
+comparisons. All eight-worker throughput and p95 cells passed. A same-window
+reconstructed pre-feature diagnostic made those three cells pass while other
+one-worker cells moved, proving the ordinal comparison was temporally biased.
+No retry artifact was discarded or repurposed.
+
+| Artifact | SHA-256 |
+|---|---|
+| `candidate/candidate-retry-1.csv` | `776c543455570f0a6d41a78cd2fb3fdc9fdae15498ee31c94e33cccae2401fc4` |
+| `candidate/candidate-retry-1.csv.metadata` | `73a41e492f886b8476be043310df41d034796e22d1a6042ae17ec0ebaaebca88` |
+| `candidate/candidate-retry-2.csv` | `f073b52d3ae2e77068a404e2044ab61c43e33bf3b29eeafc1549eaceeea3248e` |
+| `candidate/candidate-retry-2.csv.metadata` | `820e4d77e7e30e0e3f230d6829d349093636286d397b73c292248573114a2892` |
+| `candidate/candidate-retry-3.csv` | `a583e67f4e12a5061347f4bd2c2b24f7ac48aeabf55938d244094b1700a9fb08` |
+| `candidate/candidate-retry-3.csv.metadata` | `54725103edff35e241527d1f525a46be5fff7bf7b5afcb9a557a6d3da8047c62` |
+
+## Final counterbalanced retry
+
+The final acceptance set ran sequentially as `B1-C1 / C2-B2 / B3-C3` in the
+user-approved quiet window. All three candidate CSVs contain 36 unique cells,
+and the median gate passes 36/36 cells without changing any threshold.
+
+| Artifact | SHA-256 |
+|---|---|
+| `candidate/candidate-retry-p2-1.csv` | `7af6d5e5afdff52fd489992a8cb24757d12902e869371fae2ecbc4b13645ad68` |
+| `candidate/candidate-retry-p2-1.csv.metadata` | `ffdd035a41758613768fbef6fe183716eb32efc5c2fdc09fe0a881eddc8d23b7` |
+| `candidate/candidate-retry-p2-2.csv` | `6d643205fcfa4c7b24245b69900e1804587965fc4974b3f18942004e3a0c5718` |
+| `candidate/candidate-retry-p2-2.csv.metadata` | `c6b889bd7600439f154cbf004dc5be19a0429c7bf62c5b7b57961235fb540282` |
+| `candidate/candidate-retry-p2-3.csv` | `2ac6186ce98e1b2f8714c05c0b5206e85299e8d6735ea9e852d6ae8f1a997361` |
+| `candidate/candidate-retry-p2-3.csv.metadata` | `425553be3e276672acd1c07b95b061bedc5f16be326987dc3483007649dd32df` |

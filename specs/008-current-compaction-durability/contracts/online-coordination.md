@@ -12,7 +12,9 @@ maintenance shared/exclusive
     -> WAL state
 ```
 
-Normal reads acquire none of these new maintenance guards. Every normal mutation acquires shared maintenance coordination before the existing shard/key operation and retains it through:
+Normal reads acquire none of these new maintenance guards. Every normal
+mutation on that file-backed instance acquires shared maintenance coordination
+before the existing shard/key operation and retains it through:
 
 1. logical precondition validation;
 2. WAL write, flush, and required physical barrier;

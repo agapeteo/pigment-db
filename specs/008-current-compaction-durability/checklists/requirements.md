@@ -37,3 +37,8 @@
 - The named public maintenance surface is retained as an externally observable
   compatibility contract. Internal encodings, filenames, staging layout, and
   platform-wrapper design remain deferred to planning.
+- Final implementation evidence is complete: native Linux/macOS/Windows CI is
+  GREEN, all required local quality gates are GREEN, and the counterbalanced
+  inactive-compaction performance matrix passes 36/36 cells without weakening
+  the `90%`/`85%`/`125%` thresholds. Full provenance is recorded in
+  [benchmarks/final.md](../benchmarks/final.md).

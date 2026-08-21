@@ -213,8 +213,8 @@ As an operator with an older Pigment DB database, I receive clear external-migra
 #### Online Compaction
 
 - **FR-055**: Online compaction MUST operate on exactly one open store-family instance and permit at most one active compaction attempt for that instance; a concurrent second attempt MUST return `FailedClosed` immediately while the first attempt and ordinary reads and writes continue, and other families and unrelated instances MUST remain independent.
-- **FR-056**: Each store instance MUST have a bounded maintenance coordination gate whose acquisition order is maintenance coordination, then logical key or existing shard, then log state.
-- **FR-057**: Normal mutations MUST participate in shared maintenance coordination for their complete durable-acceptance and live-publication interval.
+- **FR-056**: Each file-backed store instance that exposes online compaction MUST have a bounded maintenance coordination gate whose acquisition order is maintenance coordination, then logical key or existing shard, then log state; vector-backed stores that cannot perform storage maintenance MUST NOT acquire that gate on mutation paths.
+- **FR-057**: Normal mutations on a file-backed store instance that can perform online compaction MUST participate in shared maintenance coordination for their complete durable-acceptance and live-publication interval.
 - **FR-058**: Normal reads MUST retain their existing direct read path and MUST NOT acquire maintenance coordination.
 - **FR-059**: Initial snapshot capture and final cutover MAY briefly exclude mutations; disk-heavy snapshot encoding and staging validation MUST occur without exclusive maintenance coordination.
 - **FR-060**: Online compaction MUST capture one consistent logical snapshot and activate exactly one ordered delta recorder inside the existing durable acceptance-order boundary before allowing mutations to resume.

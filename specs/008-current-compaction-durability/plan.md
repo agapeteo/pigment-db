@@ -12,7 +12,12 @@ Add read-only storage statistics, closed directory compaction, and per-family on
 
 **Language/Version**: Rust 2021 edition on stable Rust; planning toolchain `rustc 1.97.1` (the crate does not currently declare an MSRV)
 
-**Primary Dependencies**: Existing `dashmap`, `crc32fast`, `serde`, `bincode`, `memmap`, and standard-library synchronization/filesystem APIs; add target-specific `windows-sys = 0.61.2` with only `Win32_Storage_FileSystem`
+**Primary Dependencies**: Existing `dashmap`, `crc32fast`, `serde`, `bincode`,
+and `memmap`; add `parking_lot = 0.12.5` for the compact non-poisoning
+file-maintenance gate after the standard-library gate failed the approved
+inactive-throughput threshold, and add target-specific `windows-sys = 0.61.2`
+with only `Win32_Storage_FileSystem`. WAL synchronization retains its existing
+standard-library locks.
 
 **Storage**: Current V2 append-only file WALs with active and sealed segments; temporary custom-binary, CRC32-checksummed compaction manifest; no record-format change
 
@@ -69,7 +74,12 @@ Current-V2 snapshot and delta encoders live beside current replay code in `src/w
 6. Freeze the final original-WAL inventory, publish with the shared family-scoped manifest protocol, close the old Windows handle before namespace moves, install the replacement writer/rotation state, and release exclusivity.
 7. Retry exact cleanup outside exclusive coordination; leave the replacement readable and writable when cleanup remains pending.
 
-Normal mutation lock order is always `maintenance shared -> DashMap key/shard -> WAL state`, held through WAL acceptance and live publication. Reads keep the existing direct DashMap path. User callbacks and post-publication callbacks execute after maintenance and shard guards are released.
+For file-backed instances that expose online compaction, normal mutation lock
+order is always `maintenance shared -> DashMap key/shard -> WAL state`, held
+through WAL acceptance and live publication. Vector-backed instances cannot
+perform storage maintenance and bypass this gate. Reads keep the existing
+direct DashMap path. User callbacks and post-publication callbacks execute
+after maintenance and shard guards are released.
 
 ### Windows durability boundary
 
@@ -147,4 +157,11 @@ Every filesystem fault test snapshots names and bytes before the call and verifi
 
 ## Complexity Tracking
 
-No constitution violations require justification. The new target-specific dependency, process-local ownership registry, custom maintenance manifest, and one unsafe Windows module are all directly required by approved functional requirements and are bounded by the contracts in this feature.
+No constitution violations require justification. The target-specific Windows
+dependency, process-local ownership registry, custom maintenance manifest, and
+one unsafe Windows module are directly required by approved functional
+requirements and bounded by the feature contracts. The cross-platform
+`parking_lot` dependency is limited to the per-instance file-maintenance gate;
+it replaces a standard-library gate only after immutable performance evidence
+failed the approved threshold, and it is not used for WAL state or vector-only
+stores.

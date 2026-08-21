@@ -2,7 +2,10 @@
 
 ## Purpose
 
-The performance gate measures the normal mutation paths after they gain a per-store coordinator. It does not measure compaction speed. A matching feature-specific baseline must be frozen before the first production hot-path edit.
+The performance gate measures file-backed mutation paths after they gain a
+per-store coordinator and vector-backed paths as unchanged controls. It does
+not measure compaction speed. A matching feature-specific baseline must be
+frozen before the first production hot-path edit.
 
 ## Matrix
 

@@ -105,6 +105,9 @@ Primary references: [Microsoft `MoveFileExW`](https://learn.microsoft.com/en-us/
 
 The matrix covers every family, vector and file buffered storage, ordinary write/remove/minimal compute, one worker and eight distinct-key workers, at least 100 ms and 1,024 operations per sample. Record source digest, commit/dirty state, toolchain/OS/CPU/filesystem, command, affinity, and CSV checksum. Passing cells cannot offset failures.
 
-**Rationale**: Semantic hooks prove interleavings and gate release. Both vector and file stores need evidence because the common runtime field touches both hot paths.
+**Rationale**: Semantic hooks prove interleavings and gate release for
+file-backed stores that expose online maintenance. Vector stores remain in the
+matrix as unchanged controls and deterministically prove they bypass file-only
+coordination.
 
 **Alternatives considered**: Historical baselines, timing-only tests, final-state-only checks, and aggregate ratios were rejected.

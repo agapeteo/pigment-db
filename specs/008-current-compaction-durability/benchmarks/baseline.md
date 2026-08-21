@@ -38,3 +38,27 @@ positive aggregate p95 latency. All metadata agrees on source, harness,
 toolchain, host, filesystem, affinity, payload, warmups, samples, and sampling
 floors. These files are immutable comparator evidence; later results must not
 replace or selectively recapture them.
+
+## Same-window reconstructed baseline for final gate
+
+The original artifacts above remain frozen lineage evidence. After two
+candidate-only comparisons showed material day-to-day one-worker drift, the
+pre-feature source was reconstructed at the same commit with the byte-identical
+harness and recaptured in the user's approved 2026-08-21 quiet window. This is
+the matching same-window baseline required by the counterbalanced performance
+contract; it does not alter or replace the original files.
+
+| Field | Value |
+|---|---|
+| Capture IDs | `baseline-retry-p2-1`, `baseline-retry-p2-2`, `baseline-retry-p2-3` |
+| Pre-feature commit | `a7c8281f72e25c177a142be99285faead7335e01` |
+| Reconstructed-worktree dirty digest | `8d4777e6137aefc871028d975c2649d481f3178970c7c2b0dae88537a2adca60` |
+| Harness SHA-256 | `c8ca6c94e6f38d54e456462bce2e8fad0d3cffa2b2457f4c2818129b1c62006c` |
+| Pair order | `B1-C1 / C2-B2 / B3-C3` |
+| Capture completion times | `10:34:43`, `10:40:14`, `10:42:04` on 2026-08-21 (`-05:00`) |
+
+| Capture | Rows | CSV SHA-256 | Metadata SHA-256 |
+|---|---:|---|---|
+| `baseline/baseline-retry-p2-1.csv` | 36 | `7bf93e03b7bf095c4d2d1f37cd29b1bda0bae00c26b1d289cdaed94656a619fc` | `09ff25cd9cb116ec28b41c31eaa0d8af0ea33840910a224131c2feccae9b1550` |
+| `baseline/baseline-retry-p2-2.csv` | 36 | `ebd8f35c5d44b9380337e25b3111fa78fb69889b75b1a97823592ecdd4901cf0` | `9972736b7321dbfcd1c528ffc6c99ff64bbed90102245279bbc06c33e05083d9` |
+| `baseline/baseline-retry-p2-3.csv` | 36 | `04c53c3f97a79ede8cac9b2c8cef0ed35880d8ddc162ff8657407a62ce75db8c` | `61a834283310448da492ddf282afa9cefca8625928d670cc111d472a7c8d8bd8` |

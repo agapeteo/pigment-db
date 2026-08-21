@@ -158,8 +158,12 @@ Recovery/fault evidence is summarized in the User Story 2 and 3 checkpoints
 below. Migration fixture evidence is summarized in User Story 5. Immutable
 baseline provenance, raw CSV links, diagnostic conclusions, exact smoke
 commands, and quiet-host prerequisites are recorded in
-[benchmarks/README.md](./benchmarks/README.md); the final candidate and verdict
-remain pending the explicitly approved quiet-machine capture.
+[benchmarks/README.md](./benchmarks/README.md). The approved counterbalanced
+quiet-host capture is complete and passes all 36/36 cells: lowest one-worker
+throughput ratio `0.913449`, lowest eight-worker ratio `0.900328`, and highest
+p95 ratio `1.098007`. The full report and preserved retry history are in
+[benchmarks/final.md](./benchmarks/final.md); the performance release decision
+is **GO**.
 
 ### User Story 2 closed-compaction GREEN checkpoint (2026-08-20)
 
@@ -261,6 +265,11 @@ Platform jobs completed with zero failures:
 - [Windows job](https://github.com/agapeteo/pigment-db/actions/runs/32455792040/job/96692697199);
 - [Ubuntu job](https://github.com/agapeteo/pigment-db/actions/runs/32455792040/job/96692697395);
 - [macOS job](https://github.com/agapeteo/pigment-db/actions/runs/32455792040/job/96692697387).
+
+After the inactive-maintenance optimization added the bounded `parking_lot`
+gate, [retry-candidate workflow run 32495454458](https://github.com/agapeteo/pigment-db/actions/runs/32495454458)
+again completed successfully on Windows, Ubuntu, and macOS at commit
+`180e16a965285dd3edfc494bfdeff2b1fe7dcd3c`.
 
 The final local debug/release all-target/all-feature suites, formatting,
 warning-denying Clippy, warning-denying rustdoc, and Windows cross-target check

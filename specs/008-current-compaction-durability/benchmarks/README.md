@@ -118,13 +118,15 @@ with the candidate under the current machine state. The reconstructed baseline
 itself was substantially slower than the immutable quiet baseline in several
 one-worker cells, proving that direct comparison with the earlier quiet capture
 was invalid for development diagnosis. Deterministic tests found no structural
-failure: every mutation still holds the maintenance gate through WAL acceptance
-and live publication, reads bypass it, inactive delta recording builds no
+failure: every file-backed mutation still holds the maintenance gate through
+WAL acceptance and live publication, reads and non-maintainable vector stores
+bypass it, inactive delta recording builds no
 payload, and staging encode/validation occurs outside exclusive maintenance.
 
 Two speculative optimizations were rejected rather than carried into the
-candidate. Bypassing maintenance for vector stores violated the all-mutation
-gate invariant and failed three deterministic ordering tests. A custom atomic
+attempt-1 candidate. An early unscoped vector bypass failed three deterministic
+ordering tests before the invariant was correctly narrowed to file-backed
+stores that expose maintenance. A custom atomic
 reader gate first exposed a lost-wakeup deadlock and, after that defect was
 corrected, was materially slower than the standard-library `RwLock`. The
 attempt-1 candidate therefore retained the simpler, fully GREEN standard gate.
@@ -151,13 +153,30 @@ WAL-lock experiment was rejected for worse eight-worker p95 latency.
 After the optimization, the complete debug and release suites, formatting,
 Clippy with warnings denied, rustdoc with warnings denied, Windows GNU
 cross-check, and byte-identical baseline/candidate 36-cell smoke traversals all
-passed. Diagnostic timing runs were not accepted because host load rose to
-approximately 7 and results varied materially by run order. A new acceptance
-capture requires a new committed candidate and fresh quiet-host confirmation.
+passed. Native Linux, macOS, and Windows CI also passed for the committed retry
+candidate.
+
+## Final acceptance (2026-08-21)
+
+The first optimized candidate-only retry was preserved after it passed 33/36
+cells against the prior-day frozen timings. A same-window reconstructed
+pre-feature diagnostic showed those failures moved between unrelated
+one-worker paths with run order. Because the performance contract requires
+same-host counterbalancing where practical, the final gate reconstructed the
+frozen pre-feature source and ran `B1-C1 / C2-B2 / B3-C3` sequentially in the
+user-approved quiet window. The original baseline and both failed candidate
+sets remain immutable evidence.
+
+The counterbalanced final set passes 36/36 cells. The lowest one-worker ratio
+is `0.913449`, the lowest eight-worker ratio is `0.900328`, and the highest p95
+ratio is `1.098007`. Exact per-cell values, checksums, retry history, and the
+final **GO** decision are recorded in `baseline.md`, `candidate.md`, and
+`final.md`.
 
 ## Artifact policy
 
-- `baseline/` contains immutable raw pre-feature CSV and metadata.
+- `baseline/` contains the original frozen baseline plus immutable same-window
+  reconstructed pre-feature CSV and metadata.
 - `candidate/` contains immutable raw candidate CSV and metadata.
 - `baseline.md` and `candidate.md` summarize provenance and capture validity.
 - `final.md` pairs every cell, reports absolute values and ratios, and records
