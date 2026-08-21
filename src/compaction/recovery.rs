@@ -27,6 +27,10 @@ pub(crate) fn resolve_store_maintenance(
     store_dir: &Path,
     family: super::inspection::InspectedFamily,
 ) -> Result<bool, RecoveryError> {
+    match fs::metadata(store_dir) {
+        Ok(metadata) if !metadata.is_dir() => return Ok(false),
+        _ => {}
+    }
     let directory_recovered = resolve_directory_maintenance(store_dir)?;
     let online_recovered = resolve_online_maintenance_for_compaction(store_dir, family)
         .map_err(|error| map_compaction_recovery_error(store_dir, error))?;
@@ -1216,8 +1220,7 @@ fn online_source_inventory_is_canonical(
     sealed.iter().enumerate().all(|(segment, descriptor)| {
         descriptor.family == Some(family)
             && descriptor.role == ArtifactRole::SealedSegment
-            && descriptor.relative_path
-                == PathBuf::from(format!("{}.segment-{segment:020}", expected_active_name))
+            && descriptor.relative_path == format!("{}.segment-{segment:020}", expected_active_name)
     })
 }
 
