@@ -18,6 +18,20 @@ use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use log::info;
 
+/// One exact-byte precondition and replacement. None means absence/deletion.
+#[derive(Clone, Debug)]
+pub struct CompareExchangeEntry {
+    pub key: Vec<u8>,
+    pub expected: Option<Vec<u8>>,
+    pub replacement: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompareExchangeResult {
+    Applied,
+    Conflict,
+}
+
 #[cfg(test)]
 use crate::test_support::mutation_schedule::{MutationObserver, MutationPhase};
 
@@ -35,6 +49,8 @@ pub struct DurableKeyValueStore<W: Write> {
     file_backing: Option<PathBuf>,
     _open_lease: Option<OpenDirectoryLease>,
     maintenance: MaintenanceCoordinator,
+    // Lock order: maintenance -> transaction -> DashMap/WAL. Never held across I/O outside WAL.
+    transaction: parking_lot::RwLock<()>,
     #[cfg(test)]
     mutation_observer: MutationObserver,
 }
@@ -391,6 +407,7 @@ impl DurableKeyValueStore<File> {
                 file_backing: Some(file_backing),
                 _open_lease: Some(open_lease),
                 maintenance: MaintenanceCoordinator::default(),
+                transaction: parking_lot::RwLock::new(()),
                 #[cfg(test)]
                 mutation_observer: MutationObserver::default(),
             },
@@ -429,6 +446,7 @@ impl DurableKeyValueStore<Vec<u8>> {
             file_backing: None,
             _open_lease: None,
             maintenance: MaintenanceCoordinator::disabled(),
+            transaction: parking_lot::RwLock::new(()),
             #[cfg(test)]
             mutation_observer: MutationObserver::default(),
         }
@@ -455,6 +473,7 @@ impl DurableKeyValueStore<Vec<u8>> {
             file_backing: None,
             _open_lease: None,
             maintenance: MaintenanceCoordinator::disabled(),
+            transaction: parking_lot::RwLock::new(()),
             #[cfg(test)]
             mutation_observer: MutationObserver::default(),
         })
@@ -516,6 +535,7 @@ impl<W: Write> DurableKeyValueStore<W> {
             file_backing: None,
             _open_lease: None,
             maintenance: MaintenanceCoordinator::default(),
+            transaction: parking_lot::RwLock::new(()),
             mutation_observer,
         }
     }
@@ -535,6 +555,7 @@ impl<W: Write> DurableKeyValueStore<W> {
     }
 
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        let _transaction = self.transaction.read();
         match self.store.get(key) {
             None => None,
             Some(inner_val) => {
@@ -542,6 +563,70 @@ impl<W: Write> DurableKeyValueStore<W> {
                 Some(result)
             }
         }
+    }
+
+    /// Atomically checks and replaces 1..=16 distinct keys.
+    ///
+    /// None expectations require absence; Some(empty) requires an existing empty value.
+    /// None replacements delete. Conflicts write nothing. V1/V2 framing is required;
+    /// legacy-backed stores refuse a matching batch with Unsupported.
+    /// All conditions, WAL acceptance and publication share one exclusive gate; ordinary
+    /// reads/mutations participate. Separate get calls are not a multi-key snapshot.
+    /// Durability follows the opened Buffered/Physical policy. An I/O error with failed
+    /// rollback can have an unknown durable outcome: reconcile after recovery.
+    /// Compute callbacks must not recursively access this store (including other keys).
+    pub fn try_compare_exchange_batch(
+        &self,
+        entries: &[CompareExchangeEntry],
+    ) -> std::io::Result<CompareExchangeResult> {
+        if entries.is_empty()
+            || entries.len() > 16
+            || entries
+                .iter()
+                .enumerate()
+                .any(|(index, entry)| entries[..index].iter().any(|other| other.key == entry.key))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "batch requires 1..=16 distinct keys",
+            ));
+        }
+        let _maintenance = self.maintenance.shared();
+        let _transaction = self.transaction.write();
+        for entry in entries {
+            if self.store.get(&entry.key).map(|v| v.value().clone()) != entry.expected {
+                return Ok(CompareExchangeResult::Conflict);
+            }
+        }
+        let actions = entries
+            .iter()
+            .map(|entry| match &entry.replacement {
+                Some(value) => crate::wal::ComputeAction::Put {
+                    key: entry.key.clone(),
+                    value: value.clone(),
+                },
+                None => crate::wal::ComputeAction::Delete {
+                    key: entry.key.clone(),
+                },
+            })
+            .collect();
+        self.wal.commit_kv_batch(actions)?;
+        #[cfg(test)]
+        if let Some(entry) = entries.first() {
+            self.mutation_observer
+                .notify(&entry.key, MutationPhase::AcceptedBeforePublication);
+        }
+        for entry in entries {
+            match &entry.replacement {
+                Some(value) => {
+                    self.store.insert(entry.key.clone(), value.clone());
+                }
+                None => {
+                    self.store.remove(&entry.key);
+                }
+            }
+        }
+        Ok(CompareExchangeResult::Applied)
     }
 
     pub fn put(&self, key: Vec<u8>, val: Vec<u8>) {
@@ -556,6 +641,7 @@ impl<W: Write> DurableKeyValueStore<W> {
 
     pub(crate) fn try_put_core(&self, key: Vec<u8>, val: Vec<u8>) -> std::io::Result<()> {
         let _maintenance = self.maintenance.shared();
+        let _transaction = self.transaction.read();
         if let Some(mut entry) = self.store.get_mut(&key) {
             #[cfg(test)]
             self.mutation_observer
@@ -623,6 +709,7 @@ impl<W: Write> DurableKeyValueStore<W> {
         func: impl FnOnce(Option<&[u8]>) -> Vec<u8>,
     ) -> std::io::Result<()> {
         let _maintenance = self.maintenance.shared();
+        let _transaction = self.transaction.read();
         match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
                 let new_val = func(Some(entry.get().as_slice()));
@@ -665,6 +752,7 @@ impl<W: Write> DurableKeyValueStore<W> {
         increment_by: u64,
     ) -> std::io::Result<Result<u64, ()>> {
         let _maintenance = self.maintenance.shared();
+        let _transaction = self.transaction.read();
         match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
                 let entry_bytes = entry.get().as_slice();
@@ -718,6 +806,7 @@ impl<W: Write> DurableKeyValueStore<W> {
         decrement_by: u64,
     ) -> std::io::Result<Option<Result<u64, ()>>> {
         let _maintenance = self.maintenance.shared();
+        let _transaction = self.transaction.read();
         match self.store.entry(key) {
             Entry::Occupied(mut entry) => {
                 let entry_bytes = entry.get().as_slice();
@@ -741,6 +830,7 @@ impl<W: Write> DurableKeyValueStore<W> {
     }
 
     pub fn read_number(&self, key: &[u8]) -> Option<Result<u64, ()>> {
+        let _transaction = self.transaction.read();
         self.store.get(key).map(|entry_bytes| {
             let byters_arr: [u8; 8] = match <&[u8] as std::convert::TryInto<[u8; 8]>>::try_into(
                 entry_bytes.value().as_slice(),
@@ -770,6 +860,7 @@ impl<W: Write> DurableKeyValueStore<W> {
 
     #[allow(unused)]
     pub fn contains(&self, key: &[u8]) -> bool {
+        let _transaction = self.transaction.read();
         self.store.contains_key(key)
     }
 
@@ -785,6 +876,7 @@ impl<W: Write> DurableKeyValueStore<W> {
 
     pub(crate) fn try_remove_core(&self, key: &[u8]) -> std::io::Result<()> {
         let _maintenance = self.maintenance.shared();
+        let _transaction = self.transaction.read();
         let entry = self.store.entry(key.to_vec());
         #[cfg(test)]
         self.mutation_observer
@@ -805,6 +897,7 @@ impl<W: Write> DurableKeyValueStore<W> {
     }
 
     pub fn size(&self) -> usize {
+        let _transaction = self.transaction.read();
         self.store.len()
     }
 }
@@ -813,7 +906,52 @@ impl<W: Write> DurableKeyValueStore<W> {
 #[path = "mutation_ordering_tests/key_value.rs"]
 mod mutation_ordering_tests;
 
+#[cfg(test)]
+#[path = "atomic_kv_tests.rs"]
+mod atomic_kv_tests;
+
 mod tests {
+    #[test]
+    fn conditional_batch_commits_and_rejects_stale_values_without_partial_writes() {
+        use super::*;
+        let store =
+            DurableKeyValueStore::new_vec_based_with_options(DurableStoreOptions::default());
+        store.put(b"book".to_vec(), b"old".to_vec());
+        let entries = vec![
+            CompareExchangeEntry {
+                key: b"book".to_vec(),
+                expected: Some(b"old".to_vec()),
+                replacement: Some(b"new".to_vec()),
+            },
+            CompareExchangeEntry {
+                key: b"receipt".to_vec(),
+                expected: None,
+                replacement: Some(vec![]),
+            },
+        ];
+        assert_eq!(
+            store.try_compare_exchange_batch(&entries).unwrap(),
+            CompareExchangeResult::Applied
+        );
+        assert_eq!(store.get(b"book"), Some(b"new".to_vec()));
+        assert_eq!(store.get(b"receipt"), Some(vec![]));
+        assert_eq!(
+            store.try_compare_exchange_batch(&entries).unwrap(),
+            CompareExchangeResult::Conflict
+        );
+        assert_eq!(store.get(b"book"), Some(b"new".to_vec()));
+        let delete = vec![CompareExchangeEntry {
+            key: b"receipt".to_vec(),
+            expected: Some(vec![]),
+            replacement: None,
+        }];
+        assert_eq!(
+            store.try_compare_exchange_batch(&delete).unwrap(),
+            CompareExchangeResult::Applied
+        );
+        assert_eq!(store.get(b"receipt"), None);
+    }
+
     #[test]
     fn simple_test() {
         use super::*;

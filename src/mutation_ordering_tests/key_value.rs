@@ -197,6 +197,7 @@ fn different_shard_prepares_but_waits_for_busy_wal() {
         file_backing: None,
         _open_lease: None,
         maintenance: crate::maintenance_coordination::MaintenanceCoordinator::default(),
+        transaction: parking_lot::RwLock::new(()),
         mutation_observer: MutationObserver::default(),
     };
     let keys = select_shard_keys(&store.store);
@@ -300,6 +301,7 @@ fn rejected_put_and_remove_preserve_state_and_allow_progress() {
             file_backing: None,
             _open_lease: None,
             maintenance: crate::maintenance_coordination::MaintenanceCoordinator::default(),
+            transaction: parking_lot::RwLock::new(()),
             mutation_observer: MutationObserver::default(),
         };
         let key = b"key".to_vec();

@@ -1277,27 +1277,32 @@ impl<W: Write> WalStorage<W> {
 
     #[cfg(test)]
     pub(crate) fn commit_compute_batch(&self, actions: Vec<ComputeAction>) -> std::io::Result<()> {
-        self.commit_compute_batch_with_format(actions, false)
+        self.commit_compute_batch_with_format(actions, false, false)
     }
 
     pub(crate) fn commit_set_compute_batch(
         &self,
         actions: Vec<ComputeAction>,
     ) -> std::io::Result<()> {
-        self.commit_compute_batch_with_format(actions, true)
+        self.commit_compute_batch_with_format(actions, true, false)
+    }
+
+    pub(crate) fn commit_kv_batch(&self, actions: Vec<ComputeAction>) -> std::io::Result<()> {
+        self.commit_compute_batch_with_format(actions, true, true)
     }
 
     pub(crate) fn commit_map_compute_batch(
         &self,
         actions: Vec<ComputeAction>,
     ) -> std::io::Result<()> {
-        self.commit_compute_batch_with_format(actions, true)
+        self.commit_compute_batch_with_format(actions, true, false)
     }
 
     fn commit_compute_batch_with_format(
         &self,
         actions: Vec<ComputeAction>,
         encode_v1: bool,
+        require_group_framing: bool,
     ) -> std::io::Result<()> {
         if actions.is_empty() {
             return Ok(());
@@ -1305,6 +1310,12 @@ impl<W: Write> WalStorage<W> {
 
         let mut state = self.wal_state.write().unwrap();
         ensure_ready(&state.health)?;
+        if require_group_framing && matches!(state.format, WalFormat::Legacy) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "atomic KV batches require V1 or V2 group framing",
+            ));
+        }
         if matches!(state.format, WalFormat::V2) {
             let count = u32::try_from(actions.len()).map_err(|_| {
                 std::io::Error::new(
@@ -1962,6 +1973,10 @@ fn rollback_vec(bytes: &mut Vec<u8>, checkpoint: usize) -> std::io::Result<()> {
 }
 
 pub(crate) enum ComputeAction {
+    Put {
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
     Delete {
         key: Vec<u8>,
     },
@@ -1986,6 +2001,9 @@ pub(crate) enum ComputeAction {
 
 fn stored_compute_action(offset: u32, action: ComputeAction) -> StoredAction {
     match action {
+        ComputeAction::Put { key, value } => {
+            StoredAction::put_action(&offset, &KeyValueData::new(key, value))
+        }
         ComputeAction::Delete { key } => StoredAction::delete_action(&offset, &key),
         ComputeAction::SetAppend { key, value } => {
             StoredAction::append_to_set(&offset, &KeyValueData::new(key, value))
@@ -2012,6 +2030,9 @@ fn encode_compute_batch(
     let mut offset = start_offset;
     for action in actions {
         let stored = match action {
+            ComputeAction::Put { key, value } => {
+                StoredAction::put_action(&offset, &KeyValueData::new(key, value))
+            }
             ComputeAction::Delete { key } => StoredAction::delete_action(&offset, &key),
             ComputeAction::SetAppend { key, value } => {
                 StoredAction::append_to_set(&offset, &KeyValueData::new(key, value))
