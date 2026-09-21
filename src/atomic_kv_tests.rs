@@ -43,7 +43,7 @@ fn batch_committed_during_online_compaction_is_one_delta_and_survives_cutover() 
 }
 
 #[test]
-fn competing_batches_have_one_winner_and_no_extra_receipt() {
+fn competing_batches_have_one_winner_and_losers_write_nothing() {
     let store = Arc::new(DurableKeyValueStore::new_vec_based_with_options(
         DurableStoreOptions::default(),
     ));
