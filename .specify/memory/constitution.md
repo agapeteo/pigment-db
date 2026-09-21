@@ -13,6 +13,39 @@ Sync Impact Report
   - Concrete governance and semantic-versioning rules
 - Removed sections: template-only placeholder content and example comments
 - Follow-up TODOs: none
+
+Sync Impact Report
+- Version change: 1.0.0 -> 1.1.0 (MINOR: principle added, mandatory review
+  guidance expanded; nothing removed or redefined)
+- Added principles:
+  - VI. Consumer-Agnostic Library (NON-NEGOTIABLE)
+- Modified sections:
+  - Development Workflow and Quality Gates: item 6 names each principle's cure
+    (VI is cured by its own remedy, not by amending a feature spec); item 7 —
+    Principle VI is settled first in every review and Constitution Check.
+- Dependent artifacts:
+  - .specify/templates/plan-template.md: updated (VI added as the first gate)
+- Compatibility impact: none on persisted data or the public API.
+- Active work to revalidate before it resumes (Governance):
+  - Branch admin-console-for-panta-studio: db490a7 (specs/010, titled for Studio
+    administration), ce50b4f (bounded key-set pagination), 7aff8ad (batch limits
+    raised for one consumer's grouped publication), 07d1ef9 (wip(021) storage
+    work). Consumer-specific as held; any generic primitive is re-landed from
+    main under VI.
+  - Branch safety/admin-console-20260921-pigment-pre-wip: db490a7, ce50b4f and
+    7aff8ad (not 07d1ef9).
+- Consumer vocabulary on main at adoption (the closed list VI refers to),
+  rewritten before this amendment was committed, by 225456b:
+  - specs/009-atomic-kv-batch: spec.md stated requirements in one
+    application's terms (books, editions, TTS, receipts); plan.md named the
+    application outside a Motivation note and stated the design as
+    "book+usage+absent receipt". Now in storage terms, with the consumer in
+    marked Motivation notes; the verification.md cross-project evidence stays.
+  - src/atomic_kv_tests.rs:46: the test
+    competing_batches_have_one_winner_and_no_extra_receipt is now
+    competing_batches_have_one_winner_and_losers_write_nothing (its
+    b"book"/b"receipt" keys are opaque bytes and stay).
+  - The atomic compare-exchange batch code on main is generic and stays.
 -->
 # pigment-db Constitution
 
@@ -86,6 +119,76 @@ be deferred to separately approved work. A plan that introduces additional
 complexity MUST name the governing requirement and the simpler alternative it
 rejects.
 
+### VI. Consumer-Agnostic Library (NON-NEGOTIABLE)
+
+pigment-db is a general-purpose embedded storage library. Its consumers — penpack,
+and every application built on penpack — MUST NOT be visible in it. Its API, types,
+persisted formats, limits, errors, tests, fixtures, branch names, and spec
+directory names and titles MUST be stated in the library's own vocabulary: keys,
+values, sets, sorted maps, batches, snapshots, segments, the WAL, compaction and
+recovery.
+
+A change is consumer-specific, and MUST be refused, if it adds:
+
+- a consumer's or application's name, or a term used in a consumer's sense
+  (penpack itself; penpack's hosts, tenants, content versions, endpoints, WASM
+  modules or accounts; any application's domain objects), in an identifier, type,
+  error, limit, cargo feature, branch name, or spec directory or title. A word the
+  library already uses in its own sense — a format or WAL version, a Rust module, a
+  key, a set, a snapshot — is not a hit;
+- a consumer's key format, prefix or separator (`<PP_`, `{host}|`), record
+  encoding, or limit;
+- an API whose contract can only be described in a consumer's concepts, or whose
+  parameters encode one consumer feature's sequence of calls;
+- behaviour, coordination or a limit whose scope, keys or timing encode one
+  consumer's workflow.
+
+A primitive motivated by one consumer is admissible only when it is stated in the
+library's own vocabulary, any consumer can use it unchanged through the public API
+with its own parameters, it lands as its own specification and change on this
+repository's `main` branch **before** any consumer pins it, and it satisfies
+Principles I–V on its own. Atomic compare-exchange batches and bounded snapshots
+are examples of the admissible shape. A revision reachable only from a branch named
+for a consumer or an application is not admissible, whatever its code contains.
+The change description MUST name the motivating consumer. Prose MAY name a
+consumer only as provenance — a marked Motivation note, cross-project
+verification evidence, or a comment or changelog note citing the consumer defect
+a fix addresses or the consumer whose compatibility a constraint protects — and
+every requirement MUST still hold with the name removed. Tests MAY use consumer-shaped values only as opaque bytes.
+
+Classification is of the aggregate. The change description MUST name the consumer
+feature it serves, and concealing it is itself a violation. A library change whose
+motivating consumer feature is refused under that consumer's own constitution is
+refused here too, however it is worded, and a set of library changes whose only
+combined use is one consumer feature is judged as one change.
+
+Principle V bounds how much a change does; this principle bounds whose requirement
+it serves. Satisfying V, or holding an approved specification, does not satisfy VI.
+
+Consumer vocabulary already on `main` when this principle was adopted (1.1.0) is
+listed in the Sync Impact Report and was rewritten before the principle was
+committed. That list is closed: vocabulary found later is a violation, not debt.
+
+A violation is a **CRITICAL architectural defect**. It blocks implementation,
+merge and release however correct or well tested the code is, and no feature
+document, plan or per-feature approval waives it; only an amendment of this
+principle can. Consumer-specific code is removed, not repaired in place, and any
+generic primitive inside it is re-landed from `main` under the conditions above.
+Specification prose written in a consumer's terms is rewritten; a persisted format
+or public API already shipped is never removed to cure prose. A removal follows
+Principle I: its RED is a public-behaviour test that fails while the
+consumer-specific behaviour exists, such as a batch the consumer-shaped limit
+refuses or a key the consumer's format mishandles.
+
+**Rationale**: penpack's merge `961ab82` (2026-09-18, rolled back 2026-09-21)
+pinned pigment-db `db490a7`, a bounded-snapshot change made on the branch
+`admin-console-for-panta-studio`, whose spec is titled "Bounded key-set snapshots
+for Studio administration" and calls itself an "approved narrow dependency" of one
+application's admin console. The revision was on no `main` branch. Its code was
+generic; its branch, specification and purpose were not. Principle V was satisfied
+— the specification was approved — and nothing here asked whose requirement the
+change served.
+
 ## Project Constraints
 
 - pigment-db remains a Rust library crate; production dependencies MUST NOT be
@@ -118,7 +221,14 @@ rejects.
    MUST run their deterministic conformance or benchmark gates.
 6. Reviews MUST cite evidence for correctness, compatibility, and applicable
    performance claims. A constitution violation blocks implementation or release
-   until the governing artifact is amended through the process below.
+   until it is cured: for Principles I–V, by fixing the change or amending the
+   governing artifact through the process below; for Principle VI, by the remedy
+   that principle states.
+7. Every review and every plan's Constitution Check MUST settle Principle VI
+   **first**, before correctness, compatibility or performance, recording a scan of
+   the whole change for consumer and application vocabulary, the motivating
+   consumer, and the `main`-branch revision any consumer will pin. A review that
+   reports no Principle VI classification is incomplete.
 
 ## Governance
 
@@ -142,4 +252,4 @@ Every code review and Spec Kit analysis MUST verify applicable constitutional
 rules. Exceptions require an explicit, approved constitution amendment; a feature
 document alone cannot waive a principle.
 
-**Version**: 1.0.0 | **Ratified**: 2026-08-06 | **Last Amended**: 2026-08-06
+**Version**: 1.1.0 | **Ratified**: 2026-08-06 | **Last Amended**: 2026-09-21
