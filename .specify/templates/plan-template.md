@@ -46,7 +46,9 @@ per-feature approval can waive it).** Record before any other gate:
 - [ ] Scan of the whole change for consumer and application vocabulary (penpack, `<PP_`, and
       penpack's or any application's terms used in that sense): no hit in an identifier, type,
       error, limit, API or spec title. Hits are allowed only in a marked Motivation note, in
-      cross-project verification evidence, or as opaque test bytes.
+      cross-project verification evidence, in a comment or changelog note citing the consumer
+      defect a fix addresses or the consumer whose compatibility a constraint protects, or as
+      opaque test bytes.
 - [ ] The contract is stated in the library's own vocabulary and any consumer can use it unchanged.
 - [ ] Motivating consumer and consumer feature: [name, or "none"]. If that feature is part of a
       larger consumer change, it is judged with the rest of it.

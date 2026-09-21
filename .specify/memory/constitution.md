@@ -44,7 +44,7 @@ Sync Impact Report
   - src/atomic_kv_tests.rs:46: the test
     competing_batches_have_one_winner_and_no_extra_receipt is now
     competing_batches_have_one_winner_and_losers_write_nothing (its
-    b"book"/b"receipt" keys are opaque bytes and stay).
+    b"book"/b"receipt" bytes are opaque test data and stay).
   - The atomic compare-exchange batch code on main is generic and stays.
 -->
 # pigment-db Constitution
