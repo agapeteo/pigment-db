@@ -54,13 +54,20 @@ This is spec 011. Earlier work used the number 010 three times:
   - **Identity.** A directory is known by its canonical path, which also locates both lock files.
     - A symlink alias whose target does not exist, because a compaction has moved the directory
       aside, is followed by hand, up to 40 links. So it still names the directory it points to.
-    - Recovery at open reads the maintenance artifacts of that canonical directory whenever the
-      path given is a symlink. For any other path it uses the path given, so errors name it.
+    - Every path is read lexically first (a trailing separator or `.` removed) before it is
+      asked whether it is a symlink. The system follows the link for `alias/` or `alias/.`, and
+      would hide it.
+    - Recovery at open reads the canonical directory's maintenance artifacts whenever the path's
+      last component is not the directory's own name: a symlink however spelled, or a path ending
+      in `.` or `..`. For any other path it uses the path given, so errors name it.
   - **A held inner lock must still be the directory's.** An open stalled after taking the inner
     lock can end up holding the lock file of a directory that a compaction then retired. Before
     an open or a claim goes on, a held inner lock is checked against the file now at the lock
-    path, by device and inode, and re-taken if they differ. Windows std exposes no stable file
-    identity, so there a held lock is kept (Known limitations).
+    path, by device and inode, and re-taken if they differ. The check runs outside the registry's
+    mutex. Two threads that both find it stale compare holdings, not inodes, because the retired
+    file's inode can be given to the new one. A lock path that cannot be read for a reason other
+    than absence keeps the held lock. Windows std exposes no stable file identity, so there a
+    held lock is kept (Known limitations).
 - **FR-3 Refusal.**
   - An open of a directory another live process owns fails before any store artifact is opened,
     created or written. This covers `try_init_new`, `try_init_new_with_options` and `init_new` of
@@ -202,6 +209,10 @@ This is spec 011. Earlier work used the number 010 three times:
     illumos, AIX or GNU/Hurd, where one build locks and the other skips.
   - Closed compaction through a symlinked store path replaces the symlink rather than the directory.
     That defect predates this spec and is tracked separately.
+  - A store's files are opened through the path given, while its ownership is keyed by the
+    directory that path named when it was opened. So repointing a symlink on the store path
+    while a store is open, or while it is being opened, is unsupported: the open store would
+    write into a directory it does not own. This predates this spec.
   - On Windows a held inner lock is not checked against the file at the lock path (FR-2), since
     std exposes no stable file identity there. An open stalled across a whole compaction can
     therefore keep the retired directory's lock, and a view of the directory created afterwards
@@ -284,9 +295,13 @@ These unit tests use private seams or fixtures:
 | Opener stalled earlier | The same, stalled just after its maintenance check, with PreviousPublished/ManifestPublish added. | Refused by the replacement lock at every point, including those at which the directory is moved aside. |
 | Inner lock in flight | A second family opens while the first is taking the inner lock after recovery, and another holder has that lock; or the first attempt panics. | The second family waits. It is refused while the other holder has the lock, and takes the lock itself after a panic. |
 | A directory named like the lock file | It appears in the source after the claim retired its lock. | The compaction fails closed and publishes nothing. |
-| Alias, moved aside (Unix) | An open through a symlink alias while a compaction has moved the directory aside. | Refused by the claim's replacement lock. |
-| Alias, recovery (Unix) | An open through a symlink alias after a compaction was interrupted. | It recovers the directory it names, and its writes survive a later open of the real path. |
-| Retired inner lock (Unix) | An open stalled after taking the inner lock while a compaction replaces the directory. | Before going live it holds the lock of the directory in place. |
+| Alias, moved aside (Unix) | An open through a symlink alias, spelled `alias`, `alias/`, `alias/.` or through a link whose target ends in `/`, while a compaction has moved the directory aside. | Refused by the claim's replacement lock. |
+| Alias, recovery (Unix) | An open through the same spellings after a compaction was interrupted. | It recovers the directory it names, and its writes survive a later open of the real path. |
+| Retired inner lock (Unix) | An open stalled after taking the inner lock while a compaction replaces the directory; the lock path left empty, or holding another file. | Before going live it holds the lock of the directory in place. |
+| Replaced lock, later family (Unix) | The held lock file is replaced at its path, then another family opens. | The later family holds the current file's lock. |
+| Retired lock, claim (Unix) | The same interleaving for a closed-maintenance claim. | After `ensure_inner_lock` the claim holds the current file's lock, and retires it. |
+| Two stale verdicts (Unix) | Two families find the lock stale; one is parked while the other re-takes it. | The parked one keeps the re-taken lock. |
+| Held-lock check stalled | The check for one directory is stalled. | Other directories open and drop (FR-13). |
 | Lock file in `.previous` | A replaced generation holds `.pigment-lock`. | Both cleanups delete it. A directory of that name keeps cleanup pending. |
 | Recovering owners | An open, or a claim paused while staging, recovers an interrupted compaction. | Each holds the inner lock and records its process id. |
 | Progress | Lock-file I/O for one directory is stalled, at entry creation and again after recovery. | Other directories open and drop. |

@@ -4,7 +4,8 @@ Measured on Linux 7.1 with rustc 1.97.1, on branch `011-cross-process-directory-
 `af25792` to `e03c2a1`. A review of that revision found three defects and several gaps. They were
 fixed from `1b79628` to `f57bdde`, and "Review fixes" below records that evidence. A re-review of
 `c026816` found two more defects, fixed from `01f0200` to `583ddbb` ("Second review" below). A check
-of that fix found three more, fixed in `6a5b20b` ("Third review").
+of that fix found three more, fixed in `6a5b20b` ("Third review"). A check of that found two more,
+fixed in `cfc8cb5` ("Fourth review").
 
 ## Suites
 
@@ -15,6 +16,7 @@ of that fix found three more, fixed in `6a5b20b` ("Third review").
 | `f57bdde` | 597 | 0 | 28 | 26 |
 | `583ddbb` | 602 | 0 | 28 | 26 |
 | `6a5b20b` | 605 | 0 | 28 | 26 |
+| `cfc8cb5` | 611 | 0 | 28 | 26 |
 
 The extra ignored test is `directory_lock::child_entry`, the child-process role runner.
 
@@ -345,3 +347,57 @@ Checks at `6a5b20b`:
 - `cargo fmt --check` is clean.
 - Clippy reports nothing on Linux, and only the 14 warnings that predate the branch for Windows.
 - The ownership, progress and lock-error tests passed 15 runs out of 15.
+
+## Fourth review
+
+A focused check of `6a5b20b` ran at `68be84f`, with two lenses: identity and recovery path, and
+the held-lock re-verification.
+
+**Two HIGH bypasses of the alias fixes, each measured losing an acknowledged write.**
+- `lstat` of `alias/` or `alias/.` follows the link, so the path looked like a directory.
+  - Recovery through `alias/` found nothing and went live.
+  - While the directory was moved aside, the identity of `alias/`, or of a chain whose middle
+    link's target ends in `/`, fell back to the link's own name.
+- Paths are now read lexically before every lstat.
+- RED: the two alias tests, extended to those spellings, failed on `alias/`: `NotFound` for the
+  moved-aside open, and status `Normal` for recovery.
+
+**MEDIUM.**
+- The re-lock after a stale verdict compared inodes. The review measured inode reuse letting a
+  second family release the first's fresh lock, 5 times in 20. It now compares a process-unique
+  token.
+- Four behaviours had no test:
+  - a file left at the lock path;
+  - two families together;
+  - a later family;
+  - the claim path.
+
+**Pre-existing, and not fixed:**
+- Paths ending in `.` or `..` were refused at recovery. They are now fixed as well.
+- Repointing a symlink on the store path while a store is open makes it write into another
+  directory. This is recorded as a Known limitation, because fixing it means opening every
+  artifact through the identity, which changes the paths errors name.
+
+Neutralizations, each failing its test (every file restored and checked against its sha256):
+
+| Neutralization | Failing test |
+|---|---|
+| The identity not normalized | the moved-aside alias test; the identity unit test |
+| The recovery path not normalized | the alias recovery test; the recovery-path unit test |
+| The `.`/`..` rule removed | the recovery-path unit test |
+| The re-lock comparing nothing | `a_second_stale_verdict_keeps_the_lock_the_first_re_took` |
+| Any file at the lock path counting as held | the retired-lock test, with a file left |
+| Only the first owner verifying | the later-family test |
+| A claim trusting its held lock | the claim test |
+| The held-lock check under the registry mutex | the FR-13 held-lock test |
+
+Checks at `cfc8cb5`:
+- Suite: 611 passed, 0 failed, 28 ignored, across 26 binaries.
+- `cargo fmt --check` is clean.
+- Clippy reports nothing on Linux. For Windows it reports only the 14 warnings that predate the
+  branch; two test-only items were scoped to Unix to keep it there.
+- The ownership, progress, lock-error and identity tests passed 15 runs out of 15.
+
+Still unpinned:
+- the four mutations listed under "Third review";
+- the early exit that follows a stale verdict another thread has overtaken, which no seam reaches.

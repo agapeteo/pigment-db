@@ -81,9 +81,12 @@ changes. `rust-version = "1.91"` is declared, and a CI job checks every target o
 - **Checks that can go stale.** Each check the open makes can be overtaken by another process's
   compaction, so a check is re-asked where its answer decides something:
   - An alias's identity is computed even while its target is moved aside, by following the link.
-  - Recovery through a symlink reads the canonical directory's artifacts.
+    Paths are read lexically first, since `lstat` follows a link spelled `alias/`.
+  - Recovery reads the canonical directory's artifacts for any path whose last component is not
+    the directory's own name.
   - A held inner lock is compared with the file at the lock path before going live, by device and
-    inode. The comparison runs outside the mutex. Windows has no such comparison.
+    inode. The comparison runs outside the mutex. Two threads that find it stale compare
+    holdings by a process-unique token, since inodes are reused. Windows has no such comparison.
 - **Unwinding.** A panic while an entry is `Pending` removes the entry, through a guard that is
   disarmed once creation returns. Otherwise every later open of that directory would wait forever.
 

@@ -90,3 +90,13 @@ Fixes after the check of `2170d23`:
     (`Normal`); a stalled open went live on a retired lock.
   - GREEN: the three fixes (`6a5b20b`).
 - [x] T023 Correct the documents after the check.
+
+Fixes after the check of `68be84f`:
+
+- [x] T024 Read paths lexically before any lstat; recover through the identity for `.`- and
+  `..`-terminated paths; identify a held lock by holding, not inode; keep it when its path cannot
+  be read:
+  - RED: the alias tests extended with `alias/`, `alias/.` and a slash-terminated chain.
+  - Pins, confirmed by neutralization: identity unit tests, two stale verdicts, a file left at the
+    lock path, a later family, a claim, and the held-lock check under FR-13 (`cfc8cb5`).
+- [x] T025 Correct the documents after the check.
