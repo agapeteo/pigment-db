@@ -286,6 +286,17 @@ struct LockFile {
     /// Which file this is, where the platform says (device and inode on Unix), so an owner can
     /// tell whether the file it holds is still the one at the lock path.
     id: Option<FileId>,
+    /// Unique among this process's lock files. It tells two holdings apart where `id` cannot: a
+    /// retired file's inode is freed when its last descriptor closes, and a new lock file can
+    /// then be given the same number.
+    token: u64,
+}
+
+/// The source of `LockFile::token`.
+static NEXT_LOCK_TOKEN: AtomicU64 = AtomicU64::new(0);
+
+fn next_lock_token() -> u64 {
+    NEXT_LOCK_TOKEN.fetch_add(1, Ordering::Relaxed)
 }
 
 /// A file's identity: device and inode. std exposes no stable equivalent on Windows.
@@ -307,15 +318,20 @@ fn file_id(file: &std::fs::File) -> Option<FileId> {
 }
 
 /// Whether the file identified by `held` is still the one at `path`. A file that cannot be
-/// identified is taken to be; a path with no file, or another file, is not.
+/// identified is taken to be, and so is one whose path cannot be read for a reason other than
+/// absence; a path with no file, or with another file, is not.
 fn still_at(held: Option<FileId>, path: &Path) -> bool {
+    #[cfg(test)]
+    if let Some(directory) = path.parent() {
+        lock_seams::before_held_lock_check(directory);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         match (held, std::fs::symlink_metadata(path)) {
             (None, _) => true,
             (Some(id), Ok(metadata)) => (metadata.dev(), metadata.ino()) == id,
-            (Some(_), Err(_)) => false,
+            (Some(_), Err(error)) => error.kind() != io::ErrorKind::NotFound,
         }
     }
     #[cfg(not(unix))]
@@ -381,6 +397,7 @@ impl LockFile {
                     file,
                     locked: true,
                     id,
+                    token: next_lock_token(),
                 })
             }
             Err(std::fs::TryLockError::WouldBlock) => Err(held_refusal(&file, path, identity)),
@@ -402,6 +419,7 @@ impl LockFile {
                     file,
                     locked: false,
                     id: None,
+                    token: next_lock_token(),
                 })
             }
             Err(std::fs::TryLockError::Error(error)) => Err(io::Error::new(
@@ -553,6 +571,9 @@ fn canonical_directory_identity(store_dir: &Path) -> io::Result<PathBuf> {
     // directory that another process's closed compaction has moved aside. Keyed by the link's own
     // name, the open would check another directory's lock files and maintenance artifacts, and
     // miss the claim that is replacing this one (FR-2).
+    // Lexically first: `lstat` of `alias/` or `alias/.` follows the link, so a trailing separator
+    // or `.` would hide the very symlink this looks for.
+    cursor = cursor.components().collect();
     let mut hops = 0;
     while std::fs::symlink_metadata(&cursor).is_ok_and(|metadata| metadata.file_type().is_symlink())
     {
@@ -570,7 +591,9 @@ fn canonical_directory_identity(store_dir: &Path) -> io::Result<PathBuf> {
         cursor = match cursor.parent() {
             Some(parent) if target.is_relative() => parent.join(target),
             _ => target,
-        };
+        }
+        .components()
+        .collect();
         if let Ok(canonical) = std::fs::canonicalize(&cursor) {
             return Ok(canonical);
         }
@@ -757,6 +780,18 @@ fn with_entry<T>(
     }
 }
 
+fn maintenance_path_for(store_dir: &Path, identity: &Path) -> PathBuf {
+    let normal: PathBuf = store_dir.components().collect();
+    let names_itself = normal.file_name().is_some()
+        && !std::fs::symlink_metadata(&normal)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink());
+    if names_itself {
+        store_dir.to_path_buf()
+    } else {
+        identity.to_path_buf()
+    }
+}
+
 /// Returns a directory's inner lock from `Acquiring` to `Absent` when the thread taking it unwinds,
 /// so the opens waiting on that attempt take the lock themselves.
 struct AcquiringInnerLock<'a> {
@@ -837,8 +872,8 @@ fn ensure_inner_lock(identity: &Path) -> io::Result<()> {
         if !state.takes_locks {
             return Ok(());
         }
-        let held = match &state.inner {
-            InnerLock::Held(lock) => lock.id,
+        let (held, token) = match &state.inner {
+            InnerLock::Held(lock) => (lock.id, lock.token),
             // Another thread's attempt decides whether this open may go live: wait for it.
             InnerLock::Acquiring => {
                 drop(registry);
@@ -858,7 +893,9 @@ fn ensure_inner_lock(identity: &Path) -> io::Result<()> {
         let Some(Slot::Owned(state)) = registry.get_mut(identity) else {
             return Ok(());
         };
-        if matches!(&state.inner, InnerLock::Held(lock) if lock.id == held) {
+        // The same holding, not merely a file with the same inode: another thread may have
+        // re-taken the lock meanwhile, and its new file may have been given the retired inode.
+        if matches!(&state.inner, InnerLock::Held(lock) if lock.token == token) {
             let stale = std::mem::replace(&mut state.inner, InnerLock::Acquiring);
             drop(registry);
             drop(stale);
@@ -907,14 +944,13 @@ impl OpenDirectoryLease {
         ensure_inner_lock(&self.identity)
     }
 
-    /// The path recovery reads for `store_dir`. A symlink's own name locates no maintenance
-    /// artifacts of the directory it names, so for a symlink it is the directory's identity.
-    /// Otherwise it is `store_dir` itself, so that errors keep naming the path the caller gave.
+    /// The path recovery reads for `store_dir`. Maintenance artifacts are named from the path's
+    /// last component, so a path whose last component is not the directory's own name locates
+    /// none of them: a symlink, written with or without a trailing separator or `.`, and a path
+    /// ending in `.` or `..`. For those it is the directory's identity. Otherwise it is
+    /// `store_dir` itself, so that errors keep naming the path the caller gave.
     pub(crate) fn maintenance_path(&self, store_dir: &Path) -> PathBuf {
-        match std::fs::symlink_metadata(store_dir) {
-            Ok(metadata) if metadata.file_type().is_symlink() => self.identity.clone(),
-            _ => store_dir.to_path_buf(),
-        }
+        maintenance_path_for(store_dir, &self.identity)
     }
 }
 
@@ -1062,10 +1098,13 @@ pub(crate) mod lock_seams {
         LockFileOpen,
         /// In an open of the directory, just after it first looked for maintenance artifacts.
         AfterMaintenanceCheck,
+        /// Before a held inner lock is compared with the file at the directory's lock path.
+        HeldLockCheck,
     }
 
-    /// Stalls, each with its gate: `(entered, released)`.
-    static STALLS: Mutex<Vec<(StallPoint, PathBuf, Gate)>> = Mutex::new(Vec::new());
+    /// Stalls, each with its gate, `(entered, released)`, and whether it stops only the first
+    /// thread to arrive.
+    static STALLS: Mutex<Vec<(StallPoint, PathBuf, Gate, bool)>> = Mutex::new(Vec::new());
     /// How long a test waits for an open to reach its stall before failing.
     const STALL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
     /// Lock errors reported in place of a real attempt.
@@ -1105,16 +1144,23 @@ pub(crate) mod lock_seams {
         stall_at(StallPoint::AfterMaintenanceCheck, identity);
     }
 
+    pub(super) fn before_held_lock_check(directory: &Path) {
+        stall_at(StallPoint::HeldLockCheck, directory);
+    }
+
     fn stall_at(point: StallPoint, directory: &Path) {
         let gate = guard(&STALLS)
             .iter()
-            .find(|(at, stalled, _)| *at == point && stalled == directory)
-            .map(|(_, _, gate)| gate.clone());
-        let Some(gate) = gate else {
+            .find(|(at, stalled, _, _)| *at == point && stalled == directory)
+            .map(|(_, _, gate, once)| (gate.clone(), *once));
+        let Some((gate, once)) = gate else {
             return;
         };
         let (state, signal) = &*gate;
         let mut flags = state.lock().unwrap();
+        if once && flags.0 {
+            return;
+        }
         flags.0 = true;
         signal.notify_all();
         while !flags.1 {
@@ -1169,9 +1215,19 @@ pub(crate) mod lock_seams {
         }
 
         pub(crate) fn install_at(directory: &Path, point: StallPoint) -> Self {
+            Self::install_with(directory, point, false)
+        }
+
+        /// Stalls only the first thread to arrive; any later one goes on.
+        #[cfg(unix)]
+        pub(crate) fn install_once_at(directory: &Path, point: StallPoint) -> Self {
+            Self::install_with(directory, point, true)
+        }
+
+        fn install_with(directory: &Path, point: StallPoint, once: bool) -> Self {
             let directory = super::canonical_directory_identity(directory).unwrap();
             let gate: Gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
-            guard(&STALLS).push((point, directory.clone(), gate.clone()));
+            guard(&STALLS).push((point, directory.clone(), gate.clone(), once));
             Self {
                 point,
                 directory,
@@ -1204,7 +1260,7 @@ pub(crate) mod lock_seams {
             let (state, signal) = &*self.gate;
             state.lock().unwrap().1 = true;
             signal.notify_all();
-            guard(&STALLS).retain(|(point, directory, _)| {
+            guard(&STALLS).retain(|(point, directory, _, _)| {
                 !(*point == self.point && directory == &self.directory)
             });
         }
@@ -1218,12 +1274,128 @@ pub(crate) mod lock_seams {
 }
 
 #[cfg(test)]
+mod identity_tests {
+    //! How an open names its directory, and where recovery looks (specs/011, FR-2).
+
+    use super::maintenance_path_for;
+    use std::path::Path;
+
+    #[test]
+    fn recovery_uses_the_identity_only_where_the_path_does_not_name_the_directory_itself() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("store");
+        std::fs::create_dir_all(store.join("sub")).unwrap();
+        let identity = std::fs::canonicalize(&store).unwrap();
+
+        for names_itself in [store.clone(), store.join(".")] {
+            assert_eq!(
+                maintenance_path_for(&names_itself, &identity),
+                names_itself,
+                "{}",
+                names_itself.display()
+            );
+        }
+        for other in [store.join("sub").join(".."), Path::new(".").to_path_buf()] {
+            assert_eq!(
+                maintenance_path_for(&other, &identity),
+                identity,
+                "{}",
+                other.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            let alias = root.path().join("alias");
+            std::os::unix::fs::symlink(&store, &alias).unwrap();
+            for spelled in [alias.clone(), root.path().join("alias/"), alias.join(".")] {
+                assert_eq!(
+                    maintenance_path_for(&spelled, &identity),
+                    identity,
+                    "{}",
+                    spelled.display()
+                );
+            }
+        }
+    }
+
+    /// A dangling alias names the directory it points to, however it is spelled, including
+    /// through a link whose target ends in a separator.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_alias_names_its_target_however_it_is_spelled() {
+        use super::canonical_directory_identity;
+
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("store");
+        std::os::unix::fs::symlink(&store, root.path().join("alias")).unwrap();
+        std::os::unix::fs::symlink(&store, root.path().join("mid")).unwrap();
+        std::os::unix::fs::symlink("mid/", root.path().join("outer")).unwrap();
+        let expected = std::fs::canonicalize(root.path()).unwrap().join("store");
+
+        for spelled in ["alias", "alias/", "alias/.", "alias//", "outer", "outer/"] {
+            assert_eq!(
+                canonical_directory_identity(&root.path().join(spelled)).unwrap(),
+                expected,
+                "{spelled}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod progress_tests {
     //! FR-13 (specs/011): lock-file I/O for one directory must not hold up other directories.
 
     use super::lock_seams::Stall;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    /// The check of a held inner lock against the file at its path runs outside the registry's
+    /// mutex too: while it is stalled for one directory, another directory opens and a third
+    /// directory's store is dropped.
+    #[test]
+    fn a_stalled_held_lock_check_holds_up_no_other_directory() {
+        use super::lock_seams::StallPoint;
+
+        let checked = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let dropped = tempfile::tempdir().unwrap();
+        let first = crate::key_value_store::DurableKeyValueStore::try_init_new(checked.path())
+            .unwrap()
+            .into_store();
+        let held = crate::key_value_store::DurableKeyValueStore::try_init_new(dropped.path())
+            .unwrap()
+            .into_store();
+        let stall = Stall::install_at(checked.path(), StallPoint::HeldLockCheck);
+
+        let checked_path = checked.path().to_path_buf();
+        let second_family = std::thread::spawn(move || {
+            crate::key_set_store::DurableKeySetStore::try_init_new(&checked_path).is_ok()
+        });
+        stall.wait_entered();
+
+        let (done, finished) = mpsc::channel();
+        let other_path = other.path().to_path_buf();
+        std::thread::spawn(move || {
+            let opened =
+                crate::key_value_store::DurableKeyValueStore::try_init_new(&other_path).is_ok();
+            drop(held);
+            let _ = done.send(opened);
+        });
+        let progressed = finished.recv_timeout(Duration::from_secs(5));
+
+        stall.release();
+        let second_opened = second_family.join().unwrap();
+        let _ = finished.recv_timeout(Duration::from_secs(30));
+        drop(first);
+
+        assert_eq!(
+            progressed,
+            Ok(true),
+            "another directory's open and a third's drop waited behind a held-lock check"
+        );
+        assert!(second_opened);
+    }
 
     #[test]
     fn a_stalled_lock_file_holds_up_no_other_directory() {
