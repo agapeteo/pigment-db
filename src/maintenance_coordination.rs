@@ -7,6 +7,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::Duration;
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -192,6 +193,13 @@ impl Drop for StagingGenerationGuard {
     }
 }
 
+/// A directory's registry slot. `Pending` while the thread creating the entry opens its lock
+/// files outside the registry mutex; another thread opening the same directory waits for it.
+enum Slot {
+    Pending,
+    Owned(OwnershipState),
+}
+
 struct OwnershipState {
     open_leases: usize,
     closed_claimed: bool,
@@ -199,12 +207,42 @@ struct OwnershipState {
     /// a closed claim covers.
     takes_locks: bool,
     /// This process's hold on `<store>/.pigment-lock`, the steady-state lock that every view of
-    /// the directory shares. Absent while directory-level maintenance is being recovered, and
-    /// after a closed compaction has retired it.
-    inner: Option<LockFile>,
+    /// the directory shares.
+    inner: InnerLock,
     /// This process's hold on `<parent>/.<name>.pigment-lock`, which guards the phases in which
     /// the directory itself is replaced.
-    _replacement: Option<LockFile>,
+    replacement: Option<LockFile>,
+}
+
+impl OwnershipState {
+    fn new(takes_locks: bool, inner: Option<LockFile>, replacement: Option<LockFile>) -> Self {
+        Self {
+            open_leases: 0,
+            closed_claimed: false,
+            takes_locks,
+            inner: inner.map_or(InnerLock::Absent, InnerLock::Held),
+            replacement,
+        }
+    }
+
+    /// Unlocks every lock this entry holds; the files close when the entry is dropped.
+    fn unlock_all(&self) {
+        if let InnerLock::Held(lock) = &self.inner {
+            lock.unlock();
+        }
+        if let Some(lock) = &self.replacement {
+            lock.unlock();
+        }
+    }
+}
+
+enum InnerLock {
+    Held(LockFile),
+    /// Not held: while directory-level maintenance is being recovered, for a directory that does
+    /// not exist, after a closed compaction retired it, or for an entry that takes no locks.
+    Absent,
+    /// One thread is taking it after a recovery; others go on without waiting.
+    Acquiring,
 }
 
 /// The name of the inner lock file, inside the store directory.
@@ -226,13 +264,19 @@ struct LockFile {
     file: std::fs::File,
 }
 
-impl Drop for LockFile {
-    /// Unlocks before the file closes. A child process spawned by any thread keeps a copy of the
-    /// descriptor until it execs, and the lock belongs to the open file description, so closing
-    /// alone would leave it held for as long as the child takes to exec: measured, 312 of 400
-    /// immediate reopens were refused.
-    fn drop(&mut self) {
+impl LockFile {
+    /// Releases the lock without closing the file. A child process spawned by any thread keeps a
+    /// copy of the descriptor until it execs, and the lock belongs to the open file description,
+    /// so closing alone would leave it held for as long as the child takes to exec: measured, 312
+    /// of 400 immediate reopens were refused.
+    fn unlock(&self) {
         let _ = self.file.unlock();
+    }
+}
+
+impl Drop for LockFile {
+    fn drop(&mut self) {
+        self.unlock();
     }
 }
 
@@ -290,6 +334,8 @@ fn open_lock_file(path: &Path, create: bool) -> io::Result<(std::fs::File, bool)
             format!("cannot open lock file {}: {error}", path.display()),
         )
     };
+    #[cfg(test)]
+    progress_tests::stall_if_requested(path);
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.file_type().is_file() => {
             return Err(io::Error::new(
@@ -363,12 +409,12 @@ fn recorded_owner(file: &std::fs::File) -> Option<u32> {
     std::str::from_utf8(&record).ok()?.trim().parse().ok()
 }
 
-fn registry() -> &'static Mutex<HashMap<PathBuf, OwnershipState>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, OwnershipState>>> = OnceLock::new();
+fn registry() -> &'static Mutex<HashMap<PathBuf, Slot>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Slot>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn lock_registry() -> MutexGuard<'static, HashMap<PathBuf, OwnershipState>> {
+fn lock_registry() -> MutexGuard<'static, HashMap<PathBuf, Slot>> {
     registry()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -493,21 +539,117 @@ fn claim_locks(identity: &Path) -> io::Result<(Option<LockFile>, Option<LockFile
     Ok((inner, Some(replacement)))
 }
 
-/// Takes the inner lock of the directory now at `identity`, if this entry takes locks and does
-/// not hold it yet: after a recovery that may have replaced the directory.
-fn ensure_inner_lock(identity: &Path) -> io::Result<()> {
-    let mut registry = lock_registry();
-    let Some(state) = registry.get_mut(identity) else {
-        return Ok(());
-    };
-    if !state.takes_locks || state.inner.is_some() || !identity.is_dir() {
-        return Ok(());
+/// How often a thread waiting on another thread's `Pending` entry for the same directory looks
+/// again. Only opens of that one directory wait, and only while its lock files are opened.
+const PENDING_POLL: Duration = Duration::from_millis(1);
+
+/// Runs `admit` on the directory's entry, first creating the entry when there is none.
+///
+/// Creating it takes the directory's lock files, and that I/O runs with the registry mutex
+/// released: the entry is `Pending` meanwhile, so a stalled lock file holds up opens of this
+/// directory only (specs/011 FR-13). A failure to create inserts nothing. `admit` cannot refuse
+/// a new entry, which has neither a lease nor a claim, so nothing is left behind by it either.
+fn with_entry<T>(
+    identity: &Path,
+    create: impl FnOnce(&Path) -> io::Result<OwnershipState>,
+    admit: impl FnOnce(&mut OwnershipState) -> io::Result<T>,
+) -> io::Result<T> {
+    let mut admit = Some(admit);
+    loop {
+        let mut registry = lock_registry();
+        match registry.get_mut(identity) {
+            Some(Slot::Owned(state)) => return (admit.take().expect("admitted once"))(state),
+            Some(Slot::Pending) => {
+                drop(registry);
+                std::thread::sleep(PENDING_POLL);
+            }
+            None => {
+                registry.insert(identity.to_path_buf(), Slot::Pending);
+                break;
+            }
+        }
     }
-    state.inner = Some(LockFile::acquire(
-        &identity.join(INNER_LOCK_NAME),
-        identity,
-    )?);
-    Ok(())
+    let created = create(identity);
+    let mut registry = lock_registry();
+    match created {
+        Ok(state) => {
+            let slot = registry
+                .entry(identity.to_path_buf())
+                .or_insert(Slot::Pending);
+            *slot = Slot::Owned(state);
+            let Slot::Owned(state) = slot else {
+                unreachable!("the slot was just filled");
+            };
+            (admit.take().expect("admitted once"))(state)
+        }
+        Err(error) => {
+            registry.remove(identity);
+            Err(error)
+        }
+    }
+}
+
+/// Applies `update` to the directory's entry and removes the entry when it reports no owner is
+/// left. The removed entry's locks are unlocked under the mutex, so this process's next open of
+/// the directory cannot find its own stale lock; its files close after the mutex is released.
+fn release(identity: &Path, update: impl FnOnce(&mut OwnershipState) -> bool) {
+    let removed = {
+        let mut registry = lock_registry();
+        let remove = match registry.get_mut(identity) {
+            Some(Slot::Owned(state)) => update(state),
+            _ => false,
+        };
+        if remove {
+            let removed = registry.remove(identity);
+            if let Some(Slot::Owned(state)) = &removed {
+                state.unlock_all();
+            }
+            removed
+        } else {
+            None
+        }
+    };
+    drop(removed);
+}
+
+/// Takes the inner lock of the directory now at `identity`, if this entry takes locks and does
+/// not hold it yet: after a recovery that may have replaced the directory. The lock file is
+/// opened with the registry mutex released; a concurrent opener in this process goes on without
+/// waiting, because the entry already owns the directory through its replacement lock.
+fn ensure_inner_lock(identity: &Path) -> io::Result<()> {
+    {
+        let mut registry = lock_registry();
+        let Some(Slot::Owned(state)) = registry.get_mut(identity) else {
+            return Ok(());
+        };
+        if !state.takes_locks || !matches!(state.inner, InnerLock::Absent) {
+            return Ok(());
+        }
+        state.inner = InnerLock::Acquiring;
+    }
+    let acquired = if identity.is_dir() {
+        LockFile::acquire(&identity.join(INNER_LOCK_NAME), identity).map(Some)
+    } else {
+        Ok(None)
+    };
+    let mut registry = lock_registry();
+    let Some(Slot::Owned(state)) = registry.get_mut(identity) else {
+        return acquired.map(|_| ());
+    };
+    match acquired {
+        Ok(Some(lock)) => {
+            state.inner = InnerLock::Held(lock);
+            Ok(())
+        }
+        Ok(None) => {
+            state.inner = InnerLock::Absent;
+            Ok(())
+        }
+        Err(error) => {
+            state.inner = InnerLock::Absent;
+            Err(error)
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -525,16 +667,10 @@ impl OpenDirectoryLease {
 
 impl Drop for OpenDirectoryLease {
     fn drop(&mut self) {
-        let mut registry = lock_registry();
-        let remove = if let Some(state) = registry.get_mut(&self.identity) {
+        release(&self.identity, |state| {
             state.open_leases = state.open_leases.saturating_sub(1);
             state.open_leases == 0 && !state.closed_claimed
-        } else {
-            false
-        };
-        if remove {
-            registry.remove(&self.identity);
-        }
+        });
     }
 }
 
@@ -556,12 +692,24 @@ impl ClosedDirectoryClaim {
     pub(crate) fn retire_inner_lock(&self) -> io::Result<()> {
         let retired = {
             let mut registry = lock_registry();
-            registry
-                .get_mut(&self.identity)
-                .and_then(|state| state.inner.take())
+            match registry.get_mut(&self.identity) {
+                Some(Slot::Owned(state)) => {
+                    match std::mem::replace(&mut state.inner, InnerLock::Absent) {
+                        InnerLock::Held(lock) => {
+                            lock.unlock();
+                            Some(lock)
+                        }
+                        other => {
+                            state.inner = other;
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            }
         };
-        if retired.is_some() {
-            drop(retired);
+        if let Some(lock) = retired {
+            drop(lock);
             match std::fs::remove_file(self.identity.join(INNER_LOCK_NAME)) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -574,16 +722,10 @@ impl ClosedDirectoryClaim {
 
 impl Drop for ClosedDirectoryClaim {
     fn drop(&mut self) {
-        let mut registry = lock_registry();
-        let remove = if let Some(state) = registry.get_mut(&self.identity) {
+        release(&self.identity, |state| {
             state.closed_claimed = false;
             state.open_leases == 0
-        } else {
-            false
-        };
-        if remove {
-            registry.remove(&self.identity);
-        }
+        });
     }
 }
 
@@ -597,66 +739,142 @@ pub(crate) fn acquire_open_lease_with(
     policy: ProcessLockPolicy,
 ) -> io::Result<OpenDirectoryLease> {
     let identity = canonical_directory_identity(store_dir)?;
-    let mut registry = lock_registry();
-    if !registry.contains_key(&identity) {
-        let takes_locks = policy == ProcessLockPolicy::Take;
-        let (inner, replacement) = if takes_locks {
-            open_locks(&identity)?
-        } else {
-            (None, None)
-        };
-        registry.insert(
-            identity.clone(),
-            OwnershipState {
-                open_leases: 0,
-                closed_claimed: false,
-                takes_locks,
-                inner,
-                _replacement: replacement,
-            },
-        );
-    }
-    // A new entry has neither a claim nor a lease, so no refusal below can leave one behind.
-    let state = registry.get_mut(&identity).expect("entry present");
-    if state.closed_claimed {
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "closed maintenance already owns this directory",
-        ));
-    }
-    state.open_leases = state
-        .open_leases
-        .checked_add(1)
-        .ok_or_else(|| io::Error::other("open-store lease count overflow"))?;
+    let takes_locks = policy == ProcessLockPolicy::Take;
+    with_entry(
+        &identity,
+        |identity| {
+            let (inner, replacement) = if takes_locks {
+                open_locks(identity)?
+            } else {
+                (None, None)
+            };
+            Ok(OwnershipState::new(takes_locks, inner, replacement))
+        },
+        |state| {
+            if state.closed_claimed {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "closed maintenance already owns this directory",
+                ));
+            }
+            state.open_leases = state
+                .open_leases
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("open-store lease count overflow"))?;
+            Ok(())
+        },
+    )?;
     Ok(OpenDirectoryLease { identity })
 }
 
 #[allow(dead_code)]
 pub(crate) fn try_claim_closed(store_dir: &Path) -> io::Result<ClosedDirectoryClaim> {
     let identity = canonical_directory_identity(store_dir)?;
-    let mut registry = lock_registry();
-    if let Some(state) = registry.get(&identity) {
-        if state.closed_claimed || state.open_leases != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "an open store or closed maintenance operation already owns this directory",
-            ));
+    with_entry(
+        &identity,
+        |identity| {
+            let (inner, replacement) = claim_locks(identity)?;
+            Ok(OwnershipState::new(true, inner, replacement))
+        },
+        |state| {
+            if state.closed_claimed || state.open_leases != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "an open store or closed maintenance operation already owns this directory",
+                ));
+            }
+            state.closed_claimed = true;
+            Ok(())
+        },
+    )?;
+    Ok(ClosedDirectoryClaim { identity })
+}
+
+#[cfg(test)]
+mod progress_tests {
+    //! FR-13 (specs/011): lock-file I/O for one directory must not hold up other directories.
+
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc;
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+
+    type Gate = Arc<(Mutex<(bool, bool)>, Condvar)>;
+
+    /// The one directory whose lock-file opens stall, and the gate that releases them:
+    /// `(entered, released)`.
+    static STALL: Mutex<Option<(PathBuf, Gate)>> = Mutex::new(None);
+
+    pub(super) fn stall_if_requested(path: &Path) {
+        let gate = {
+            let stall = STALL
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match &*stall {
+                Some((directory, gate)) if path.parent() == Some(directory.as_path()) => {
+                    gate.clone()
+                }
+                _ => return,
+            }
+        };
+        let (state, signal) = &*gate;
+        let mut flags = state.lock().unwrap();
+        flags.0 = true;
+        signal.notify_all();
+        while !flags.1 {
+            flags = signal.wait(flags).unwrap();
         }
     }
-    if !registry.contains_key(&identity) {
-        let (inner, replacement) = claim_locks(&identity)?;
-        registry.insert(
-            identity.clone(),
-            OwnershipState {
-                open_leases: 0,
-                closed_claimed: false,
-                takes_locks: true,
-                inner,
-                _replacement: replacement,
-            },
+
+    #[test]
+    fn a_stalled_lock_file_holds_up_no_other_directory() {
+        let stalled = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let dropped = tempfile::tempdir().unwrap();
+        let held = crate::key_value_store::DurableKeyValueStore::try_init_new(dropped.path())
+            .unwrap()
+            .into_store();
+        let gate: Gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+        *STALL.lock().unwrap() =
+            Some((std::fs::canonicalize(stalled.path()).unwrap(), gate.clone()));
+
+        let stalled_path = stalled.path().to_path_buf();
+        let stalled_open = std::thread::spawn(move || {
+            crate::key_value_store::DurableKeyValueStore::try_init_new(&stalled_path).is_ok()
+        });
+        {
+            let (state, signal) = &*gate;
+            let mut flags = state.lock().unwrap();
+            while !flags.0 {
+                flags = signal.wait(flags).unwrap();
+            }
+        }
+
+        let (done, finished) = mpsc::channel();
+        let other_path = other.path().to_path_buf();
+        std::thread::spawn(move || {
+            let opened =
+                crate::key_value_store::DurableKeyValueStore::try_init_new(&other_path).is_ok();
+            drop(held);
+            let _ = done.send(opened);
+        });
+        let progressed = finished.recv_timeout(Duration::from_secs(5));
+
+        {
+            let (state, signal) = &*gate;
+            state.lock().unwrap().1 = true;
+            signal.notify_all();
+        }
+        *STALL.lock().unwrap() = None;
+        let stalled_opened = stalled_open.join().unwrap();
+        // Joined before asserting, so a failure leaves no thread parked on the gate.
+        let _ = finished.recv_timeout(Duration::from_secs(30));
+
+        assert_eq!(
+            progressed,
+            Ok(true),
+            "another directory's open and a third's drop waited behind a stalled lock file"
         );
+        assert!(stalled_opened);
     }
-    let state = registry.get_mut(&identity).expect("entry present");
-    state.closed_claimed = true;
-    Ok(ClosedDirectoryClaim { identity })
 }
