@@ -100,3 +100,11 @@ Fixes after the check of `68be84f`:
   - Pins, confirmed by neutralization: identity unit tests, two stale verdicts, a file left at the
     lock path, a later family, a claim, and the held-lock check under FR-13 (`cfc8cb5`).
 - [x] T025 Correct the documents after the check.
+
+Fixes after the final check of `cfc8cb5`:
+
+- [x] T026 Re-ask a skipped replacement check under maintenance; recover through the identity unless
+  the path ends in the directory's own name; fold `store/.`:
+  - RED: an open unable to check the replacement lock went live during a claim; `store/.` failed
+    recovery; the recovery-path rule returned the raw path (`c99dfc4`).
+- [x] T027 Correct the documents after the check.

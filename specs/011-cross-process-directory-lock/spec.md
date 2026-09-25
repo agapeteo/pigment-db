@@ -58,8 +58,9 @@ This is spec 011. Earlier work used the number 010 three times:
       asked whether it is a symlink. The system follows the link for `alias/` or `alias/.`, and
       would hide it.
     - Recovery at open reads the canonical directory's maintenance artifacts whenever the path's
-      last component is not the directory's own name: a symlink however spelled, or a path ending
-      in `.` or `..`. For any other path it uses the path given, so errors name it.
+      last component is not the directory's own name. That covers a symlink however spelled, a
+      path ending in `..`, and on Windows a name the system maps to another (`store.`, an 8.3
+      short name). For any other path it uses the path given, read lexically, so errors name it.
   - **A held inner lock must still be the directory's.** An open stalled after taking the inner
     lock can end up holding the lock file of a directory that a compaction then retired. Before
     an open or a claim goes on, a held inner lock is checked against the file now at the lock
@@ -114,7 +115,10 @@ This is spec 011. Earlier work used the number 010 three times:
   - **An inner lock, or a required replacement lock, cannot be opened at all:** the open is
     refused, naming the file. This covers an absent file that cannot be created, and an unreadable
     file.
-  - **The file consulted by the replacement check cannot be opened:** the check is skipped.
+  - **The file consulted by the replacement check cannot be opened:** the check is skipped,
+    unless directory-level maintenance is in progress once the inner lock is held. A claim
+    retires its inner lock after staging, so from then on the replacement lock is what excludes
+    the open, and it is then required.
 - **FR-8 A missing directory.**
   - When the store directory does not exist and no directory-level maintenance artifacts exist,
     the open fails at once and creates nothing. The error is
@@ -209,6 +213,10 @@ This is spec 011. Earlier work used the number 010 three times:
     illumos, AIX or GNU/Hurd, where one build locks and the other skips.
   - Closed compaction through a symlinked store path replaces the symlink rather than the directory.
     That defect predates this spec and is tracked separately.
+  - A path that reaches the directory through its inode rather than its name, such as
+    `/proc/self/fd/N` or a working directory inside it, follows the directory when a compaction
+    moves it aside. An open through such a path during a compaction is not excluded, and is
+    unsupported.
   - A store's files are opened through the path given, while its ownership is keyed by the
     directory that path named when it was opened. So repointing a symlink on the store path
     while a store is open, or while it is being opened, is unsupported: the open store would
@@ -302,6 +310,8 @@ These unit tests use private seams or fixtures:
 | Retired lock, claim (Unix) | The same interleaving for a closed-maintenance claim. | After `ensure_inner_lock` the claim holds the current file's lock, and retires it. |
 | Two stale verdicts (Unix) | Two families find the lock stale; one is parked while the other re-takes it. | The parked one keeps the re-taken lock. |
 | Held-lock check stalled | The check for one directory is stalled. | Other directories open and drop (FR-13). |
+| Replacement check unreadable | An open that cannot open the replacement lock file, stalled until a claim has published its manifest. | Refused; the claim completes. |
+| A path ending in `.` | `store/.` over an interrupted compaction. | Recovered. |
 | Lock file in `.previous` | A replaced generation holds `.pigment-lock`. | Both cleanups delete it. A directory of that name keeps cleanup pending. |
 | Recovering owners | An open, or a claim paused while staging, recovers an interrupted compaction. | Each holds the inner lock and records its process id. |
 | Progress | Lock-file I/O for one directory is stalled, at entry creation and again after recovery. | Other directories open and drop. |

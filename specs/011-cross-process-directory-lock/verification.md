@@ -5,7 +5,8 @@ Measured on Linux 7.1 with rustc 1.97.1, on branch `011-cross-process-directory-
 fixed from `1b79628` to `f57bdde`, and "Review fixes" below records that evidence. A re-review of
 `c026816` found two more defects, fixed from `01f0200` to `583ddbb` ("Second review" below). A check
 of that fix found three more, fixed in `6a5b20b` ("Third review"). A check of that found two more,
-fixed in `cfc8cb5` ("Fourth review").
+fixed in `cfc8cb5` ("Fourth review"). A final check found two older gaps, fixed in `c99dfc4`
+("Final check").
 
 ## Suites
 
@@ -17,6 +18,7 @@ fixed in `cfc8cb5` ("Fourth review").
 | `583ddbb` | 602 | 0 | 28 | 26 |
 | `6a5b20b` | 605 | 0 | 28 | 26 |
 | `cfc8cb5` | 611 | 0 | 28 | 26 |
+| `c99dfc4` | 613 | 0 | 28 | 26 |
 
 The extra ignored test is `directory_lock::child_entry`, the child-process role runner.
 
@@ -401,3 +403,43 @@ Checks at `cfc8cb5`:
 Still unpinned:
 - the four mutations listed under "Third review";
 - the early exit that follows a stale verdict another thread has overtaken, which no seam reaches.
+
+## Final check
+
+A narrow check of `cfc8cb5` found no regression in it. The attacks it ran came back clean:
+- `..` through symlinked components;
+- an intermediate symlink with a trailing separator;
+- relative `./alias/`;
+- the token comparison, which cannot loop forever or release a current lock.
+
+It found two older gaps and a smaller one, fixed in `c99dfc4`:
+
+| Gap | Measured | Fixed by |
+|---|---|---|
+| An open unable to open the replacement lock file skipped that check under FR-7, and so went live during a claim that had already retired its inner lock | Its recovery deleted the claim's staging and manifest | Requiring the replacement lock whenever maintenance is in progress |
+| Recovery decided "names itself" by the symlink test alone. On Windows `store.` and 8.3 short names reach the directory under another name | Inferred from std's source, not run | Requiring the last component to be the directory's own name |
+| `store/.` was recovered as given, and the kernel refuses renames into it | It failed closed | Reading the path lexically |
+
+RED:
+- `an_open_that_cannot_check_the_replacement_lock_is_refused_during_a_claim`: `Ok(Recovered)`
+  during a live claim.
+- `a_path_ending_in_a_dot_recovers_the_directory`: `NotFound`.
+- The recovery-path unit test.
+
+Each neutralization fails exactly its test.
+
+Recorded, not fixed:
+- A path that follows the directory's inode (`/proc/self/fd/N`, or a working directory inside
+  the store) follows it when a compaction moves it aside. This is a new Known limitation.
+- No test tells the holding token apart from an inode comparison. The seam that parks a family
+  sits before the `lstat`, and inode reuse cannot be forced portably. The token is recorded as
+  unpinned.
+- Closed compaction still recovers through the path given. This belongs to the tracked defect for
+  compaction through a symlinked store path, whose fix must move that recovery onto the identity
+  too.
+
+Checks at `c99dfc4`:
+- Suite: 613 passed, 0 failed, 28 ignored, across 26 binaries.
+- `cargo fmt --check` is clean.
+- Clippy reports nothing on Linux, and only the 14 warnings that predate the branch for Windows.
+- The ownership, progress, lock-error and identity tests passed 15 runs out of 15.
