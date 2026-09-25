@@ -270,8 +270,7 @@ pub(crate) fn inspect_generation(store_dir: &Path) -> io::Result<DirectoryInspec
         let name = entry.file_name();
         // The directory's cross-process lock (specs/011) is ownership state, not a store
         // artifact: it belongs to no family and counts toward no total.
-        if name == crate::maintenance_coordination::INNER_LOCK_NAME && entry.file_type()?.is_file()
-        {
+        if crate::maintenance_coordination::is_inner_lock_file(&name, entry.file_type()?) {
             continue;
         }
         if !entry.file_type()?.is_file() {

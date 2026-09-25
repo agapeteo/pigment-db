@@ -288,6 +288,82 @@ fn cleanup_is_phase_ordered_exact_manifest_last_and_faults_are_pending() {
     assert!(!prepared.paths.manifest.exists());
 }
 
+/// specs/011, FR-9: a lock file that a refused open left in the source after the claim retired its
+/// own travels into `.previous`, and either cleanup deletes it with the generation: the
+/// compactor's own, and recovery's. A directory of that name is not a lock file: it still keeps
+/// cleanup pending, and in the canonical directory it leaves the authority undetermined.
+#[test]
+fn a_lock_file_in_the_replaced_generation_is_deleted_with_it() {
+    use crate::maintenance_coordination::INNER_LOCK_NAME;
+
+    let (_root, store_dir, prepared, mut manifest) = replacement_fixture();
+    std::fs::write(prepared.paths.previous.join(INNER_LOCK_NAME), b"1\n").unwrap();
+    let canonical = snapshot_directory(&store_dir).unwrap();
+    assert_eq!(
+        cleanup_closed_with_checkpoint(&prepared, &mut manifest, |_| Ok(())).unwrap(),
+        crate::CleanupStatus::Complete
+    );
+    assert_eq!(snapshot_directory(&store_dir).unwrap(), canonical);
+    assert!(!prepared.paths.previous.exists());
+    assert!(!prepared.paths.manifest.exists());
+
+    let (_root, store_dir, prepared, mut manifest) = replacement_fixture();
+    crate::compaction::recovery::recover_replacement_published_closed(
+        &store_dir,
+        &prepared.paths,
+        &mut manifest,
+    )
+    .unwrap();
+    std::fs::write(prepared.paths.previous.join(INNER_LOCK_NAME), b"1\n").unwrap();
+    assert_eq!(
+        crate::compaction::recovery::recover_cleanup_pending_closed(
+            &store_dir,
+            &prepared.paths,
+            &manifest,
+        )
+        .unwrap(),
+        crate::CleanupStatus::Complete
+    );
+    assert!(!prepared.paths.previous.exists());
+    assert!(!prepared.paths.manifest.exists());
+
+    let (_root, store_dir, prepared, mut manifest) = replacement_fixture();
+    std::fs::create_dir(prepared.paths.previous.join(INNER_LOCK_NAME)).unwrap();
+    assert_eq!(
+        cleanup_closed_with_checkpoint(&prepared, &mut manifest, |_| Ok(())).unwrap(),
+        crate::CleanupStatus::Pending
+    );
+    assert!(prepared.paths.previous.join(INNER_LOCK_NAME).is_dir());
+    assert_eq!(
+        crate::compaction::recovery::recover_cleanup_pending_closed(
+            &store_dir,
+            &prepared.paths,
+            &manifest,
+        )
+        .unwrap(),
+        crate::CleanupStatus::Pending
+    );
+    assert!(prepared.paths.previous.join(INNER_LOCK_NAME).is_dir());
+
+    let (_root, store_dir, prepared, mut manifest) = replacement_fixture();
+    crate::compaction::recovery::recover_replacement_published_closed(
+        &store_dir,
+        &prepared.paths,
+        &mut manifest,
+    )
+    .unwrap();
+    std::fs::create_dir(store_dir.join(INNER_LOCK_NAME)).unwrap();
+    assert!(matches!(
+        crate::compaction::recovery::recover_cleanup_pending_closed(
+            &store_dir,
+            &prepared.paths,
+            &manifest,
+        ),
+        Err(crate::CompactionError::AuthorityUndetermined { .. })
+    ));
+    assert!(prepared.paths.previous.is_dir());
+}
+
 #[test]
 fn prepared_recovery_restores_verified_old_and_discards_only_incomplete_owned_staging() {
     let (_root, store_dir, prepared) = prepared_fixture();
@@ -1115,6 +1191,203 @@ fn an_open_is_refused_while_another_process_holds_a_closed_claim() {
             .unwrap()
             .into_store();
         assert_eq!(reopened.get(b"alpha"), Some(b"one".to_vec()), "{point:?}");
+    }
+}
+
+/// A closed compaction whose cleanup cannot finish yet: the replacement is canonical and the
+/// manifest is `CleanupPending`, but one artifact of `.previous` no longer matches its descriptor,
+/// so cleanup deletes nothing. Returns that artifact and its original bytes, so a test can let
+/// cleanup succeed later.
+fn cleanup_pending_fixture() -> (
+    tempfile::TempDir,
+    std::path::PathBuf,
+    super::PreparedClosedStaging,
+    std::path::PathBuf,
+    Vec<u8>,
+) {
+    let (root, store_dir, prepared, mut manifest) = replacement_fixture();
+    crate::compaction::recovery::recover_replacement_published_closed(
+        &store_dir,
+        &prepared.paths,
+        &mut manifest,
+    )
+    .unwrap();
+    let previous_file = std::fs::read_dir(&prepared.paths.previous)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let original = std::fs::read(&previous_file).unwrap();
+    let mut changed = original.clone();
+    *changed.last_mut().unwrap() ^= 0xff;
+    std::fs::write(&previous_file, changed).unwrap();
+    (root, store_dir, prepared, previous_file, original)
+}
+
+/// Opens the key/value family of a directory whose cleanup stays pending, and checks the state
+/// the later steps start from: the open succeeded, the manifest remains, and the open took the
+/// directory's inner lock (specs/011, FR-5 step 3).
+fn open_while_cleanup_is_pending(
+    store_dir: &std::path::Path,
+    prepared: &super::PreparedClosedStaging,
+) -> crate::key_value_store::DurableKeyValueStore<std::fs::File> {
+    let outcome = crate::key_value_store::DurableKeyValueStore::try_init_new(store_dir).unwrap();
+    assert_eq!(outcome.status(), crate::RecoveryStatus::Recovered);
+    assert!(
+        prepared.paths.manifest.is_file(),
+        "cleanup must still be pending"
+    );
+    assert!(
+        store_dir
+            .join(crate::maintenance_coordination::INNER_LOCK_NAME)
+            .is_file(),
+        "the open must hold the inner lock of the directory it recovered"
+    );
+    outcome.into_store()
+}
+
+fn assert_cleanup_complete(prepared: &super::PreparedClosedStaging) {
+    assert!(
+        !prepared.paths.manifest.exists(),
+        "the manifest must be gone"
+    );
+    assert!(
+        !prepared.paths.previous.exists(),
+        "`.previous` must be gone"
+    );
+}
+
+/// specs/011: the inner lock an open takes while cleanup stays pending is not a store artifact,
+/// so once cleanup can proceed, the next open finishes it.
+#[test]
+fn a_reopen_finishes_a_cleanup_that_an_earlier_open_left_pending() {
+    let (_root, store_dir, prepared, previous_file, original) = cleanup_pending_fixture();
+    drop(open_while_cleanup_is_pending(&store_dir, &prepared));
+    std::fs::write(&previous_file, original).unwrap();
+
+    let outcome = crate::key_value_store::DurableKeyValueStore::try_init_new(&store_dir).unwrap();
+
+    assert_eq!(outcome.status(), crate::RecoveryStatus::Recovered);
+    assert_cleanup_complete(&prepared);
+    assert_eq!(outcome.into_store().get(b"alpha"), Some(b"one".to_vec()));
+}
+
+/// specs/011: a second family opened in the same process, while the first still holds the
+/// directory, finishes the cleanup the first open left pending.
+#[test]
+fn a_second_family_finishes_a_cleanup_the_first_left_pending() {
+    let (_root, store_dir, prepared, previous_file, original) = cleanup_pending_fixture();
+    let first = open_while_cleanup_is_pending(&store_dir, &prepared);
+    std::fs::write(&previous_file, original).unwrap();
+
+    let second = crate::key_set_store::DurableKeySetStore::try_init_new(&store_dir);
+
+    assert!(second.is_ok(), "{:?}", second.err());
+    assert_cleanup_complete(&prepared);
+    assert_eq!(first.get(b"alpha"), Some(b"one".to_vec()));
+}
+
+/// specs/011: compacting again retries the cleanup an earlier open left pending, as
+/// `compact_directory_in_place` documents.
+#[test]
+fn a_compaction_retry_finishes_a_cleanup_that_an_earlier_open_left_pending() {
+    let (_root, store_dir, prepared, previous_file, original) = cleanup_pending_fixture();
+    drop(open_while_cleanup_is_pending(&store_dir, &prepared));
+    std::fs::write(&previous_file, original).unwrap();
+
+    let compacted =
+        crate::compact_directory_in_place(&store_dir, crate::ClosedCompactionOptions::default());
+
+    assert!(compacted.is_ok(), "{:?}", compacted.err());
+    assert_cleanup_complete(&prepared);
+    let reopened = crate::key_value_store::DurableKeyValueStore::try_init_new(&store_dir)
+        .unwrap()
+        .into_store();
+    assert_eq!(reopened.get(b"alpha"), Some(b"one".to_vec()));
+}
+
+/// specs/011: an open that checked for maintenance before another process's closed compaction
+/// staged anything, and reaches its inner lock only after the claim retired it, is refused by
+/// the replacement lock. The lock file it creates on the way must not break the compaction: the
+/// compaction completes and the directory reopens with its data.
+#[test]
+fn an_open_stalled_across_another_processs_compaction_neither_opens_nor_breaks_it() {
+    use crate::maintenance_coordination::lock_seams::Stall;
+    use crate::test_support::fault_checkpoint::{
+        pause_maintenance_child, MaintenanceCut, MaintenanceFaultPoint, MaintenancePhase,
+        MAINTENANCE_PAUSED_CHILD_COMPLETED,
+    };
+    for point in [
+        MaintenanceFaultPoint {
+            phase: MaintenancePhase::Prepared,
+            cut: MaintenanceCut::StagingValidate,
+        },
+        MaintenanceFaultPoint {
+            phase: MaintenancePhase::ReplacementPublished,
+            cut: MaintenanceCut::ReopenValidation,
+        },
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let store_dir = root.path().join("store");
+        std::fs::create_dir(&store_dir).unwrap();
+        create_segmented_v2(&store_dir, FixtureFamily::KeyValue);
+        let stall = Stall::install(&store_dir);
+        let opener = {
+            let store_dir = store_dir.clone();
+            std::thread::spawn(move || {
+                crate::key_value_store::DurableKeyValueStore::try_init_new(&store_dir).map(|_| ())
+            })
+        };
+        stall.wait_entered();
+        let pause_dir = tempfile::tempdir().unwrap();
+        let child = pause_maintenance_child(
+            "compaction::recovery_tests::closed_compaction_checkpoint_child",
+            &store_dir,
+            pause_dir.path(),
+            point,
+        );
+
+        stall.release();
+        let refused = opener.join().unwrap();
+        assert!(
+            store_dir
+                .join(crate::maintenance_coordination::INNER_LOCK_NAME)
+                .is_file(),
+            "{point:?}: the refused open must have left its lock file in the directory"
+        );
+        let exit = child.resume();
+
+        match refused {
+            Err(crate::RecoveryError::Io {
+                operation: crate::RecoveryOperation::Inspect,
+                source,
+                ..
+            }) => {
+                assert_eq!(source.kind(), std::io::ErrorKind::WouldBlock, "{point:?}");
+                assert!(
+                    source.to_string().contains(".store.pigment-lock"),
+                    "{point:?}: the replacement lock must refuse: {source}"
+                );
+            }
+            Err(error) => panic!("{point:?}: expected a WouldBlock refusal, got {error:?}"),
+            Ok(()) => panic!("{point:?}: an open during another process's compaction must fail"),
+        }
+        assert_eq!(
+            exit, MAINTENANCE_PAUSED_CHILD_COMPLETED,
+            "{point:?}: the compaction must complete"
+        );
+        let reopened = crate::key_value_store::DurableKeyValueStore::try_init_new(&store_dir)
+            .unwrap()
+            .into_store();
+        assert_eq!(reopened.get(b"alpha"), Some(b"one".to_vec()), "{point:?}");
+        drop(reopened);
+        let mut left = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        left.sort();
+        assert_eq!(left, [".store.pigment-lock", "store"], "{point:?}");
     }
 }
 

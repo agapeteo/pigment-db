@@ -108,6 +108,7 @@ pub(crate) fn cleanup_closed_with_checkpoint(
         .iter()
         .filter_map(|(_, path)| path.file_name().map(OsString::from))
         .collect::<BTreeSet<_>>();
+    let mut lock_file = None;
     let actual_names = match fs::read_dir(&prepared.paths.previous) {
         Ok(entries) => {
             let mut names = BTreeSet::new();
@@ -118,6 +119,13 @@ pub(crate) fn cleanup_closed_with_checkpoint(
                 let Ok(file_type) = entry.file_type() else {
                     return Ok(crate::CleanupStatus::Pending);
                 };
+                if crate::maintenance_coordination::is_inner_lock_file(
+                    &entry.file_name(),
+                    file_type,
+                ) {
+                    lock_file = Some(entry.path());
+                    continue;
+                }
                 if !file_type.is_file() {
                     return Ok(crate::CleanupStatus::Pending);
                 }
@@ -137,6 +145,11 @@ pub(crate) fn cleanup_closed_with_checkpoint(
         {
             return Ok(crate::CleanupStatus::Pending);
         }
+    }
+    if lock_file.is_some_and(|path| {
+        crate::maintenance_coordination::remove_retired_inner_lock(&path).is_err()
+    }) {
+        return Ok(crate::CleanupStatus::Pending);
     }
     if checkpoint(ClosedCleanupStage::BeforePreviousDirectory).is_err()
         || fs::remove_dir(&prepared.paths.previous).is_err()

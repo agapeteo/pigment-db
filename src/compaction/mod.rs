@@ -842,6 +842,9 @@ pub(crate) fn revalidate_closed_source_inventory(
             path: entry.path(),
             source,
         })?;
+        if crate::maintenance_coordination::is_inner_lock_file(&entry.file_name(), file_type) {
+            continue;
+        }
         if !file_type.is_file() {
             return Err(source_revalidation_error(
                 "source contains a non-file artifact",

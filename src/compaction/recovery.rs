@@ -541,6 +541,7 @@ pub(crate) fn recover_cleanup_pending_closed_with_checkpoint(
         Err(_) => return Ok(crate::CleanupStatus::Pending),
     };
     let mut remaining = Vec::new();
+    let mut lock_file = None;
     for entry in entries {
         let Ok(entry) = entry else {
             return Ok(crate::CleanupStatus::Pending);
@@ -548,6 +549,10 @@ pub(crate) fn recover_cleanup_pending_closed_with_checkpoint(
         let Ok(file_type) = entry.file_type() else {
             return Ok(crate::CleanupStatus::Pending);
         };
+        if crate::maintenance_coordination::is_inner_lock_file(&entry.file_name(), file_type) {
+            lock_file = Some(entry.path());
+            continue;
+        }
         if !file_type.is_file() {
             return Ok(crate::CleanupStatus::Pending);
         }
@@ -568,6 +573,11 @@ pub(crate) fn recover_cleanup_pending_closed_with_checkpoint(
         {
             return Ok(crate::CleanupStatus::Pending);
         }
+    }
+    if lock_file.is_some_and(|path| {
+        crate::maintenance_coordination::remove_retired_inner_lock(&path).is_err()
+    }) {
+        return Ok(crate::CleanupStatus::Pending);
     }
     if checkpoint(RecoveryCleanupStage::Directory).is_err()
         || fs::remove_dir(&paths.previous).is_err()
@@ -1296,6 +1306,9 @@ fn generation_matches(location: &Path, descriptors: &[ArtifactDescriptor]) -> bo
         let Ok(file_type) = entry.file_type() else {
             return false;
         };
+        if crate::maintenance_coordination::is_inner_lock_file(&entry.file_name(), file_type) {
+            continue;
+        }
         if !file_type.is_file() {
             return false;
         }

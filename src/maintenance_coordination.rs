@@ -248,6 +248,24 @@ enum InnerLock {
 /// The name of the inner lock file, inside the store directory.
 pub(crate) const INNER_LOCK_NAME: &str = ".pigment-lock";
 
+/// Whether a directory entry is a generation's inner lock file. The file is ownership state, not
+/// a store artifact, so every inventory of a store generation skips it (FR-9). An open refused
+/// part-way through another process's closed compaction can leave one in the source after the
+/// claim retired its own, and an open that recovered can hold one while cleanup is still pending.
+/// A cleanup that deletes a replaced generation deletes it too.
+pub(crate) fn is_inner_lock_file(name: &std::ffi::OsStr, file_type: std::fs::FileType) -> bool {
+    name == INNER_LOCK_NAME && file_type.is_file()
+}
+
+/// Deletes the inner lock file a replaced generation still holds, before its directory goes. It
+/// may be gone already, and nothing else in the generation is touched.
+pub(crate) fn remove_retired_inner_lock(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
 /// Whether an open takes this process's locks on its directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProcessLockPolicy {
@@ -306,7 +324,7 @@ impl LockFile {
 
     fn lock(file: std::fs::File, writable: bool, path: &Path, identity: &Path) -> io::Result<Self> {
         #[cfg(test)]
-        let attempt = match lock_error_tests::injected_error(path) {
+        let attempt = match lock_seams::injected_lock_error(path) {
             Some(kind) => Err(std::fs::TryLockError::Error(io::Error::from(kind))),
             None => file.try_lock(),
         };
@@ -363,7 +381,7 @@ fn open_lock_file(path: &Path, create: bool) -> io::Result<(std::fs::File, bool)
         )
     };
     #[cfg(test)]
-    progress_tests::stall_if_requested(path);
+    lock_seams::before_lock_file_open(path);
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if !metadata.file_type().is_file() => {
             return Err(io::Error::new(
@@ -819,31 +837,38 @@ pub(crate) fn try_claim_closed(store_dir: &Path) -> io::Result<ClosedDirectoryCl
 }
 
 #[cfg(test)]
-mod progress_tests {
-    //! FR-13 (specs/011): lock-file I/O for one directory must not hold up other directories.
+pub(crate) mod lock_seams {
+    //! Private seams for lock-file I/O (specs/011), each keyed by the directory a lock file lives
+    //! in, so tests running in parallel do not see each other's.
 
+    use std::io;
     use std::path::{Path, PathBuf};
-    use std::sync::mpsc;
     use std::sync::{Arc, Condvar, Mutex};
-    use std::time::Duration;
 
     type Gate = Arc<(Mutex<(bool, bool)>, Condvar)>;
 
-    /// The one directory whose lock-file opens stall, and the gate that releases them:
-    /// `(entered, released)`.
-    static STALL: Mutex<Option<(PathBuf, Gate)>> = Mutex::new(None);
+    /// Directories whose lock-file opens stall, each with its gate: `(entered, released)`.
+    static STALLS: Mutex<Vec<(PathBuf, Gate)>> = Mutex::new(Vec::new());
+    /// Lock errors reported in place of a real attempt.
+    static LOCK_ERRORS: Mutex<Vec<(PathBuf, io::ErrorKind)>> = Mutex::new(Vec::new());
 
-    pub(super) fn stall_if_requested(path: &Path) {
-        let gate = {
-            let stall = STALL
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            match &*stall {
-                Some((directory, gate)) if path.parent() == Some(directory.as_path()) => {
-                    gate.clone()
-                }
-                _ => return,
-            }
+    fn guard<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn in_directory(path: &Path, directory: &Path) -> bool {
+        path.parent() == Some(directory)
+    }
+
+    pub(super) fn before_lock_file_open(path: &Path) {
+        let gate = guard(&STALLS)
+            .iter()
+            .find(|(directory, _)| in_directory(path, directory))
+            .map(|(_, gate)| gate.clone());
+        let Some(gate) = gate else {
+            return;
         };
         let (state, signal) = &*gate;
         let mut flags = state.lock().unwrap();
@@ -854,6 +879,63 @@ mod progress_tests {
         }
     }
 
+    pub(super) fn injected_lock_error(path: &Path) -> Option<io::ErrorKind> {
+        guard(&LOCK_ERRORS)
+            .iter()
+            .find(|(directory, _)| in_directory(path, directory))
+            .map(|(_, kind)| *kind)
+    }
+
+    pub(crate) fn inject_lock_error(directory: &Path, kind: io::ErrorKind) {
+        guard(&LOCK_ERRORS).push((std::fs::canonicalize(directory).unwrap(), kind));
+    }
+
+    /// Stalls every lock-file open in one directory until released or dropped.
+    pub(crate) struct Stall {
+        directory: PathBuf,
+        gate: Gate,
+    }
+
+    impl Stall {
+        pub(crate) fn install(directory: &Path) -> Self {
+            let directory = std::fs::canonicalize(directory).unwrap();
+            let gate: Gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+            guard(&STALLS).push((directory.clone(), gate.clone()));
+            Self { directory, gate }
+        }
+
+        /// Waits until some open has reached the stall.
+        pub(crate) fn wait_entered(&self) {
+            let (state, signal) = &*self.gate;
+            let mut flags = state.lock().unwrap();
+            while !flags.0 {
+                flags = signal.wait(flags).unwrap();
+            }
+        }
+
+        pub(crate) fn release(&self) {
+            let (state, signal) = &*self.gate;
+            state.lock().unwrap().1 = true;
+            signal.notify_all();
+            guard(&STALLS).retain(|(directory, _)| directory != &self.directory);
+        }
+    }
+
+    impl Drop for Stall {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    //! FR-13 (specs/011): lock-file I/O for one directory must not hold up other directories.
+
+    use super::lock_seams::Stall;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
     #[test]
     fn a_stalled_lock_file_holds_up_no_other_directory() {
         let stalled = tempfile::tempdir().unwrap();
@@ -862,21 +944,13 @@ mod progress_tests {
         let held = crate::key_value_store::DurableKeyValueStore::try_init_new(dropped.path())
             .unwrap()
             .into_store();
-        let gate: Gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
-        *STALL.lock().unwrap() =
-            Some((std::fs::canonicalize(stalled.path()).unwrap(), gate.clone()));
+        let stall = Stall::install(stalled.path());
 
         let stalled_path = stalled.path().to_path_buf();
         let stalled_open = std::thread::spawn(move || {
             crate::key_value_store::DurableKeyValueStore::try_init_new(&stalled_path).is_ok()
         });
-        {
-            let (state, signal) = &*gate;
-            let mut flags = state.lock().unwrap();
-            while !flags.0 {
-                flags = signal.wait(flags).unwrap();
-            }
-        }
+        stall.wait_entered();
 
         let (done, finished) = mpsc::channel();
         let other_path = other.path().to_path_buf();
@@ -888,12 +962,7 @@ mod progress_tests {
         });
         let progressed = finished.recv_timeout(Duration::from_secs(5));
 
-        {
-            let (state, signal) = &*gate;
-            state.lock().unwrap().1 = true;
-            signal.notify_all();
-        }
-        *STALL.lock().unwrap() = None;
+        stall.release();
         let stalled_opened = stalled_open.join().unwrap();
         // Joined before asserting, so a failure leaves no thread parked on the gate.
         let _ = finished.recv_timeout(Duration::from_secs(30));
@@ -912,34 +981,13 @@ mod lock_error_tests {
     //! FR-11 (specs/011): a lock the platform or filesystem cannot take is skipped with a warning;
     //! any other lock error refuses the open.
 
+    use super::lock_seams::inject_lock_error;
     use std::io;
-    use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
-
-    /// Lock errors to report in place of a real attempt, for lock files in the given directories.
-    static INJECTED: Mutex<Vec<(PathBuf, io::ErrorKind)>> = Mutex::new(Vec::new());
-
-    pub(super) fn injected_error(path: &Path) -> Option<io::ErrorKind> {
-        let injected = INJECTED
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        injected
-            .iter()
-            .find(|(directory, _)| path.parent() == Some(directory.as_path()))
-            .map(|(_, kind)| *kind)
-    }
-
-    fn inject(directory: &Path, kind: io::ErrorKind) {
-        INJECTED
-            .lock()
-            .unwrap()
-            .push((std::fs::canonicalize(directory).unwrap(), kind));
-    }
 
     #[test]
     fn a_lock_the_platform_cannot_take_is_skipped_and_the_store_opens() {
         let directory = tempfile::tempdir().unwrap();
-        inject(directory.path(), io::ErrorKind::Unsupported);
+        inject_lock_error(directory.path(), io::ErrorKind::Unsupported);
 
         let opened = crate::key_value_store::DurableKeyValueStore::try_init_new(directory.path());
 
@@ -949,7 +997,7 @@ mod lock_error_tests {
     #[test]
     fn any_other_lock_error_refuses_the_open() {
         let directory = tempfile::tempdir().unwrap();
-        inject(directory.path(), io::ErrorKind::Other);
+        inject_lock_error(directory.path(), io::ErrorKind::Other);
 
         match crate::key_value_store::DurableKeyValueStore::try_init_new(directory.path()) {
             Err(crate::RecoveryError::Io { source, .. }) => {
