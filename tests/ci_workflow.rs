@@ -7,12 +7,15 @@ fn recovery_workflow_runs_every_dedicated_issue_regression_target() {
         .join(".github")
         .join("workflows")
         .join("recovery.yml");
-    let workflow = fs::read_to_string(&workflow_path).unwrap_or_else(|error| {
-        panic!(
-            "failed to read recovery workflow {}: {error}",
-            workflow_path.display()
-        )
-    });
+    // A checkout with CRLF line endings would otherwise defeat every multi-line match.
+    let workflow = fs::read_to_string(&workflow_path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to read recovery workflow {}: {error}",
+                workflow_path.display()
+            )
+        })
+        .replace("\r\n", "\n");
 
     for target in [
         "async_compute_conflicts",
@@ -38,12 +41,15 @@ fn recovery_workflow_runs_the_complete_suite_on_linux() {
         .join(".github")
         .join("workflows")
         .join("recovery.yml");
-    let workflow = fs::read_to_string(&workflow_path).unwrap_or_else(|error| {
-        panic!(
-            "failed to read recovery workflow {}: {error}",
-            workflow_path.display()
-        )
-    });
+    // A checkout with CRLF line endings would otherwise defeat every multi-line match.
+    let workflow = fs::read_to_string(&workflow_path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to read recovery workflow {}: {error}",
+                workflow_path.display()
+            )
+        })
+        .replace("\r\n", "\n");
     let complete_linux_gate = [
         "      - name: Complete regression suite",
         "        if: runner.os == 'Linux'",
@@ -63,12 +69,15 @@ fn recovery_workflow_does_not_use_yaml_ambiguous_inline_run_commands() {
         .join(".github")
         .join("workflows")
         .join("recovery.yml");
-    let workflow = fs::read_to_string(&workflow_path).unwrap_or_else(|error| {
-        panic!(
-            "failed to read recovery workflow {}: {error}",
-            workflow_path.display()
-        )
-    });
+    // A checkout with CRLF line endings would otherwise defeat every multi-line match.
+    let workflow = fs::read_to_string(&workflow_path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to read recovery workflow {}: {error}",
+                workflow_path.display()
+            )
+        })
+        .replace("\r\n", "\n");
 
     let ambiguous_commands = workflow
         .lines()
@@ -88,12 +97,15 @@ fn windows_recovery_failure_is_reported_as_a_structured_annotation() {
         .join(".github")
         .join("workflows")
         .join("recovery.yml");
-    let workflow = fs::read_to_string(&workflow_path).unwrap_or_else(|error| {
-        panic!(
-            "failed to read recovery workflow {}: {error}",
-            workflow_path.display()
-        )
-    });
+    // A checkout with CRLF line endings would otherwise defeat every multi-line match.
+    let workflow = fs::read_to_string(&workflow_path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to read recovery workflow {}: {error}",
+                workflow_path.display()
+            )
+        })
+        .replace("\r\n", "\n");
 
     for required in [
         "- name: Public recovery scenarios (Windows diagnostics)",
@@ -115,12 +127,15 @@ fn windows_physical_durability_failure_is_reported_as_a_structured_annotation() 
         .join(".github")
         .join("workflows")
         .join("recovery.yml");
-    let workflow = fs::read_to_string(&workflow_path).unwrap_or_else(|error| {
-        panic!(
-            "failed to read recovery workflow {}: {error}",
-            workflow_path.display()
-        )
-    });
+    // A checkout with CRLF line endings would otherwise defeat every multi-line match.
+    let workflow = fs::read_to_string(&workflow_path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to read recovery workflow {}: {error}",
+                workflow_path.display()
+            )
+        })
+        .replace("\r\n", "\n");
 
     for required in [
         "- name: Windows physical durability and buffered compatibility matrix",
@@ -143,12 +158,15 @@ fn windows_workflow_runs_native_boundary_and_private_physical_fault_models() {
         .join(".github")
         .join("workflows")
         .join("recovery.yml");
-    let workflow = fs::read_to_string(&workflow_path).unwrap_or_else(|error| {
-        panic!(
-            "failed to read recovery workflow {}: {error}",
-            workflow_path.display()
-        )
-    });
+    // A checkout with CRLF line endings would otherwise defeat every multi-line match.
+    let workflow = fs::read_to_string(&workflow_path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to read recovery workflow {}: {error}",
+                workflow_path.display()
+            )
+        })
+        .replace("\r\n", "\n");
 
     for required in [
         "- name: Windows native boundary and physical fault models",
@@ -265,12 +283,15 @@ fn directory_ownership_tests_run_on_every_operating_system() {
         .join(".github")
         .join("workflows")
         .join("recovery.yml");
-    let workflow = fs::read_to_string(&workflow_path).unwrap_or_else(|error| {
-        panic!(
-            "failed to read recovery workflow {}: {error}",
-            workflow_path.display()
-        )
-    });
+    // A checkout with CRLF line endings would otherwise defeat every multi-line match.
+    let workflow = fs::read_to_string(&workflow_path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to read recovery workflow {}: {error}",
+                workflow_path.display()
+            )
+        })
+        .replace("\r\n", "\n");
     // `run:` directly after `name:` leaves no room for an `if:` gating the step to one OS.
     let every_os_step = [
         "      - name: Directory ownership seams and cross-process claims",
@@ -289,7 +310,9 @@ fn directory_ownership_tests_run_on_every_operating_system() {
 #[test]
 fn the_declared_minimum_toolchain_checks_every_target() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("read Cargo.toml");
+    let manifest = fs::read_to_string(root.join("Cargo.toml"))
+        .expect("read Cargo.toml")
+        .replace("\r\n", "\n");
     let declared = manifest
         .lines()
         .find_map(|line| line.trim().strip_prefix("rust-version = "))
@@ -301,12 +324,15 @@ fn the_declared_minimum_toolchain_checks_every_target() {
         declared.to_owned()
     };
     let workflow_path = root.join(".github").join("workflows").join("recovery.yml");
-    let workflow = fs::read_to_string(&workflow_path).unwrap_or_else(|error| {
-        panic!(
-            "failed to read recovery workflow {}: {error}",
-            workflow_path.display()
-        )
-    });
+    // A checkout with CRLF line endings would otherwise defeat every multi-line match.
+    let workflow = fs::read_to_string(&workflow_path)
+        .unwrap_or_else(|error| {
+            panic!(
+                "failed to read recovery workflow {}: {error}",
+                workflow_path.display()
+            )
+        })
+        .replace("\r\n", "\n");
     // Clippy's incompatible_msrv lint misses trait impls and test code, so only a build on the
     // declared toolchain enforces it.
     let msrv_job = [

@@ -1179,6 +1179,34 @@ mod lock_error_tests {
         assert!(opened.is_ok(), "{:?}", opened.err());
     }
 
+    /// FR-11: a skipped lock is reported, naming the lock file and the directory left unexcluded.
+    #[test]
+    fn a_skipped_lock_is_reported_with_a_warning() {
+        use crate::test_support::log_capture::{install, logged};
+
+        install();
+        let directory = tempfile::tempdir().unwrap();
+        inject_lock_error(directory.path(), io::ErrorKind::Unsupported);
+        let identity = super::canonical_directory_identity(directory.path()).unwrap();
+        let lock = identity.join(INNER_LOCK_NAME).display().to_string();
+        let warned = |message: &str| {
+            message.contains(&lock)
+                && message.contains("is not excluded")
+                && message.contains(&identity.display().to_string())
+        };
+
+        // Another test may clear the shared buffer between an open and the look, so each attempt
+        // opens again and so logs again.
+        let found = (0..10).any(|_| {
+            drop(crate::key_value_store::DurableKeyValueStore::try_init_new(
+                directory.path(),
+            ));
+            logged(warned)
+        });
+
+        assert!(found, "no warning named {lock}");
+    }
+
     #[test]
     fn any_other_lock_error_refuses_the_open() {
         let directory = tempfile::tempdir().unwrap();

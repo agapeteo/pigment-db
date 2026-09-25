@@ -51,6 +51,8 @@ fn every_frozen_legacy_family_requires_the_external_tool_without_mutation() {
             &[Lock::Inner],
             &format!("open {family}"),
         );
+        // Inspection takes no lock, so it is measured against what the open left.
+        let after_open = namespace(root.path(), &store_directory);
 
         let inspect_error = inspect_storage(&store_directory).unwrap_err();
         assert!(matches!(
@@ -61,8 +63,8 @@ fn every_frozen_legacy_family_requires_the_external_tool_without_mutation() {
         assert_only_locks_taken(
             root.path(),
             &store_directory,
-            &before,
-            &[Lock::Inner],
+            &after_open,
+            &[],
             &format!("inspect {family}"),
         );
 
@@ -129,7 +131,8 @@ fn namespace(root: &std::path::Path, store: &std::path::Path) -> Namespace {
 
 /// Asserts that an operation refused for a reason other than ownership changed nothing but the
 /// lock files it takes before it reads anything: every lock file in `taken` now exists, no lock
-/// file that existed before is gone, and everything else is byte-for-byte as it was.
+/// file appeared that was neither there before nor in `taken`, none that existed before is gone,
+/// and everything else is byte-for-byte as it was.
 fn assert_only_locks_taken(
     root: &std::path::Path,
     store: &std::path::Path,
@@ -142,10 +145,20 @@ fn assert_only_locks_taken(
     for lock in &before.locks {
         assert!(after.locks.contains(lock), "{operation} removed {lock:?}");
     }
-    for &lock in taken {
+    let taken = taken
+        .iter()
+        .map(|&lock| lock_path(root, store, lock))
+        .collect::<Vec<_>>();
+    for lock in &taken {
         assert!(
-            after.locks.contains(&lock_path(root, store, lock)),
+            after.locks.contains(lock),
             "{operation} must leave the {lock:?} lock file"
+        );
+    }
+    for lock in &after.locks {
+        assert!(
+            before.locks.contains(lock) || taken.contains(lock),
+            "{operation} created {lock:?}, which it does not take"
         );
     }
 }
@@ -201,17 +214,12 @@ fn current_invalid_and_ambiguous_evidence_stays_distinct_across_runtime_entry_po
             &[Lock::Inner],
             &format!("open {case}"),
         );
+        let after_open = namespace(root, store);
         assert!(matches!(
             inspect_storage(store),
             Err(CompactionError::InvalidArtifact { path: found }) if found == path
         ));
-        assert_only_locks_taken(
-            root,
-            store,
-            &before,
-            &[Lock::Inner],
-            &format!("inspect {case}"),
-        );
+        assert_only_locks_taken(root, store, &after_open, &[], &format!("inspect {case}"));
         assert!(matches!(
             compact_directory_in_place(store, ClosedCompactionOptions::default()),
             Err(CompactionError::InvalidArtifact { path: found }) if found == path
@@ -309,6 +317,7 @@ fn current_invalid_and_ambiguous_evidence_stays_distinct_across_runtime_entry_po
         &[Lock::Replacement],
         "open ambiguous",
     );
+    let after_open = namespace(ambiguous_root.path(), &ambiguous_store);
     assert!(matches!(
         inspect_storage(&ambiguous_store),
         Err(CompactionError::AuthorityUndetermined { .. })
@@ -316,8 +325,8 @@ fn current_invalid_and_ambiguous_evidence_stays_distinct_across_runtime_entry_po
     assert_only_locks_taken(
         ambiguous_root.path(),
         &ambiguous_store,
-        &before,
-        &[Lock::Replacement],
+        &after_open,
+        &[],
         "inspect ambiguous",
     );
     assert!(matches!(

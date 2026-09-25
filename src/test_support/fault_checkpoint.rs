@@ -265,8 +265,58 @@ pub(crate) fn run_maintenance_checkpoint_child_with_evidence_root(
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+    #[cfg(windows)]
+    wait_for_released_lock_files(evidence_root);
     let after = snapshot_directory(evidence_root).expect("snapshot evidence after child");
     MaintenanceChildEvidence { before, after }
+}
+
+/// Waits until no lock file under `root` is still held by an exited child. Windows releases a
+/// terminated process's locks asynchronously, and refuses reads of a held one; elsewhere a lock
+/// is gone once its owner is reaped.
+#[cfg(windows)]
+fn wait_for_released_lock_files(root: &Path) {
+    fn lock_files(directory: &Path, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => lock_files(&path, found),
+                Ok(kind)
+                    if kind.is_file()
+                        && entry
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|name| name.ends_with(".pigment-lock")) =>
+                {
+                    found.push(path)
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut pending = Vec::new();
+    lock_files(root, &mut pending);
+    let started = Instant::now();
+    while let Some(path) = pending.last() {
+        let released = match std::fs::File::open(path) {
+            Ok(file) => !matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            Err(_) => true,
+        };
+        if released {
+            pending.pop();
+            continue;
+        }
+        assert!(
+            started.elapsed() < WATCHDOG,
+            "{} was still held after its owner exited",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[cfg(test)]

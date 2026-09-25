@@ -1059,6 +1059,25 @@ fn closed_compaction_checkpoint_child() {
 mod ownership {
     use super::*;
 
+    /// Every entry of `directory` by name, with a regular file's bytes; symlinks and directories are
+    /// listed without following them.
+    fn entries_of(directory: &std::path::Path) -> Vec<(std::ffi::OsString, Option<Vec<u8>>)> {
+        let mut entries = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let bytes = entry
+                    .file_type()
+                    .unwrap()
+                    .is_file()
+                    .then(|| std::fs::read(entry.path()).unwrap());
+                (entry.file_name(), bytes)
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
+
     /// specs/011, FR-9: a lock file that a refused open left in the source after the claim retired its
     /// own travels into `.previous`, and either cleanup deletes it with the generation: the
     /// compactor's own, and recovery's. A directory of that name is not a lock file: it still keeps
@@ -1098,23 +1117,49 @@ mod ownership {
         assert!(!prepared.paths.previous.exists());
         assert!(!prepared.paths.manifest.exists());
 
-        let (_root, store_dir, prepared, mut manifest) = replacement_fixture();
-        std::fs::create_dir(prepared.paths.previous.join(INNER_LOCK_NAME)).unwrap();
-        assert_eq!(
-            cleanup_closed_with_checkpoint(&prepared, &mut manifest, |_| Ok(())).unwrap(),
-            crate::CleanupStatus::Pending
-        );
-        assert!(prepared.paths.previous.join(INNER_LOCK_NAME).is_dir());
-        assert_eq!(
-            crate::compaction::recovery::recover_cleanup_pending_closed(
-                &store_dir,
-                &prepared.paths,
-                &manifest,
-            )
-            .unwrap(),
-            crate::CleanupStatus::Pending
-        );
-        assert!(prepared.paths.previous.join(INNER_LOCK_NAME).is_dir());
+        // Anything else of that name, or a near name, is foreign: both cleanups stay pending and
+        // `.previous` keeps every artifact.
+        type Plant = fn(&std::path::Path);
+        let foreign: [(&str, Plant); 3] = [
+            ("a directory", |previous| {
+                std::fs::create_dir(previous.join(INNER_LOCK_NAME)).unwrap()
+            }),
+            ("a near name", |previous| {
+                std::fs::write(previous.join(format!("{INNER_LOCK_NAME}.old")), b"1\n").unwrap()
+            }),
+            ("a symlink", |previous| {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(
+                    previous.join("kv.wal.dat"),
+                    previous.join(INNER_LOCK_NAME),
+                )
+                .unwrap();
+                #[cfg(not(unix))]
+                std::fs::create_dir(previous.join(INNER_LOCK_NAME)).unwrap();
+            }),
+        ];
+        for (what, plant) in foreign {
+            let (_root, store_dir, prepared, mut manifest) = replacement_fixture();
+            plant(&prepared.paths.previous);
+            let previous = entries_of(&prepared.paths.previous);
+            assert_eq!(
+                cleanup_closed_with_checkpoint(&prepared, &mut manifest, |_| Ok(())).unwrap(),
+                crate::CleanupStatus::Pending,
+                "{what}"
+            );
+            assert_eq!(entries_of(&prepared.paths.previous), previous, "{what}");
+            assert_eq!(
+                crate::compaction::recovery::recover_cleanup_pending_closed(
+                    &store_dir,
+                    &prepared.paths,
+                    &manifest,
+                )
+                .unwrap(),
+                crate::CleanupStatus::Pending,
+                "{what}"
+            );
+            assert_eq!(entries_of(&prepared.paths.previous), previous, "{what}");
+        }
 
         let (_root, store_dir, prepared, mut manifest) = replacement_fixture();
         crate::compaction::recovery::recover_replacement_published_closed(
@@ -1168,6 +1213,13 @@ mod ownership {
                 &store_dir,
                 pause_dir.path(),
                 point,
+            );
+            // FR-4: the claim deleted its inner lock file before it published anything.
+            assert!(
+                !store_dir
+                    .join(crate::maintenance_coordination::INNER_LOCK_NAME)
+                    .exists(),
+                "{point:?}"
             );
 
             let refused = crate::key_value_store::DurableKeyValueStore::try_init_new(&store_dir);
@@ -1501,6 +1553,45 @@ mod ownership {
                 ".store.pigment-lock",
             );
         }
+    }
+
+    /// specs/011, FR-9: only a regular file of that name is skipped. A directory named like the
+    /// lock file, appearing in the source after the claim retired its lock, fails the compaction
+    /// closed before it publishes anything.
+    #[test]
+    fn a_directory_named_like_the_lock_file_fails_the_compaction_closed() {
+        use crate::test_support::fault_checkpoint::{
+            pause_maintenance_child, MaintenanceCut, MaintenanceFaultPoint, MaintenancePhase,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let store_dir = root.path().join("store");
+        std::fs::create_dir(&store_dir).unwrap();
+        create_segmented_v2(&store_dir, FixtureFamily::KeyValue);
+        let pause_dir = tempfile::tempdir().unwrap();
+        let child = pause_maintenance_child(
+            "compaction::recovery_tests::closed_compaction_checkpoint_child",
+            &store_dir,
+            pause_dir.path(),
+            MaintenanceFaultPoint {
+                phase: MaintenancePhase::Prepared,
+                cut: MaintenanceCut::StagingValidate,
+            },
+        );
+        let foreign = store_dir.join(crate::maintenance_coordination::INNER_LOCK_NAME);
+        std::fs::create_dir(&foreign).unwrap();
+
+        let exit = child.resume();
+
+        // Its staging stays as evidence, as it does for any source that changed after capture.
+        assert_eq!(exit, 101, "the compaction must fail closed");
+        let paths = crate::compaction::publication::directory_artifact_paths(&store_dir).unwrap();
+        assert!(!paths.manifest.exists(), "nothing may be published");
+        assert!(
+            !paths.previous.exists(),
+            "the source must not be moved aside"
+        );
+        assert!(store_dir.join("kv.wal.dat").is_file());
+        assert!(foreign.is_dir());
     }
 
     /// Whether some descriptor other than a fresh one holds `store_dir`'s inner lock. A lock taken

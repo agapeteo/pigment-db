@@ -2472,7 +2472,6 @@ mod tests {
     use std::fs;
     use std::io;
     use std::path::Path;
-    use std::sync::{Mutex, Once};
 
     use crate::key_value_store::DurableKeyValueStore;
     use crate::wal::model::{KeyValueData, StoredAction};
@@ -2484,30 +2483,7 @@ mod tests {
         ArtifactPaths, PublicationCheckpoint, RecoveryDecision, RecoverySource, StoreKind,
     };
 
-    struct TestLogger;
-    static TEST_LOGGER: TestLogger = TestLogger;
-    static TEST_LOGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-    static INSTALL_TEST_LOGGER: Once = Once::new();
-
-    impl log::Log for TestLogger {
-        fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
-            true
-        }
-
-        fn log(&self, record: &log::Record<'_>) {
-            TEST_LOGS.lock().unwrap().push(record.args().to_string());
-        }
-
-        fn flush(&self) {}
-    }
-
-    fn capture_logs() {
-        INSTALL_TEST_LOGGER.call_once(|| {
-            log::set_logger(&TEST_LOGGER).unwrap();
-            log::set_max_level(log::LevelFilter::Trace);
-        });
-        TEST_LOGS.lock().unwrap().clear();
-    }
+    use crate::test_support::log_capture::{capture_logs, TEST_LOGS};
 
     #[test]
     fn artifact_paths_and_active_authority_ignore_staging() {
