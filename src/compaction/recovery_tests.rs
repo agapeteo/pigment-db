@@ -1317,9 +1317,11 @@ mod ownership {
     }
 
     /// specs/011: an open that checked for maintenance before another process's closed compaction
-    /// staged anything, and reaches its inner lock only after the claim retired it, is refused by
-    /// the replacement lock. The lock file it creates on the way must not break the compaction: the
-    /// compaction completes and the directory reopens with its data.
+    /// staged anything, and reaches its inner lock only once the claim has retired it, neither
+    /// opens nor breaks the compaction. Where the directory is present it creates a lock file and
+    /// is refused by the replacement lock; while the directory is moved aside it finds no directory
+    /// and creates nothing. Either way the compaction completes and the directory reopens with its
+    /// data.
     #[test]
     fn an_open_stalled_across_another_processs_compaction_neither_opens_nor_breaks_it() {
         use crate::maintenance_coordination::lock_seams::Stall;
@@ -1327,15 +1329,28 @@ mod ownership {
             pause_maintenance_child, MaintenanceCut, MaintenanceFaultPoint, MaintenancePhase,
             MAINTENANCE_PAUSED_CHILD_COMPLETED,
         };
-        for point in [
-            MaintenanceFaultPoint {
-                phase: MaintenancePhase::Prepared,
-                cut: MaintenanceCut::StagingValidate,
-            },
-            MaintenanceFaultPoint {
-                phase: MaintenancePhase::ReplacementPublished,
-                cut: MaintenanceCut::ReopenValidation,
-            },
+        for (point, directory_present) in [
+            (
+                MaintenanceFaultPoint {
+                    phase: MaintenancePhase::Prepared,
+                    cut: MaintenanceCut::StagingValidate,
+                },
+                true,
+            ),
+            (
+                MaintenanceFaultPoint {
+                    phase: MaintenancePhase::PreviousPublished,
+                    cut: MaintenanceCut::PreviousPublish,
+                },
+                false,
+            ),
+            (
+                MaintenanceFaultPoint {
+                    phase: MaintenancePhase::ReplacementPublished,
+                    cut: MaintenanceCut::ReopenValidation,
+                },
+                true,
+            ),
         ] {
             let root = tempfile::tempdir().unwrap();
             let store_dir = root.path().join("store");
@@ -1360,27 +1375,33 @@ mod ownership {
 
             stall.release();
             let refused = opener.join().unwrap();
-            assert!(
+            assert_eq!(
                 store_dir
                     .join(crate::maintenance_coordination::INNER_LOCK_NAME)
                     .is_file(),
-                "{point:?}: the refused open must have left its lock file in the directory"
+                directory_present,
+                "{point:?}: a refused open leaves a lock file exactly where it found a directory"
             );
             let exit = child.resume();
 
+            let (expected_kind, named) = if directory_present {
+                (std::io::ErrorKind::WouldBlock, ".store.pigment-lock")
+            } else {
+                (std::io::ErrorKind::NotFound, "store/.pigment-lock")
+            };
             match refused {
                 Err(crate::RecoveryError::Io {
                     operation: crate::RecoveryOperation::Inspect,
                     source,
                     ..
                 }) => {
-                    assert_eq!(source.kind(), std::io::ErrorKind::WouldBlock, "{point:?}");
+                    assert_eq!(source.kind(), expected_kind, "{point:?}: {source}");
                     assert!(
-                        source.to_string().contains(".store.pigment-lock"),
-                        "{point:?}: the replacement lock must refuse: {source}"
+                        source.to_string().contains(named),
+                        "{point:?}: the refusal must name {named}: {source}"
                     );
                 }
-                Err(error) => panic!("{point:?}: expected a WouldBlock refusal, got {error:?}"),
+                Err(error) => panic!("{point:?}: expected an Inspect refusal, got {error:?}"),
                 Ok(()) => {
                     panic!("{point:?}: an open during another process's compaction must fail")
                 }
