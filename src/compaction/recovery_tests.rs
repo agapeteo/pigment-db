@@ -1665,16 +1665,21 @@ fn every_closed_checkpoint_process_exit_reopens_exact_state_or_preserves_explici
                 "{family:?} {phase:?} {cut:?} must leave maintenance evidence"
             );
             let _ = evidence;
-            // The reopen takes the directory's locks and records its own process id in them
-            // before it reads anything (specs/011); the store namespace is what a refused reopen
-            // must leave as it found it.
-            let without_lock_files =
+            // With maintenance in progress, the reopen takes only the replacement lock the claim
+            // created, and records its own process id in it before it reads anything
+            // (specs/011). A refused reopen must leave everything else as it found it, including
+            // any inner lock file the claim left.
+            let without_replacement_lock =
                 |mut snapshot: crate::test_support::maintenance_fixtures::DirectoryByteSnapshot| {
-                    snapshot.remove(std::path::Path::new(".store.pigment-lock"));
-                    snapshot.remove(std::path::Path::new("store/.pigment-lock"));
+                    assert!(
+                        snapshot
+                            .remove(std::path::Path::new(".store.pigment-lock"))
+                            .is_some(),
+                        "{family:?} {phase:?} {cut:?}: the replacement lock file must exist"
+                    );
                     snapshot
                 };
-            let before_reopen = without_lock_files(snapshot_directory(root.path()).unwrap());
+            let before_reopen = without_replacement_lock(snapshot_directory(root.path()).unwrap());
             match reopen_after_checkpoint(&store_dir, family) {
                 Ok(status) => {
                     assert_eq!(status, crate::RecoveryStatus::Recovered);
@@ -1692,7 +1697,7 @@ fn every_closed_checkpoint_process_exit_reopens_exact_state_or_preserves_explici
                         "{family:?} {phase:?} {cut:?} returned unexpected {error:?}"
                     );
                     assert_eq!(
-                        without_lock_files(snapshot_directory(root.path()).unwrap()),
+                        without_replacement_lock(snapshot_directory(root.path()).unwrap()),
                         before_reopen
                     );
                 }

@@ -22,7 +22,7 @@ fn every_frozen_legacy_family_requires_the_external_tool_without_mutation() {
         std::fs::create_dir(&store_directory).unwrap();
         let artifact = store_directory.join(name);
         std::fs::copy(fixture_directory.join(name), &artifact).unwrap();
-        let before = namespace_except_lock_file(root.path(), &store_directory);
+        let before = namespace(root.path(), &store_directory);
 
         let open_error = match family {
             "value" => match DurableKeyValueStore::try_init_new(&store_directory) {
@@ -44,14 +44,12 @@ fn every_frozen_legacy_family_requires_the_external_tool_without_mutation() {
             RecoveryError::MigrationRequired { ref path } if path == &artifact
         ));
         assert!(open_error.to_string().contains("pigment-db-migrate"));
-        assert!(
-            store_directory.join(".pigment-lock").is_file(),
-            "open {family}"
-        );
-        assert_eq!(
-            namespace_except_lock_file(root.path(), &store_directory),
-            before,
-            "open {family}"
+        assert_only_locks_taken(
+            root.path(),
+            &store_directory,
+            &before,
+            &[Lock::Inner],
+            &format!("open {family}"),
         );
 
         let inspect_error = inspect_storage(&store_directory).unwrap_err();
@@ -60,10 +58,12 @@ fn every_frozen_legacy_family_requires_the_external_tool_without_mutation() {
             CompactionError::MigrationRequired { ref path } if path == &artifact
         ));
         assert!(inspect_error.to_string().contains("pigment-db-migrate"));
-        assert_eq!(
-            namespace_except_lock_file(root.path(), &store_directory),
-            before,
-            "inspect {family}"
+        assert_only_locks_taken(
+            root.path(),
+            &store_directory,
+            &before,
+            &[Lock::Inner],
+            &format!("inspect {family}"),
         );
 
         let compact_error =
@@ -74,32 +74,80 @@ fn every_frozen_legacy_family_requires_the_external_tool_without_mutation() {
             CompactionError::MigrationRequired { ref path } if path == &artifact
         ));
         assert!(compact_error.to_string().contains("pigment-db-migrate"));
-        assert_eq!(
-            namespace_except_lock_file(root.path(), &store_directory),
-            before,
-            "compact {family}"
+        assert_only_locks_taken(
+            root.path(),
+            &store_directory,
+            &before,
+            &[Lock::Inner, Lock::Replacement],
+            &format!("compact {family}"),
         );
     }
 }
 
-/// The namespace without the store directory's two lock files (specs/011): the inner one an open
-/// creates in the directory and the replacement one a closed claim creates beside it, each before
-/// anything is read. An open or claim refused for any other reason leaves them behind; nothing
-/// else may change.
-fn namespace_except_lock_file(
+/// The store directory's two lock files (specs/011).
+#[derive(Clone, Copy, Debug)]
+enum Lock {
+    /// `<store>/.pigment-lock`, which an open takes.
+    Inner,
+    /// `.<store name>.pigment-lock` beside it, which a claim or a maintenance-state open takes.
+    Replacement,
+}
+
+/// A namespace snapshot without the store directory's lock files, whose contents record whichever
+/// process locked them last, together with the lock files present.
+struct Namespace {
+    without_locks: Vec<(std::path::PathBuf, Option<Vec<u8>>)>,
+    locks: Vec<std::path::PathBuf>,
+}
+
+fn lock_path(root: &std::path::Path, store: &std::path::Path, lock: Lock) -> std::path::PathBuf {
+    let relative = store.strip_prefix(root).unwrap();
+    match lock {
+        Lock::Inner => relative.join(".pigment-lock"),
+        Lock::Replacement => {
+            let mut name = std::ffi::OsString::from(".");
+            name.push(relative.file_name().unwrap());
+            name.push(".pigment-lock");
+            relative.with_file_name(name)
+        }
+    }
+}
+
+fn namespace(root: &std::path::Path, store: &std::path::Path) -> Namespace {
+    let lock_paths = [
+        lock_path(root, store, Lock::Inner),
+        lock_path(root, store, Lock::Replacement),
+    ];
+    let (locks, without_locks) = namespace_snapshot(root)
+        .into_iter()
+        .partition::<Vec<_>, _>(|(path, _)| lock_paths.contains(path));
+    Namespace {
+        without_locks,
+        locks: locks.into_iter().map(|(path, _)| path).collect(),
+    }
+}
+
+/// Asserts that an operation refused for a reason other than ownership changed nothing but the
+/// lock files it takes before it reads anything: every lock file in `taken` now exists, no lock
+/// file that existed before is gone, and everything else is byte-for-byte as it was.
+fn assert_only_locks_taken(
     root: &std::path::Path,
     store: &std::path::Path,
-) -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {
-    let relative = store.strip_prefix(root).unwrap();
-    let inner = relative.join(".pigment-lock");
-    let mut replacement_name = std::ffi::OsString::from(".");
-    replacement_name.push(relative.file_name().unwrap());
-    replacement_name.push(".pigment-lock");
-    let replacement = relative.with_file_name(replacement_name);
-    namespace_snapshot(root)
-        .into_iter()
-        .filter(|(path, _)| *path != inner && *path != replacement)
-        .collect()
+    before: &Namespace,
+    taken: &[Lock],
+    operation: &str,
+) {
+    let after = namespace(root, store);
+    assert_eq!(after.without_locks, before.without_locks, "{operation}");
+    for lock in &before.locks {
+        assert!(after.locks.contains(lock), "{operation} removed {lock:?}");
+    }
+    for &lock in taken {
+        assert!(
+            after.locks.contains(&lock_path(root, store, lock)),
+            "{operation} must leave the {lock:?} lock file"
+        );
+    }
 }
 
 fn namespace_snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, Option<Vec<u8>>)> {
@@ -138,7 +186,7 @@ fn current_invalid_and_ambiguous_evidence_stays_distinct_across_runtime_entry_po
         store: &std::path::Path,
         path: &std::path::Path,
     ) {
-        let before = namespace_except_lock_file(root, store);
+        let before = namespace(root, store);
         let open_error = match DurableKeyValueStore::try_init_new(store) {
             Err(error) => error,
             Ok(_) => panic!("invalid current evidence unexpectedly opened: {case}"),
@@ -146,17 +194,35 @@ fn current_invalid_and_ambiguous_evidence_stays_distinct_across_runtime_entry_po
         assert!(
             matches!(open_error, RecoveryError::InvalidArtifact { path: ref found } if found == path)
         );
-        assert_eq!(namespace_except_lock_file(root, store), before);
+        assert_only_locks_taken(
+            root,
+            store,
+            &before,
+            &[Lock::Inner],
+            &format!("open {case}"),
+        );
         assert!(matches!(
             inspect_storage(store),
             Err(CompactionError::InvalidArtifact { path: found }) if found == path
         ));
-        assert_eq!(namespace_except_lock_file(root, store), before);
+        assert_only_locks_taken(
+            root,
+            store,
+            &before,
+            &[Lock::Inner],
+            &format!("inspect {case}"),
+        );
         assert!(matches!(
             compact_directory_in_place(store, ClosedCompactionOptions::default()),
             Err(CompactionError::InvalidArtifact { path: found }) if found == path
         ));
-        assert_eq!(namespace_except_lock_file(root, store), before);
+        assert_only_locks_taken(
+            root,
+            store,
+            &before,
+            &[Lock::Inner, Lock::Replacement],
+            &format!("compact {case}"),
+        );
     }
 
     let corrupt_root = tempfile::tempdir().unwrap();
@@ -230,29 +296,39 @@ fn current_invalid_and_ambiguous_evidence_stays_distinct_across_runtime_entry_po
             .into_store();
         store.put(b"new".to_vec(), b"candidate".to_vec());
     }
-    let before = namespace_except_lock_file(ambiguous_root.path(), &ambiguous_store);
+    let before = namespace(ambiguous_root.path(), &ambiguous_store);
     assert!(matches!(
         DurableKeyValueStore::try_init_new(&ambiguous_store),
         Err(RecoveryError::AuthorityUndetermined { .. })
     ));
-    assert_eq!(
-        namespace_except_lock_file(ambiguous_root.path(), &ambiguous_store),
-        before
+    // Directory-level maintenance is in progress, so the open takes the replacement lock only.
+    assert_only_locks_taken(
+        ambiguous_root.path(),
+        &ambiguous_store,
+        &before,
+        &[Lock::Replacement],
+        "open ambiguous",
     );
     assert!(matches!(
         inspect_storage(&ambiguous_store),
         Err(CompactionError::AuthorityUndetermined { .. })
     ));
-    assert_eq!(
-        namespace_except_lock_file(ambiguous_root.path(), &ambiguous_store),
-        before
+    assert_only_locks_taken(
+        ambiguous_root.path(),
+        &ambiguous_store,
+        &before,
+        &[Lock::Replacement],
+        "inspect ambiguous",
     );
     assert!(matches!(
         compact_directory_in_place(&ambiguous_store, ClosedCompactionOptions::default()),
         Err(CompactionError::AuthorityUndetermined { .. })
     ));
-    assert_eq!(
-        namespace_except_lock_file(ambiguous_root.path(), &ambiguous_store),
-        before
+    assert_only_locks_taken(
+        ambiguous_root.path(),
+        &ambiguous_store,
+        &before,
+        &[Lock::Replacement],
+        "compact ambiguous",
     );
 }
