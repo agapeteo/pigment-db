@@ -20,7 +20,7 @@ fn fresh_physical_publication_exposes_only_canonical_files_for_every_family() {
             .unwrap()
             .into_store(),
     );
-    assert_only_active(value_directory.path(), "kv.wal.dat");
+    assert_only_active_and_lock_file(value_directory.path(), "kv.wal.dat");
 
     let set_directory = tempfile::tempdir().unwrap();
     drop(
@@ -28,7 +28,7 @@ fn fresh_physical_publication_exposes_only_canonical_files_for_every_family() {
             .unwrap()
             .into_store(),
     );
-    assert_only_active(set_directory.path(), "set.wal.dat");
+    assert_only_active_and_lock_file(set_directory.path(), "set.wal.dat");
 
     let map_directory = tempfile::tempdir().unwrap();
     drop(
@@ -36,7 +36,7 @@ fn fresh_physical_publication_exposes_only_canonical_files_for_every_family() {
             .unwrap()
             .into_store(),
     );
-    assert_only_active(map_directory.path(), "map.wal.dat");
+    assert_only_active_and_lock_file(map_directory.path(), "map.wal.dat");
 }
 
 fn assert_only_active(directory: &std::path::Path, active_name: &str) {
@@ -45,6 +45,23 @@ fn assert_only_active(directory: &std::path::Path, active_name: &str) {
         .map(|entry| entry.unwrap().file_name())
         .collect::<Vec<_>>();
     assert_eq!(names, [std::ffi::OsString::from(active_name)]);
+}
+
+/// Asserts that `directory` holds its active WAL and the directory's lock file (specs/011), which
+/// stays after a store opened there is dropped, and nothing else.
+fn assert_only_active_and_lock_file(directory: &std::path::Path, active_name: &str) {
+    let mut names = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            std::ffi::OsString::from(".pigment-lock"),
+            std::ffi::OsString::from(active_name)
+        ]
+    );
 }
 
 #[test]
@@ -125,7 +142,7 @@ fn physical_recovery_repairs_a_terminal_tail_before_exposing_the_store() {
     assert_eq!(reopened.status(), RecoveryStatus::Recovered);
     assert_eq!(reopened.store().get(b"stable"), Some(b"accepted".to_vec()));
     assert_eq!(reopened.store().get(b"torn"), None);
-    assert_only_active(directory.path(), "kv.wal.dat");
+    assert_only_active_and_lock_file(directory.path(), "kv.wal.dat");
 }
 
 #[test]

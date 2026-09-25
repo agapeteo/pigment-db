@@ -21,7 +21,14 @@ fn physical_construction_preflights_actual_directory_content_without_residue() {
         .map(|entry| entry.unwrap().file_name())
         .collect::<Vec<_>>();
     names.sort();
-    assert_eq!(names, [std::ffi::OsString::from("kv.wal.dat")]);
+    // The directory's lock file (specs/011) stays after the store is dropped.
+    assert_eq!(
+        names,
+        [
+            std::ffi::OsString::from(".pigment-lock"),
+            std::ffi::OsString::from("kv.wal.dat")
+        ]
+    );
 }
 
 #[test]
@@ -43,5 +50,17 @@ fn physical_open_preflight_preserves_existing_authority_byte_for_byte() {
     assert_eq!(physical.get(b"key"), Some(b"value".to_vec()));
     drop(physical);
     assert_eq!(std::fs::read(&active).unwrap(), before);
-    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    let mut names = std::fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    names.sort();
+    // The directory's lock file (specs/011) stays after the store is dropped.
+    assert_eq!(
+        names,
+        [
+            std::ffi::OsString::from(".pigment-lock"),
+            std::ffi::OsString::from("kv.wal.dat")
+        ]
+    );
 }

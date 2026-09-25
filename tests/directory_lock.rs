@@ -79,6 +79,15 @@ fn collect(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
         if path.is_dir() {
             out.push((relative, None));
             collect(root, &path, out);
+        } else if cfg!(windows)
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".pigment-lock"))
+        {
+            // Windows refuses every read of a locked range, even through the holder's own second
+            // handle, so a lock file is recorded by its presence there.
+            out.push((relative, Some(b"<lock file>".to_vec())));
         } else {
             let bytes = fs::read(&path)
                 .unwrap_or_else(|error| panic!("read fixture file {}: {error}", path.display()));
@@ -318,6 +327,20 @@ fn assert_refused_naming(line: &str, family: &str, lock: &Path) {
     );
 }
 
+/// The families the "open-each" role opens, in order: every family, then the first again.
+const OPEN_EACH: [&str; 4] = ["kv", "set", "map", "kv"];
+
+/// Pairs each line of an "open-each" report with the family it reports, requiring one line per
+/// open: a child that reports fewer is a harness failure, not a pass.
+fn open_each_lines(lines: &[String]) -> impl Iterator<Item = (&String, &'static str)> {
+    assert_eq!(
+        lines.len(),
+        OPEN_EACH.len(),
+        "one report line per open: {lines:?}"
+    );
+    lines.iter().zip(OPEN_EACH)
+}
+
 /// A1: while this process holds one family, another process's open of every family is refused,
 /// before it reads or writes anything, naming the directory's lock file.
 #[test]
@@ -335,7 +358,7 @@ fn another_process_cannot_open_a_directory_this_process_holds() {
     let lines = run_role("open-each", &fixture, &fixture.store());
 
     let lock = fixture.inner_lock();
-    for (line, family) in lines.iter().zip(["kv", "set", "map", "kv"]) {
+    for (line, family) in open_each_lines(&lines) {
         assert_refused_naming(line, family, &lock);
     }
     assert_eq!(
@@ -343,12 +366,13 @@ fn another_process_cannot_open_a_directory_this_process_holds() {
         before,
         "a refused open must change nothing"
     );
+    // Read once released: Windows refuses reads of a locked range, and release keeps the file.
+    drop(held);
     assert_eq!(
         fs::read_to_string(&lock).expect("lock file"),
         format!("{}\n", std::process::id()),
         "the lock file records its owner"
     );
-    drop(held);
 }
 
 /// A2: the refusal names the lock file and, where the owner's record can be read, the owning
@@ -397,7 +421,7 @@ fn one_process_opens_every_family_and_releases_the_directory_on_drop() {
     let lines = run_role("open-each", &fixture, &fixture.store());
 
     assert!(
-        lines.iter().all(|line| line.ends_with(" opened")),
+        open_each_lines(&lines).all(|(line, family)| *line == format!("{family} opened")),
         "a released directory must open in another process: {lines:?}"
     );
     assert!(
@@ -413,12 +437,18 @@ fn a_killed_owner_leaves_the_directory_openable() {
     let mut holder = spawn_holder(&fixture);
     holder.kill_and_reap();
 
-    // Windows releases a terminated process's locks asynchronously, so allow it a moment.
+    // Windows releases a terminated process's locks asynchronously, so it is allowed a moment.
+    // Elsewhere the lock is gone once the owner is reaped, and the first open must succeed.
+    let patience = if cfg!(windows) {
+        Duration::from_secs(5)
+    } else {
+        Duration::ZERO
+    };
     let started = Instant::now();
     let stores = loop {
         match DurableKeyValueStore::try_init_new(fixture.store()) {
             Ok(outcome) => break outcome.into_parts().0,
-            Err(error) if started.elapsed() < Duration::from_secs(5) => {
+            Err(error) if started.elapsed() < patience => {
                 let _ = error;
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -447,11 +477,11 @@ fn the_directory_stays_owned_until_the_last_family_is_dropped() {
     drop(set);
     let after_both = run_role("open-each", &fixture, &fixture.store());
 
-    for (line, family) in while_set_open.iter().zip(["kv", "set", "map", "kv"]) {
+    for (line, family) in open_each_lines(&while_set_open) {
         assert_refused_naming(line, family, &fixture.inner_lock());
     }
     assert!(
-        after_both.iter().all(|line| line.ends_with(" opened")),
+        open_each_lines(&after_both).all(|(line, family)| *line == format!("{family} opened")),
         "once every family is dropped the directory must open: {after_both:?}"
     );
 }
@@ -470,7 +500,7 @@ fn an_alias_of_a_held_directory_is_refused() {
 
     let lines = run_role("open-each", &fixture, &alias);
 
-    for (line, family) in lines.iter().zip(["kv", "set", "map", "kv"]) {
+    for (line, family) in open_each_lines(&lines) {
         assert_refused_naming(line, family, &fixture.inner_lock());
     }
     drop(held);
@@ -681,7 +711,7 @@ fn a_read_only_lock_file_created_in_advance_serves_a_read_only_store_directory()
         recorded.is_empty(),
         "a read-only lock records nothing: {recorded:?}"
     );
-    for (line, family) in lines.iter().zip(["kv", "set", "map", "kv"]) {
+    for (line, family) in open_each_lines(&lines) {
         assert_refused_naming(line, family, &fixture.inner_lock());
     }
 }
