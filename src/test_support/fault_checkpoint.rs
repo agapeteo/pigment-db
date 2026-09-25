@@ -13,6 +13,13 @@ const MAINTENANCE_STORE_DIR_ENV: &str = "PIGMENT_DB_MAINTENANCE_STORE_DIR";
 const MAINTENANCE_PHASE_ENV: &str = "PIGMENT_DB_MAINTENANCE_PHASE";
 const MAINTENANCE_CUT_ENV: &str = "PIGMENT_DB_MAINTENANCE_CUT";
 const MAINTENANCE_EXIT_CODE: i32 = 87;
+/// When set, a child reaching its requested cut parks there instead of exiting: it writes
+/// `paused` into this directory and continues once `resume` appears.
+const MAINTENANCE_PAUSE_ENV: &str = "PIGMENT_DB_MAINTENANCE_PAUSE_DIR";
+/// A paused child whose `resume` never came.
+const MAINTENANCE_PAUSE_TIMEOUT_CODE: i32 = 88;
+/// A paused child that resumed and completed its maintenance.
+pub(crate) const MAINTENANCE_PAUSED_CHILD_COMPLETED: i32 = 89;
 const WATCHDOG: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,8 +115,97 @@ pub(crate) fn exit_at_maintenance_fault(point: MaintenanceFaultPoint) {
     if std::env::var(MAINTENANCE_PHASE_ENV).as_deref() == Ok(point.phase.name())
         && std::env::var(MAINTENANCE_CUT_ENV).as_deref() == Ok(point.cut.name())
     {
-        std::process::exit(MAINTENANCE_EXIT_CODE);
+        let Some(pause_dir) = std::env::var_os(MAINTENANCE_PAUSE_ENV).map(PathBuf::from) else {
+            std::process::exit(MAINTENANCE_EXIT_CODE);
+        };
+        std::fs::write(pause_dir.join("paused"), b"").expect("signal paused");
+        let started = Instant::now();
+        while !pause_dir.join("resume").exists() {
+            if started.elapsed() >= WATCHDOG {
+                std::process::exit(MAINTENANCE_PAUSE_TIMEOUT_CODE);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
+}
+
+/// Whether this process is a maintenance child asked to park at its cut rather than exit.
+pub(crate) fn maintenance_child_pauses() -> bool {
+    std::env::var_os(MAINTENANCE_PAUSE_ENV).is_some()
+}
+
+/// A maintenance child parked at a cut, holding whatever it holds there. Killed on drop.
+pub(crate) struct PausedMaintenanceChild {
+    child: Option<std::process::Child>,
+    pause_dir: PathBuf,
+}
+
+impl PausedMaintenanceChild {
+    /// Lets the child continue past its cut and returns its exit code.
+    pub(crate) fn resume(mut self) -> i32 {
+        std::fs::write(self.pause_dir.join("resume"), b"").expect("signal resume");
+        let mut child = self.child.take().expect("paused child");
+        let started = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().expect("poll paused child") {
+                return status.code().unwrap_or(-1);
+            }
+            if started.elapsed() >= WATCHDOG {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("resumed maintenance child did not finish");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for PausedMaintenanceChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Starts `exact_test_name` as a maintenance child on `store_dir` and returns once it is parked
+/// at `point`.
+pub(crate) fn pause_maintenance_child(
+    exact_test_name: &str,
+    store_dir: &Path,
+    pause_dir: &Path,
+    point: MaintenanceFaultPoint,
+) -> PausedMaintenanceChild {
+    let executable = std::env::current_exe().expect("locate unit-test executable");
+    let child = std::process::Command::new(executable)
+        .arg(exact_test_name)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(MAINTENANCE_CHILD_MODE_ENV, "1")
+        .env(MAINTENANCE_STORE_DIR_ENV, store_dir)
+        .env(MAINTENANCE_PHASE_ENV, point.phase.name())
+        .env(MAINTENANCE_CUT_ENV, point.cut.name())
+        .env(MAINTENANCE_PAUSE_ENV, pause_dir)
+        .spawn()
+        .expect("spawn maintenance pause child");
+    let mut paused = PausedMaintenanceChild {
+        child: Some(child),
+        pause_dir: pause_dir.to_path_buf(),
+    };
+    let started = Instant::now();
+    while !pause_dir.join("paused").exists() {
+        let child = paused.child.as_mut().expect("paused child");
+        if let Some(status) = child.try_wait().expect("poll pause child") {
+            panic!("maintenance child exited before its cut ({status})");
+        }
+        assert!(
+            started.elapsed() < WATCHDOG,
+            "maintenance child never paused"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    paused
 }
 
 pub(crate) fn maintenance_child_store_dir() -> Option<PathBuf> {

@@ -1046,7 +1046,76 @@ fn closed_compaction_checkpoint_child() {
         crate::ClosedCompactionOptions::default(),
     )
     .unwrap();
+    if crate::test_support::fault_checkpoint::maintenance_child_pauses() {
+        std::process::exit(
+            crate::test_support::fault_checkpoint::MAINTENANCE_PAUSED_CHILD_COMPLETED,
+        );
+    }
     panic!("checkpoint child completed without reaching the requested cut");
+}
+
+/// R1 (specs/011): while another process holds a closed-compaction claim -- staging validated
+/// and the inner lock retired, the directory moved aside, or the replacement published -- an open
+/// is refused by the replacement lock, and opens once the compaction has finished.
+#[test]
+fn an_open_is_refused_while_another_process_holds_a_closed_claim() {
+    use crate::test_support::fault_checkpoint::{
+        pause_maintenance_child, MaintenanceCut, MaintenanceFaultPoint, MaintenancePhase,
+        MAINTENANCE_PAUSED_CHILD_COMPLETED,
+    };
+    for point in [
+        MaintenanceFaultPoint {
+            phase: MaintenancePhase::Prepared,
+            cut: MaintenanceCut::StagingValidate,
+        },
+        MaintenanceFaultPoint {
+            phase: MaintenancePhase::PreviousPublished,
+            cut: MaintenanceCut::PreviousPublish,
+        },
+        MaintenanceFaultPoint {
+            phase: MaintenancePhase::ReplacementPublished,
+            cut: MaintenanceCut::ReopenValidation,
+        },
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let store_dir = root.path().join("store");
+        std::fs::create_dir(&store_dir).unwrap();
+        create_segmented_v2(&store_dir, FixtureFamily::KeyValue);
+        let pause_dir = tempfile::tempdir().unwrap();
+        let child = pause_maintenance_child(
+            "compaction::recovery_tests::closed_compaction_checkpoint_child",
+            &store_dir,
+            pause_dir.path(),
+            point,
+        );
+
+        let refused = crate::key_value_store::DurableKeyValueStore::try_init_new(&store_dir);
+
+        assert_eq!(
+            child.resume(),
+            MAINTENANCE_PAUSED_CHILD_COMPLETED,
+            "{point:?}"
+        );
+        match refused {
+            Err(crate::RecoveryError::Io {
+                operation: crate::RecoveryOperation::Inspect,
+                source,
+                ..
+            }) => {
+                assert_eq!(source.kind(), std::io::ErrorKind::WouldBlock, "{point:?}");
+                assert!(
+                    source.to_string().contains(".store.pigment-lock"),
+                    "{point:?}: the replacement lock must refuse: {source}"
+                );
+            }
+            Err(error) => panic!("{point:?}: expected a WouldBlock refusal, got {error:?}"),
+            Ok(_) => panic!("{point:?}: an open during another process's compaction must fail"),
+        }
+        let reopened = crate::key_value_store::DurableKeyValueStore::try_init_new(&store_dir)
+            .unwrap()
+            .into_store();
+        assert_eq!(reopened.get(b"alpha"), Some(b"one".to_vec()), "{point:?}");
+    }
 }
 
 fn reopen_after_checkpoint(
