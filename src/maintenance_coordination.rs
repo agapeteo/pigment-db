@@ -391,13 +391,24 @@ fn open_lock_file(path: &Path, create: bool) -> io::Result<(std::fs::File, bool)
         }
         _ => {}
     }
-    match std::fs::OpenOptions::new()
+    #[cfg(test)]
+    let read_write = match lock_seams::injected_open_error(path) {
+        Some(kind) => Err(io::Error::from(kind)),
+        None => std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(create)
+            .truncate(false)
+            .open(path),
+    };
+    #[cfg(not(test))]
+    let read_write = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(create)
         .truncate(false)
-        .open(path)
-    {
+        .open(path);
+    match read_write {
         Ok(file) => Ok((file, true)),
         Err(error)
             if matches!(
@@ -593,8 +604,10 @@ const PENDING_POLL: Duration = Duration::from_millis(1);
 ///
 /// Creating it takes the directory's lock files, and that I/O runs with the registry mutex
 /// released: the entry is `Pending` meanwhile, so a stalled lock file holds up opens of this
-/// directory only (specs/011 FR-13). A failure to create inserts nothing. `admit` cannot refuse
-/// a new entry, which has neither a lease nor a claim, so nothing is left behind by it either.
+/// directory only (specs/011 FR-13). A failure to create inserts nothing, and neither does a
+/// panic while creating, which would otherwise leave every later open of the directory waiting.
+/// `admit` cannot refuse a new entry, which has neither a lease nor a claim, so nothing is left
+/// behind by it either.
 fn with_entry<T>(
     identity: &Path,
     create: impl FnOnce(&Path) -> io::Result<OwnershipState>,
@@ -615,7 +628,12 @@ fn with_entry<T>(
             }
         }
     }
+    let mut pending = PendingEntry {
+        identity,
+        armed: true,
+    };
     let created = create(identity);
+    pending.armed = false;
     let mut registry = lock_registry();
     match created {
         Ok(state) => {
@@ -631,6 +649,23 @@ fn with_entry<T>(
         Err(error) => {
             registry.remove(identity);
             Err(error)
+        }
+    }
+}
+
+/// Removes a directory's `Pending` entry when the thread creating it unwinds instead of returning.
+struct PendingEntry<'a> {
+    identity: &'a Path,
+    armed: bool,
+}
+
+impl Drop for PendingEntry<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut registry = lock_registry();
+            if matches!(registry.get(self.identity), Some(Slot::Pending)) {
+                registry.remove(self.identity);
+            }
         }
     }
 }
@@ -852,6 +887,10 @@ pub(crate) mod lock_seams {
     static STALLS: Mutex<Vec<(PathBuf, Gate)>> = Mutex::new(Vec::new());
     /// Lock errors reported in place of a real attempt.
     static LOCK_ERRORS: Mutex<Vec<(PathBuf, io::ErrorKind)>> = Mutex::new(Vec::new());
+    /// Errors reported in place of the read-write open.
+    static OPEN_ERRORS: Mutex<Vec<(PathBuf, io::ErrorKind)>> = Mutex::new(Vec::new());
+    /// Directories whose next lock-file open panics.
+    static PANICS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
     fn guard<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         mutex
@@ -864,6 +903,15 @@ pub(crate) mod lock_seams {
     }
 
     pub(super) fn before_lock_file_open(path: &Path) {
+        let panics = {
+            let mut panics = guard(&PANICS);
+            let before = panics.len();
+            panics.retain(|directory| !in_directory(path, directory));
+            panics.len() != before
+        };
+        if panics {
+            panic!("injected panic opening {}", path.display());
+        }
         let gate = guard(&STALLS)
             .iter()
             .find(|(directory, _)| in_directory(path, directory))
@@ -885,6 +933,25 @@ pub(crate) mod lock_seams {
             .iter()
             .find(|(directory, _)| in_directory(path, directory))
             .map(|(_, kind)| *kind)
+    }
+
+    pub(super) fn injected_open_error(path: &Path) -> Option<io::ErrorKind> {
+        guard(&OPEN_ERRORS)
+            .iter()
+            .find(|(directory, _)| in_directory(path, directory))
+            .map(|(_, kind)| *kind)
+    }
+
+    pub(crate) fn inject_open_error(directory: &Path, kind: io::ErrorKind) {
+        guard(&OPEN_ERRORS).push((
+            super::canonical_directory_identity(directory).unwrap(),
+            kind,
+        ));
+    }
+
+    /// Makes the next lock-file open in `directory` panic, once.
+    pub(crate) fn inject_panic(directory: &Path) {
+        guard(&PANICS).push(super::canonical_directory_identity(directory).unwrap());
     }
 
     pub(crate) fn inject_lock_error(directory: &Path, kind: io::ErrorKind) {
@@ -985,8 +1052,11 @@ mod lock_error_tests {
     //! FR-11 (specs/011): a lock the platform or filesystem cannot take is skipped with a warning;
     //! any other lock error refuses the open.
 
-    use super::lock_seams::inject_lock_error;
+    use super::lock_seams::{inject_lock_error, inject_open_error, inject_panic};
+    use super::INNER_LOCK_NAME;
     use std::io;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
     fn a_lock_the_platform_cannot_take_is_skipped_and_the_store_opens() {
@@ -1010,5 +1080,49 @@ mod lock_error_tests {
             }
             other => panic!("expected an I/O refusal, got {:?}", other.map(|_| ())),
         }
+    }
+
+    /// FR-7: a lock file the filesystem will not open for writing, because it is mounted read-only,
+    /// is opened read-only and locked, and nothing is recorded in it.
+    #[test]
+    fn a_read_only_filesystem_opens_the_lock_file_read_only_and_records_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        drop(crate::key_value_store::DurableKeyValueStore::try_init_new(directory.path()).unwrap());
+        let lock = directory.path().join(INNER_LOCK_NAME);
+        std::fs::write(&lock, b"stale\n").unwrap();
+        inject_open_error(directory.path(), io::ErrorKind::ReadOnlyFilesystem);
+
+        let opened = crate::key_value_store::DurableKeyValueStore::try_init_new(directory.path());
+
+        assert!(opened.is_ok(), "{:?}", opened.err());
+        let held = std::fs::File::open(&lock).unwrap().try_lock();
+        assert!(
+            matches!(held, Err(std::fs::TryLockError::WouldBlock)),
+            "the read-only descriptor must hold the lock: {held:?}"
+        );
+        drop(opened);
+        assert_eq!(std::fs::read(&lock).unwrap(), b"stale\n");
+    }
+
+    /// A panic while a directory's locks are being taken leaves nothing behind in the ownership
+    /// registry: the next open of that directory in this process proceeds.
+    #[test]
+    fn a_panic_while_taking_locks_does_not_wedge_the_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        inject_panic(directory.path());
+
+        let panicked = std::panic::catch_unwind(|| {
+            crate::key_value_store::DurableKeyValueStore::try_init_new(directory.path())
+        });
+        let (done, finished) = mpsc::channel();
+        let path = directory.path().to_path_buf();
+        std::thread::spawn(move || {
+            let reopened = crate::key_value_store::DurableKeyValueStore::try_init_new(&path);
+            let _ = done.send(reopened.map(|_| ()).map_err(|error| error.to_string()));
+        });
+        let reopened = finished.recv_timeout(Duration::from_secs(5));
+
+        assert!(panicked.is_err(), "the injected panic must have fired");
+        assert_eq!(reopened, Ok(Ok(())), "the directory must open again");
     }
 }
