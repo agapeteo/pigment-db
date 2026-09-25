@@ -19,8 +19,11 @@ when the store directory is a mount point.
 
 ## Numbering
 
-This is spec 011. `specs/010` is the refused bounded key-set snapshot change, cited
-under that number in the constitution's Sync Impact Report, and it never reached `main`.
+This is spec 011. Two earlier pieces of work used the number 010, and neither reached `main`:
+- `specs/010`, the refused bounded key-set snapshot change, is cited under that number in the
+  constitution's Sync Impact Report.
+- The `010-cross-process-directory-lock` branch was this feature's first prototype. It used a lock
+  beside the directory only. The verification record calls it "the spec 010 prototype".
 
 ## Requirements
 
@@ -29,6 +32,8 @@ under that number in the constitution's Sync Impact Report, and it never reached
   - A process takes the directory's locks the first time it opens the directory (any family) or
     claims it for closed maintenance.
   - Further opens of the same directory in the same process share those locks.
+  - Every open that takes locks holds at least one of them before it recovers anything or goes
+    live.
   - The locks are released when the process's last owner of the directory is dropped. The operating
     system releases them when the process exits for any reason, including a kill that runs no
     destructor.
@@ -64,8 +69,10 @@ under that number in the constitution's Sync Impact Report, and it never reached
     maintenance before staging began, and reaches its inner lock only after that deletion.
     - Where the directory is present, the open creates a lock file there and is refused by the
       replacement lock. The file it leaves is not a store artifact (FR-9).
-    - While the directory is moved aside, the open finds no directory. It fails with `NotFound`,
-      naming the lock file, and creates nothing.
+    - While the directory is moved aside, the open finds no directory. It asks again whether
+      maintenance is in progress, finds that it is, and is refused by the replacement lock (FR-8).
+    - An open that has already reached its lock-file open when the directory is moved aside fails
+      with `NotFound` naming the lock file, and creates nothing.
   - The next open creates an inner lock file in the replacement directory.
 - **FR-5 Recovery at open.** When directory-level maintenance artifacts exist, an open does the
   following:
@@ -73,6 +80,8 @@ under that number in the constitution's Sync Impact Report, and it never reached
   2. It runs recovery.
   3. It takes the inner lock of the directory that recovery leaves in place. If another process
      already holds that lock, the open is refused.
+  - Other opens of the same directory in the same process wait for that attempt before they go
+    live. If it failed, each takes the lock itself, and is refused in the same way.
 - **FR-6 Lock-file contents.**
   - After locking through a writable descriptor, the holder replaces the file's contents with its
     process id in ASCII decimal followed by a newline.
@@ -87,9 +96,16 @@ under that number in the constitution's Sync Impact Report, and it never reached
     refused, naming the file. This covers an absent file that cannot be created, and an unreadable
     file.
   - **The file consulted by the replacement check cannot be opened:** the check is skipped.
-- **FR-8 A missing directory.** When the store directory does not exist and no directory-level
-  maintenance artifacts exist, no lock is taken and nothing is created. The open fails as it does
-  today.
+- **FR-8 A missing directory.**
+  - When the store directory does not exist and no directory-level maintenance artifacts exist,
+    the open fails at once and creates nothing. The error is
+    `RecoveryError::Io { operation: Inspect, path: <store dir>, source }`, with
+    `source.kind() == ErrorKind::NotFound`.
+  - A closed compaction moves the directory aside while its claim holds the replacement lock. So an
+    open that finds no directory asks again whether maintenance is in progress. If it is, the open
+    takes the maintenance path of FR-5, and a live claim refuses it.
+  - An open that finds the directory changing on each of three attempts is refused with
+    `WouldBlock`.
 - **FR-9 The inner lock file is not a store artifact.**
   - A regular file named `.pigment-lock` in a store generation belongs to no family, and its bytes
     count toward no total.
@@ -123,8 +139,9 @@ under that number in the constitution's Sync Impact Report, and it never reached
 
 - **What does not change:** WAL, snapshot and manifest formats, public signatures and types, and
   dependencies (none added).
-- **The contract:** the lock files' names, locations and lock semantics (whole-file `flock` on
-  Unix, `LockFileEx` on Windows) are a compatibility contract. Changing them needs a specification
+- **The contract:** the lock files' names, locations and lock semantics are a compatibility
+  contract. The semantics are whatever std's `File::try_lock` takes on each target (see Platform
+  coverage): on the targets CI covers, a whole-file `flock` or `LockFileEx`. Changing them needs a specification
   with a migration, because processes that disagree exclude nothing. Lock-file contents and message
   text are not contract.
 - **What is new:**
@@ -138,8 +155,13 @@ under that number in the constitution's Sync Impact Report, and it never reached
   3. A store directory that is not writable and has no `.pigment-lock` is refused. Creating the file
      once, readable, restores it.
   4. An open or claim refused for any other reason, such as `MigrationRequired` or
-     `InvalidArtifact`, leaves the lock files it took behind: the inner one, or the replacement one
-     for a claim or a maintenance-state open.
+     `InvalidArtifact`, leaves behind the lock files it took:
+     - the inner one, for an open;
+     - both, for a claim;
+     - the replacement one alone, for an open or claim in a maintenance state.
+  5. An open of a directory that does not exist now fails before it takes a lock or touches any
+     artifact, with `Inspect` naming the directory (FR-8). It used to fail creating the WAL's
+     staging file (`CreateStaging`, naming `<dir>/.kv.wal.dat.next` for the key/value family).
 - **The first upgrade:** protection begins only when every process using a directory runs this
   version. An older process takes no lock, so drain it before the first restart onto this version.
 - **Windows:**
@@ -186,7 +208,8 @@ minimum, and at 1.97.1, the toolchain this was verified with:
 | illumos, AIX, GNU/Hurd | no lock: `Unsupported`, skipped with a warning (FR-11) | `flock` |
 | DragonFly BSD and every other Unix target | no lock: skipped with a warning | no lock: skipped with a warning |
 
-Only Linux was run. macOS and Windows are covered by CI.
+Only Linux was run. CI covers macOS and Windows once the branch is pushed, and no run on either
+is recorded here. The minimum-toolchain job checks Linux only.
 
 ## Found during review, not fixed here
 
@@ -205,8 +228,9 @@ inventory). The canonical directory would then only have to inspect as a valid g
 
 ## Acceptance
 
-Each of these tests re-executes its own test binary as a child process. All but R1 use only the
-public API. R1 parks its child with a private pause seam.
+Most of these tests re-execute their own test binary as a child process. X3, A7, A8 and Symlink
+run in one process. X2, A6, A7, A8 and Symlink are Unix-only. All but R1 use only the public API.
+R1 parks its child with a private pause seam.
 
 | Test | Scenario | Expected |
 |---|---|---|
@@ -229,11 +253,14 @@ These unit tests use private seams or fixtures:
 | Test | Scenario | Expected |
 |---|---|---|
 | Cleanup left pending | An open recovers a compaction whose cleanup stays pending. Cleanup is then allowed to proceed. | The next open, a second family opened in the same process, and a compaction retry each finish cleanup. |
-| Stalled opener | An open is stalled after its maintenance check. Meanwhile another process's compaction reaches StagingValidate, PreviousPublish or ReopenValidation. | The open is refused: `WouldBlock` naming the replacement lock, or `NotFound` while the directory is moved aside. The compaction completes and the directory reopens. |
+| Stalled opener | An open is stalled at its lock-file open. Meanwhile another process's compaction reaches StagingValidate, PreviousPublish or ReopenValidation. | The open is refused: `WouldBlock` naming the replacement lock, or `NotFound` while the directory is moved aside. The compaction completes and the directory reopens. |
+| Opener stalled earlier | The same, stalled just after its maintenance check, with PreviousPublished/ManifestPublish added. | Refused by the replacement lock at every point, including those at which the directory is moved aside. |
+| Inner lock in flight | A second family opens while the first is taking the inner lock after recovery, and another holder has that lock; or the first attempt panics. | The second family waits. It is refused while the other holder has the lock, and takes the lock itself after a panic. |
+| A directory named like the lock file | It appears in the source after the claim retired its lock. | The compaction fails closed and publishes nothing. |
 | Lock file in `.previous` | A replaced generation holds `.pigment-lock`. | Both cleanups delete it. A directory of that name keeps cleanup pending. |
 | Recovering owners | An open, or a claim paused while staging, recovers an interrupted compaction. | Each holds the inner lock and records its process id. |
 | Progress | Lock-file I/O for one directory is stalled, at entry creation and again after recovery. | Other directories open and drop. |
-| Lock errors | An injected `Unsupported`, another lock error, or `ReadOnlyFilesystem` from the read-write open. | Skipped with a warning; refused; locked read-only with nothing recorded. |
+| Lock errors | An injected `Unsupported`, another lock error, or `ReadOnlyFilesystem` from the read-write open. | Skipped, with a warning naming the lock file and the directory; refused; locked read-only with nothing recorded. |
 | Panic | The lock-file open panics. | The next open of the directory proceeds. |
 
 A mount-namespace run (`unshare -rm`), with the store directory bind-mounted as a volume under a

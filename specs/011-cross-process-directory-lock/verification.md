@@ -2,7 +2,8 @@
 
 Measured on Linux 7.1 with rustc 1.97.1, on branch `011-cross-process-directory-lock`, from
 `af25792` to `e03c2a1`. A review of that revision found three defects and several gaps. They were
-fixed from `1b79628` to `f57bdde`, and "Review fixes" below records that evidence.
+fixed from `1b79628` to `f57bdde`, and "Review fixes" below records that evidence. A re-review of
+`c026816` found two more defects, fixed from `01f0200` to `583ddbb` ("Second review" below).
 
 ## Suites
 
@@ -11,6 +12,7 @@ fixed from `1b79628` to `f57bdde`, and "Review fixes" below records that evidenc
 | `af25792` (baseline) | 568 | 0 | 27 | 25 |
 | `e03c2a1` | 585 | 0 | 28 | 26 |
 | `f57bdde` | 597 | 0 | 28 | 26 |
+| `583ddbb` | 602 | 0 | 28 | 26 |
 
 The extra ignored test is `directory_lock::child_entry`, the child-process role runner.
 
@@ -22,7 +24,7 @@ The extra ignored test is `directory_lock::child_entry`, the child-process role 
   - `tests/directory_lock.rs`;
   - the library's `maintenance_coordination::` tests;
   - `compaction::recovery_tests::ownership`.
-- A CI job checks every target on rust-version 1.91.
+- A CI job checks every target on rust-version 1.91, on Linux only.
 - Only Linux was run for this record.
 
 ## RED evidence, in order
@@ -129,10 +131,10 @@ timed out after 5 s. With the guard left disarmed, it fails the same way.
 
 | Mechanism | Pinned by | Neutralization that fails it |
 |---|---|---|
-| The lease's `ensure_inner_lock` (FR-5 step 3) | `an_open_that_recovered_holds_the_inner_lock` | A no-op, which also fails the cleanup-pending tests' check that the open holds the lock |
+| The lease's `ensure_inner_lock` (FR-5 step 3) | `an_open_that_recovered_holds_the_inner_lock` | A no-op, which also fails the cleanup-pending tests' check that the open holds the lock. The progress test hung under it rather than failing; `wait_entered` now fails after 30 s. |
 | The claim's `ensure_inner_lock` | `a_claim_that_recovered_holds_the_inner_lock_while_it_stages` | A no-op, failing this test only |
 | Post-recovery lock I/O outside the mutex (FR-13) | `a_stalled_inner_lock_after_recovery_holds_up_no_other_directory` | The acquire moved under the mutex, which compiles warning-free |
-| The optional replacement-lock check on ordinary opens | the stalled-opener test, at ReopenValidation | `check_existing(..).ok().flatten()` |
+| The optional replacement-lock check on ordinary opens | the stalled-opener test | `check_existing(..).ok().flatten()`. The first point to fail is StagingValidate, where the open is admitted instead of refused. ReopenValidation was not run on its own. |
 | The `ReadOnlyFilesystem` read-only fallback (FR-7) | `a_read_only_filesystem_opens_the_lock_file_read_only_and_records_nothing`, through an injected read-write-open error | The arm dropped |
 
 The stalled-opener test also covers PreviousPublish, where the directory is moved aside. The
@@ -142,12 +144,13 @@ measured with a temporary print before it was pinned.
 ### Tests that would have failed on Windows, or passed vacuously (`a0310da`, `b6194a7`)
 
 - **Windows listings.** Four tests in `tests/windows_physical_durability` asserted listings that
-  left out the lock file. The Windows modules were copied, without their cfg line, into a throwaway
-  Linux test target:
-  - before the change, 4 tests failed;
+  left out the lock file. Two of the four Windows modules, `preflight.rs` and `publication.rs`
+  (9 tests), can run on Linux. They were copied, without their cfg line, into a throwaway test
+  target:
+  - before the change, 5 failed: the 4 listing tests, and
+    `physical_rotation_conflict_preserves_original_os_error_and_writable_authority`;
   - after it, 8 of 9 pass;
-  - the ninth, `physical_rotation_conflict_preserves_original_os_error_and_writable_authority`,
-    fails at `af25792` too, for a Windows-specific reason.
+  - the rotation-conflict test fails at `af25792` too, for a Windows-specific reason.
 - **Reads of a held lock file.** A1 and A3 read `.pigment-lock` while holding it. This was emulated
   on Linux by panicking whenever a fresh descriptor is refused the lock:
   - without the Windows skip, A1 and A3 fail;
@@ -158,7 +161,9 @@ measured with a temporary print before it was pinned.
   carry a claim's inner lock file. That file is now compared byte for byte, and the replacement
   lock is asserted to exist.
 - **Migration compatibility.** These tests assert that each lock file an operation takes exists,
-  and that none present before has gone.
+  and that none present before has gone. The commit that added this (`b6194a7`) said inspection
+  takes the inner lock. It takes none, so those assertions checked nothing until `a00e12b`
+  measured inspection against what the open left, expecting no lock.
 
 ### Toolchain (`edc0afa`)
 
@@ -192,6 +197,86 @@ pending makes the next open fail. It is present at `af25792` and needs its own s
 
 ### Not verified
 
-- macOS and Windows: CI covers them, and no run of either is recorded here.
+- macOS and Windows: CI will cover them once the branch is pushed. No run of either is recorded
+  here.
 - Solaris behaviour, inferred from std's source only.
 - A delete-pending lock file at retirement on Windows, when another handle to it is open.
+
+## Second review
+
+An adversarial re-review of `c026816` ran four lenses, Principle VI first, and verified every
+finding of medium severity or above independently. Principle VI found nothing: consumer names appear
+only in marked provenance and in verification evidence.
+
+### Defects (`01f0200`)
+
+**An open could proceed holding no lock.** Two verifiers each reproduced it.
+- `open_locks` checked for maintenance, then for the directory. For an absent directory it
+  returned an entry holding no lock.
+- An open stalled between those two checks, while another process's compaction moved the
+  directory aside, then ran recovery unprotected.
+  - At PreviousPublish it rolled back the live compaction. The compaction failed, and every later
+    open answered `AuthorityUndetermined` until the manifest was removed by hand.
+  - At PreviousPublished/ManifestPublish it completed the other process's compaction itself.
+- `open_locks` now asks again whether maintenance is in progress. Otherwise it fails a missing
+  directory at once, so every lock-taking entry holds a lock.
+- This changes the error for opening a directory that does not exist (spec, Compatibility item 5).
+
+**A second family went live on another thread's unfinished inner-lock attempt.**
+`ensure_inner_lock` now waits on the `Acquiring` marker, and a guard clears the marker on unwind.
+
+RED before the fix:
+
+| Test | Failure |
+|---|---|
+| `an_open_stalled_before_it_looks_for_the_directory_is_refused_by_the_claim` | At PreviousPublish the child failed with `InvalidArtifact`, and the reopen answered `AuthorityUndetermined` |
+| `a_second_family_does_not_go_live_while_the_first_is_still_taking_the_inner_lock` | "the second family went live while another holder had the inner lock" |
+| `a_panic_while_taking_the_inner_lock_after_recovery_leaves_it_to_the_next_open` | "the open second family must hold the inner lock" |
+
+The only pinned test that went RED from the fix itself is the missing-directory error in
+`tests/recovery/key_value.rs` (`CreateStaging`, now `Inspect`). It was updated deliberately.
+
+| Neutralization | Failing test |
+|---|---|
+| The absent-directory branch returning no lock | the stall-before-the-directory-check test |
+| Refusing `NotFound` without asking again | the same test, at PreviousPublish |
+| Trusting `Acquiring` | both inner-lock-in-flight tests |
+| The guard disarmed | the panic test |
+| The key/set or key/map open skipping `ensure_inner_lock` | `an_open_that_recovered_holds_the_inner_lock`, now run for every family |
+
+The ownership, progress and lock-error tests passed 15 runs out of 15.
+
+### Weak tests (`a00e12b`, `583ddbb`)
+
+| Test gap | Neutralization that now fails a test |
+|---|---|
+| The FR-11 warning was unasserted | Deleting it |
+| Revalidation's file-type check was unpinned | Skipping any entry of that name |
+| The cleanup controls lacked a near name and a symlink, and did not check that `.previous` kept its entries | — (controls added) |
+| The claim's deletion of its inner lock was unpinned | — (R1 asserts it) |
+| The workflow pins failed under CRLF | CRLF copies of `recovery.yml` and `Cargo.toml`: 10 of 10 pass |
+
+On Windows, the checkpoint-child helper now waits for a killed child's locks to be released. It is
+compiled for `x86_64-pc-windows-gnu` and not run.
+
+A child that fails on purpose now exits with its own code instead of panicking, so its libtest
+summary no longer appears in the parent's output as a failure.
+
+### Checks at `583ddbb`
+
+- Suite: 602 passed, 0 failed, 28 ignored, across 26 binaries.
+- `cargo fmt --check` is clean.
+- Clippy reports nothing on Linux. For Windows it reports only the 14 warnings that predate the
+  branch.
+- `cargo doc` builds with no warnings.
+- The two-container `unshare -rm` run repeats the result above: the second container is refused,
+  naming the inner lock and the holder's pid, and it opens once the holder has exited.
+
+### Left as they are
+
+The review's other LOW items were applied, in the documents or in the tests above. Three optional
+items were not:
+- `remove_retired_inner_lock`'s tolerance of a file that is already gone has no test of its own.
+- The cross-process stalled-opener test does not report the compactor's own cleanup status. The
+  unit test `a_lock_file_in_the_replaced_generation_is_deleted_with_it` pins that removal instead.
+- A wording nit in the plan's Principle VI check.

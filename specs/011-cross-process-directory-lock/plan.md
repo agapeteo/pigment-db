@@ -37,7 +37,8 @@ keeps lock-file I/O outside the mutex. The other changes are small:
 - **A8:** RED against the step before the explicit unlock. The 010 prototype measured 343 of 400
   reopens refused.
 - **A3:** RED at the pre-change revision (the compaction runs).
-- **R1:** RED against the step before claims take locks.
+- **R1:** written after the claim step had landed, so probed by neutralization rather than
+  observed failing in sequence (see verification.md).
 - **The progress and `Unsupported` unit tests:** RED against the step before their fix.
 - **The existing inspection and compaction tests:** they go RED when opens start creating
   `.pigment-lock`, which is what drives FR-9.
@@ -70,6 +71,13 @@ changes. `rust-version = "1.91"` is declared, and a CI job checks every target o
   third's drop to complete.
 - **Post-recovery.** The inner lock taken after recovery (FR-5) is set once per entry, through an
   `Acquiring` marker. Its lock-file I/O also runs outside the mutex, and has its own progress test.
+  Every other open of the directory waits on that marker before it goes live, and takes the lock
+  itself if the attempt failed. A guard clears the marker if the attempt unwinds.
+- **No entry without a lock.** An open that finds no directory asks again whether maintenance is
+  in progress, because a claim may have moved the directory aside in between. If none is, the
+  open fails at once (FR-8). An entry that held no lock could neither recover maintenance nor go
+  live safely. The first version of this plan let such an entry proceed, and a re-review measured
+  it recovering, and wedging, another process's live compaction.
 - **Unwinding.** A panic while an entry is `Pending` removes the entry, through a guard that is
   disarmed once creation returns. Otherwise every later open of that directory would wait forever.
 
@@ -112,8 +120,8 @@ schedules an interleaving that is otherwise unobservable. No dependency and no A
   - So the lock file is ownership state wherever a generation is compared exactly, not only in
     inspection (FR-9).
 - **Explicit unlock at release (FR-12).** Measured: closing without unlocking left the lock held by
-  children in the middle of being spawned, refusing 343 of 400 immediate reopens. With the unlock,
-  none were refused.
+  children in the middle of being spawned. Immediate reopens were refused 343 of 400 times in the
+  spec 010 prototype, and 312 of 400 times on this branch. With the unlock, none were refused.
 - **Refusal.** An `io::Error` of kind `WouldBlock`, which callers already map to
   `RecoveryError::Io` or `FailedClosed`. No new error variant is added.
 - **A lock path that is not a regular file** (a symlink, a directory or a FIFO): a required lock is
@@ -137,12 +145,13 @@ remains the default until an approved specification defines cross-process coordi
 > Every file-backed open of a store directory, and every closed-maintenance claim, MUST take the
 > lock files specs/011 defines and MUST refuse while another process holds them. Their names,
 > locations and lock semantics are a compatibility contract, and changing them requires a
-> specification with a migration. The exclusion this gives is bounded by specs/011's Known
-> limitations, among them: targets and filesystems where the standard library takes no lock,
-> network filesystems, closed maintenance while another mount view of the directory exists, a
-> process that forks without exec, the first upgrade from a version that takes no lock, and the
-> destination of `pigment-db-migrate`. Within those limitations, single-process ownership is
-> enforced, not a convention.
+> specification with a migration. The exclusion this gives is bounded by what specs/011 states in
+> its Compatibility section (Known limitations, the first upgrade, and what is out of scope) and
+> in FR-11, among them: targets and filesystems where the standard library takes no lock, network
+> filesystems, closed maintenance while another mount view of the directory exists, a process
+> that forks without exec, the first upgrade from a version that takes no lock, and the
+> destination of `pigment-db-migrate`. Within those limits, single-process ownership is enforced,
+> not a convention.
 
 This makes enforcement mandatory rather than conventional, which is materially expanded mandatory
 guidance, so the amendment is MINOR. The first wording stated the constraint descriptively, and

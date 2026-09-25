@@ -27,7 +27,8 @@ probed rather than observed failing in sequence (see verification.md).
   - RED: a symlinked `.pigment-lock` whose target the pid write overwrites.
   - GREEN: refuse it, with the check made before the open.
 - [x] T007 Claims and the replacement lock:
-  - RED: A3 at the pre-change revision, and R1 against T006.
+  - RED: A3 at the pre-change revision. R1 was written after this step landed, so it was probed by
+    neutralization, not observed failing first.
   - GREEN: claims take both locks and retire the inner one before publication. Maintenance-state
     opens take the replacement lock and then the inner one after recovery. Other opens check an
     existing replacement lock.
@@ -68,3 +69,15 @@ Review fixes, after the review of `df1fef1`:
 - [x] T017 Pin the stalled opener while the directory is moved aside (`f57bdde`).
 - [x] T018 Correct the spec, plan, constitution and this record: FR-4, FR-9, FR-11, Platform
   coverage, the Windows semantics, Solaris, and the pre-existing defect.
+
+Fixes after the re-review of `c026816`:
+
+- [x] T019 No lock-free entry, and no open going live on another thread's unfinished attempt:
+  - RED: an opener stalled before its directory check recovered a live compaction; a second family
+    went live while another holder had the inner lock; after a panic, it never took the lock.
+  - GREEN: open_locks asks again and refuses a missing directory at once; ensure_inner_lock waits,
+    behind an unwinding guard. FR-5 step 3 is pinned for every family (`01f0200`).
+- [x] T020 Harden the ownership tests: the FR-11 warning, foreign entries at revalidation and in
+  `.previous`, the claim's retirement, the inspection assertions, CRLF-safe pins, and Windows
+  lock release (`a00e12b`).
+- [x] T021 Correct the documents after the re-review.

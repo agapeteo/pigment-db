@@ -53,8 +53,9 @@ Sync Impact Report
 - Modified sections:
   - Project Constraints: every file-backed open of a store directory and every
     closed-maintenance claim MUST take the lock files specs/011 defines and
-    refuse while another process holds them. The exclusion is bounded by that
-    spec's Known limitations, which the constraint cites rather than restates.
+    refuse while another process holds them. The exclusion is bounded by what
+    that spec's Compatibility section and FR-11 state, which the constraint
+    cites rather than restates.
 - Motivating consumer: penpack (two processes appended to one WAL for twelve
   hours; see specs/011's Motivation note). Classified under VI as a
   library-vocabulary primitive landing on main before any consumer pins it.
@@ -214,13 +215,14 @@ change served.
   claim, MUST take the lock files specs/011 defines and MUST refuse while another
   process holds them. Their names, locations and lock semantics are a
   compatibility contract, and changing them requires a specification with a
-  migration. The exclusion this gives is bounded by specs/011's Known
-  limitations, among them: targets and filesystems where the standard library
-  takes no lock, network filesystems, closed maintenance while another mount
-  view of the directory exists, a process that forks without exec, the first
-  upgrade from a version that takes no lock, and the destination of
-  `pigment-db-migrate`. Within those limitations, single-process ownership is
-  enforced, not a convention.
+  migration. The exclusion this gives is bounded by what specs/011 states in
+  its Compatibility section (Known limitations, the first upgrade, and what is
+  out of scope) and in FR-11, among them: targets and filesystems where the
+  standard library takes no lock, network filesystems, closed maintenance
+  while another mount view of the directory exists, a process that forks
+  without exec, the first upgrade from a version that takes no lock, and the
+  destination of `pigment-db-migrate`. Within those limits, single-process
+  ownership is enforced, not a convention.
 - Persistent-state changes MUST account for all three durable store families:
   key/value, key/set, and key/sorted-map, unless the specification explicitly
   demonstrates that a family is unaffected.
