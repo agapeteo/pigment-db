@@ -914,7 +914,10 @@ fn reopen_and_compare_public_state(
     for family in families {
         let matches = match &family.state {
             CapturedLogicalState::Value(expected) => {
-                let store = crate::key_value_store::DurableKeyValueStore::try_init_new(staging)
+                let store =
+                    crate::key_value_store::DurableKeyValueStore::try_init_new_under_closed_claim(
+                        staging,
+                    )
                     .map_err(|error| staging_reopen_error(staging, error.to_string()))?
                     .into_store();
                 store.size() == expected.len()
@@ -923,7 +926,10 @@ fn reopen_and_compare_public_state(
                         .all(|(key, value)| store.get(key) == Some(value.clone()))
             }
             CapturedLogicalState::Set(expected) => {
-                let store = crate::key_set_store::DurableKeySetStore::try_init_new(staging)
+                let store =
+                    crate::key_set_store::DurableKeySetStore::try_init_new_under_closed_claim(
+                        staging,
+                    )
                     .map_err(|error| staging_reopen_error(staging, error.to_string()))?
                     .into_store();
                 store.size() == expected.len()
@@ -932,7 +938,10 @@ fn reopen_and_compare_public_state(
                         .all(|(key, values)| store.get_hashset(key).as_ref() == Some(values))
             }
             CapturedLogicalState::Map(expected) => {
-                let store = crate::key_map_store::DurableKeyMapStore::try_init_new(staging)
+                let store =
+                    crate::key_map_store::DurableKeyMapStore::try_init_new_under_closed_claim(
+                        staging,
+                    )
                     .map_err(|error| staging_reopen_error(staging, error.to_string()))?
                     .into_store();
                 store.size() == expected.len()
@@ -1415,32 +1424,43 @@ fn active_name(family: StoreFamily) -> &'static str {
     }
 }
 
+/// A claim or lock failure: `FailedClosed` when another owner holds the directory, else I/O.
+fn claim_lock_error(store_dir: &Path, source: std::io::Error) -> CompactionError {
+    if source.kind() == std::io::ErrorKind::WouldBlock {
+        CompactionError::FailedClosed {
+            detail: source.to_string(),
+        }
+    } else {
+        CompactionError::Io {
+            operation: crate::CompactionOperation::Inspect,
+            path: store_dir.to_path_buf(),
+            source,
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) fn compact_closed_directory(
     store_dir: &Path,
     options: ClosedCompactionOptions,
 ) -> Result<DirectoryCompactionOutcome, CompactionError> {
-    let _claim =
-        crate::maintenance_coordination::try_claim_closed(store_dir).map_err(|source| {
-            if source.kind() == std::io::ErrorKind::WouldBlock {
-                CompactionError::FailedClosed {
-                    detail: source.to_string(),
-                }
-            } else {
-                CompactionError::Io {
-                    operation: crate::CompactionOperation::Inspect,
-                    path: store_dir.to_path_buf(),
-                    source,
-                }
-            }
-        })?;
+    let _claim = crate::maintenance_coordination::try_claim_closed(store_dir)
+        .map_err(|source| claim_lock_error(store_dir, source))?;
     let _ = recovery::resolve_directory_maintenance_for_compaction(store_dir)?;
+    _claim
+        .ensure_inner_lock()
+        .map_err(|source| claim_lock_error(store_dir, source))?;
     let inspection = crate::inspect_storage(store_dir)?;
     if inspection.families().is_empty() {
         return Ok(DirectoryCompactionOutcome::empty());
     }
     let prepared = prepare_closed_staging(store_dir, options)?;
     validate_closed_staging(&prepared)?;
+    // Before the source is revalidated or any manifest published, so the directory being replaced
+    // holds exactly the captured store files (specs/011 FR-4).
+    _claim
+        .retire_inner_lock()
+        .map_err(|source| claim_lock_error(store_dir, source))?;
     #[cfg(test)]
     crate::test_support::fault_checkpoint::exit_at_maintenance_fault(
         crate::test_support::fault_checkpoint::MaintenanceFaultPoint {

@@ -822,7 +822,14 @@ fn every_file_initializer_resolves_maintenance_before_ordinary_wal_recovery() {
     std::fs::write(previous_file, b"invalid old authority").unwrap();
     let evidence = snapshot_directory(_root.path()).unwrap();
     assert!(crate::key_value_store::DurableKeyValueStore::try_init_new(&store_dir).is_err());
-    assert_eq!(snapshot_directory(_root.path()).unwrap(), evidence);
+    // A maintenance-state open takes the replacement lock before it reads the evidence
+    // (specs/011 FR-5), so a refused one leaves that lock file beside the directory, and nothing
+    // else.
+    let mut after = snapshot_directory(_root.path()).unwrap();
+    assert!(after
+        .remove(std::path::Path::new(".store.pigment-lock"))
+        .is_some());
+    assert_eq!(after, evidence);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1151,7 +1158,16 @@ fn every_closed_checkpoint_process_exit_reopens_exact_state_or_preserves_explici
                 "{family:?} {phase:?} {cut:?} must leave maintenance evidence"
             );
             let _ = evidence;
-            let before_reopen = snapshot_directory(root.path()).unwrap();
+            // The reopen takes the directory's locks and records its own process id in them
+            // before it reads anything (specs/011); the store namespace is what a refused reopen
+            // must leave as it found it.
+            let without_lock_files =
+                |mut snapshot: crate::test_support::maintenance_fixtures::DirectoryByteSnapshot| {
+                    snapshot.remove(std::path::Path::new(".store.pigment-lock"));
+                    snapshot.remove(std::path::Path::new("store/.pigment-lock"));
+                    snapshot
+                };
+            let before_reopen = without_lock_files(snapshot_directory(root.path()).unwrap());
             match reopen_after_checkpoint(&store_dir, family) {
                 Ok(status) => {
                     assert_eq!(status, crate::RecoveryStatus::Recovered);
@@ -1168,7 +1184,10 @@ fn every_closed_checkpoint_process_exit_reopens_exact_state_or_preserves_explici
                         ),
                         "{family:?} {phase:?} {cut:?} returned unexpected {error:?}"
                     );
-                    assert_eq!(snapshot_directory(root.path()).unwrap(), before_reopen);
+                    assert_eq!(
+                        without_lock_files(snapshot_directory(root.path()).unwrap()),
+                        before_reopen
+                    );
                 }
             }
         }

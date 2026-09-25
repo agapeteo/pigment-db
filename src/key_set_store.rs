@@ -226,7 +226,11 @@ impl DurableKeySetStore<File> {
     pub fn try_init_new(
         store_dir: impl AsRef<Path>,
     ) -> Result<RecoveryOutcome<Self>, RecoveryError> {
-        Self::try_init_new_configured(store_dir, None)
+        Self::try_init_new_configured(
+            store_dir,
+            None,
+            crate::maintenance_coordination::ProcessLockPolicy::Take,
+        )
     }
 
     /// Opens a file-backed key/set store with explicit timestamp and durability options.
@@ -240,26 +244,49 @@ impl DurableKeySetStore<File> {
         store_dir: impl AsRef<Path>,
         options: DurableStoreOptions,
     ) -> Result<RecoveryOutcome<Self>, RecoveryError> {
-        Self::try_init_new_configured(store_dir, Some(options))
+        Self::try_init_new_configured(
+            store_dir,
+            Some(options),
+            crate::maintenance_coordination::ProcessLockPolicy::Take,
+        )
+    }
+
+    /// Reopens a closed-compaction staging directory without taking a lock of its own: the
+    /// compactor's claim on the store directory already excludes other processes.
+    pub(crate) fn try_init_new_under_closed_claim(
+        store_dir: &Path,
+    ) -> Result<RecoveryOutcome<Self>, RecoveryError> {
+        Self::try_init_new_configured(
+            store_dir,
+            None,
+            crate::maintenance_coordination::ProcessLockPolicy::CoveredByClosedClaim,
+        )
     }
 
     fn try_init_new_configured(
         store_dir: impl AsRef<Path>,
         options: Option<DurableStoreOptions>,
+        process_lock: crate::maintenance_coordination::ProcessLockPolicy,
     ) -> Result<RecoveryOutcome<Self>, RecoveryError> {
         let store_dir = store_dir.as_ref();
         let open_lease =
-            crate::maintenance_coordination::acquire_open_lease(store_dir).map_err(|source| {
-                RecoveryError::Io {
+            crate::maintenance_coordination::acquire_open_lease_with(store_dir, process_lock)
+                .map_err(|source| RecoveryError::Io {
                     operation: crate::RecoveryOperation::Inspect,
                     path: store_dir.to_path_buf(),
                     source,
-                }
-            })?;
+                })?;
         let maintenance_recovered = crate::compaction::recovery::resolve_store_maintenance(
             store_dir,
             crate::compaction::inspection::InspectedFamily::KeySet,
         )?;
+        open_lease
+            .ensure_inner_lock()
+            .map_err(|source| RecoveryError::Io {
+                operation: crate::RecoveryOperation::Inspect,
+                path: store_dir.to_path_buf(),
+                source,
+            })?;
         let paths = ArtifactPaths::new(store_dir, StoreKind::Set);
         let durability_policy = options
             .map(DurableStoreOptions::durability_policy)

@@ -267,10 +267,16 @@ pub(crate) fn inspect_generation(store_dir: &Path) -> io::Result<DirectoryInspec
     let mut artifacts = BTreeMap::<InspectedFamily, FamilyArtifacts>::new();
     for entry in std::fs::read_dir(store_dir)? {
         let entry = entry?;
+        let name = entry.file_name();
+        // The directory's cross-process lock (specs/011) is ownership state, not a store
+        // artifact: it belongs to no family and counts toward no total.
+        if name == crate::maintenance_coordination::INNER_LOCK_NAME && entry.file_type()?.is_file()
+        {
+            continue;
+        }
         if !entry.file_type()?.is_file() {
             return Err(invalid_artifact_at(entry.path()));
         }
-        let name = entry.file_name();
         if let Some(family) = family_for_active_name(&name) {
             let family_artifacts = artifacts.entry(family).or_default();
             if family_artifacts.active.replace(entry.path()).is_some() {

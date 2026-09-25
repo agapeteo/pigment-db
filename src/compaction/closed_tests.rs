@@ -64,7 +64,16 @@ fn empty_closed_compaction_is_an_artifact_free_no_op() {
     .unwrap();
 
     assert!(outcome.families().is_empty());
-    assert_eq!(snapshot_directory(root.path()).unwrap(), before);
+    let mut after = snapshot_directory(root.path()).unwrap();
+    // The claim's two lock files (specs/011) are the only entries it leaves: the inner one in the
+    // directory and the replacement one beside it.
+    assert!(after
+        .remove(std::path::Path::new("empty-store/.pigment-lock"))
+        .is_some());
+    assert!(after
+        .remove(std::path::Path::new(".empty-store.pigment-lock"))
+        .is_some());
+    assert_eq!(after, before);
 }
 
 #[test]
@@ -116,7 +125,16 @@ fn buffered_nonempty_closed_compaction_runs_the_complete_publication_pipeline() 
         assert!(!store_dir.join(sealed_name(family, 0)).exists());
         assert_three_reopens(&store_dir, family);
     }
-    assert_eq!(snapshot_directory(root.path()).unwrap().len(), 3);
+    let mut after = snapshot_directory(root.path()).unwrap();
+    // Three active files, the inner lock file the reopens created (the compaction retired the one
+    // it held), and the replacement lock file beside the directory (specs/011).
+    assert!(after
+        .remove(std::path::Path::new("mixed-store/.pigment-lock"))
+        .is_some());
+    assert!(after
+        .remove(std::path::Path::new(".mixed-store.pigment-lock"))
+        .is_some());
+    assert_eq!(after.len(), 3, "{:?}", after.keys().collect::<Vec<_>>());
 }
 
 #[test]
