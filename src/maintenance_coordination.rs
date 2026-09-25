@@ -239,42 +239,29 @@ impl Drop for LockFile {
 impl LockFile {
     /// Takes the lock at `path` for `identity`, creating the file if absent, or refuses.
     fn acquire(path: &Path, identity: &Path) -> io::Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!("cannot open lock file {}: {error}", path.display()),
-                )
-            })?;
-        Self::lock(file, path, identity)
+        let (file, writable) = open_lock_file(path, true)?;
+        Self::lock(file, writable, path, identity)
     }
 
     /// Takes the lock at `path` only if the file already exists and can be opened; refuses only
     /// when another process holds it. Nothing is created.
     fn check_existing(path: &Path, identity: &Path) -> io::Result<Option<Self>> {
-        let Ok(file) = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-        else {
+        let Ok((file, writable)) = open_lock_file(path, false) else {
             return Ok(None);
         };
-        match Self::lock(file, path, identity) {
+        match Self::lock(file, writable, path, identity) {
             Ok(lock) => Ok(Some(lock)),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => Err(error),
             Err(_) => Ok(None),
         }
     }
 
-    fn lock(file: std::fs::File, path: &Path, identity: &Path) -> io::Result<Self> {
+    fn lock(file: std::fs::File, writable: bool, path: &Path, identity: &Path) -> io::Result<Self> {
         match file.try_lock() {
             Ok(()) => {
-                record_owner(&file);
+                if writable {
+                    record_owner(&file);
+                }
                 Ok(Self { file })
             }
             Err(std::fs::TryLockError::WouldBlock) => Err(held_refusal(&file, path, identity)),
@@ -283,6 +270,54 @@ impl LockFile {
                 format!("cannot lock {}: {error}", path.display()),
             )),
         }
+    }
+}
+
+/// Opens a lock file for writing, creating it when `create` asks. A lock file this process may
+/// only read -- created in advance for a directory it cannot write, left by another user, or on a
+/// read-only mount -- is opened read-only instead: an exclusive lock still holds through it, and
+/// only the owner record is lost. Reports whether the descriptor is writable.
+///
+/// A path that exists but is not a regular file -- a symlink, a directory, a FIFO -- is refused
+/// before anything opens it: following a symlink would lock its target in the lock file's place
+/// and overwrite it with the owner record. The check precedes the open, so a path replaced in
+/// between is not caught; the store directory is the owner's own, and the replacement lock's
+/// parent is the directory the store lives in.
+fn open_lock_file(path: &Path, create: bool) -> io::Result<(std::fs::File, bool)> {
+    let annotate = |error: io::Error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot open lock file {}: {error}", path.display()),
+        )
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("lock file {} is not a regular file", path.display()),
+            ));
+        }
+        _ => {}
+    }
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false)
+        .open(path)
+    {
+        Ok(file) => Ok((file, true)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            std::fs::File::open(path)
+                .map(|file| (file, false))
+                .map_err(|_| annotate(error))
+        }
+        Err(error) => Err(annotate(error)),
     }
 }
 

@@ -642,3 +642,63 @@ fn another_process_cannot_compact_a_directory_this_process_holds() {
     );
     drop(stores);
 }
+
+/// A6: a store directory this process cannot write, holding a read-only `.pigment-lock` created
+/// in advance, opens: the lock is taken through a read-only descriptor and records nothing, and
+/// it still excludes another process.
+#[cfg(unix)]
+#[test]
+fn a_read_only_lock_file_created_in_advance_serves_a_read_only_store_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let stores = open_all(&fixture.store());
+    seed(&stores);
+    drop(stores);
+    let lock = fixture.store().join(".pigment-lock");
+    fs::write(&lock, b"").expect("reset lock file");
+    fs::set_permissions(&lock, fs::Permissions::from_mode(0o444)).expect("read-only lock file");
+    let read_only = ReadOnlyDirectory::new(&fixture.store());
+
+    let stores = open_all(&fixture.store());
+    let recorded = fs::read(&lock).expect("read lock file");
+    let lines = run_role("open-each", &fixture, &fixture.store());
+
+    drop(stores);
+    drop(read_only);
+    assert!(
+        recorded.is_empty(),
+        "a read-only lock records nothing: {recorded:?}"
+    );
+    for (line, family) in lines.iter().zip(["kv", "set", "map", "kv"]) {
+        assert_refused_naming(line, family, &fixture.inner_lock());
+    }
+}
+
+/// A lock path that is not a regular file is refused rather than followed: a symlink's target
+/// would otherwise be locked in its place and overwritten with the owner record.
+#[cfg(unix)]
+#[test]
+fn a_lock_path_that_is_a_symlink_is_refused_and_its_target_untouched() {
+    let fixture = Fixture::new();
+    let victim = fixture.base.path().join("victim.txt");
+    fs::write(&victim, b"keep me").expect("create victim");
+    std::os::unix::fs::symlink(&victim, fixture.store().join(".pigment-lock"))
+        .expect("symlink lock path");
+
+    let result = DurableKeyValueStore::try_init_new(fixture.store());
+
+    assert_eq!(fs::read(&victim).expect("read victim"), b"keep me");
+    match result {
+        Err(RecoveryError::Io {
+            operation: RecoveryOperation::Inspect,
+            source,
+            ..
+        }) => assert!(
+            source.to_string().contains("not a regular file"),
+            "the refusal must say why: {source}"
+        ),
+        Err(error) => panic!("expected an Inspect refusal, got {error:?}"),
+        Ok(_) => panic!("a symlinked lock path must be refused"),
+    }
+}
