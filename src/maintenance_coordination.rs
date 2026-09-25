@@ -686,8 +686,17 @@ fn open_locks(identity: &Path) -> io::Result<(Option<LockFile>, Option<LockFile>
         lock_seams::after_maintenance_check(identity);
         if identity.is_dir() {
             let inner = LockFile::acquire(&identity.join(INNER_LOCK_NAME), identity)?;
-            let replacement =
+            let mut replacement =
                 LockFile::check_existing(&replacement_lock_path(identity)?, identity)?;
+            // A check skipped because the file could not be opened is safe only while no
+            // maintenance is in progress. A claim retires its inner lock once it has staged, and
+            // from then on only its replacement lock excludes this open (FR-7).
+            if replacement.is_none() && directory_maintenance_in_progress(identity)? {
+                replacement = Some(LockFile::acquire(
+                    &replacement_lock_path(identity)?,
+                    identity,
+                )?);
+            }
             return Ok((Some(inner), replacement));
         }
         if !directory_maintenance_in_progress(identity)? && !identity.is_dir() {
@@ -782,11 +791,13 @@ fn with_entry<T>(
 
 fn maintenance_path_for(store_dir: &Path, identity: &Path) -> PathBuf {
     let normal: PathBuf = store_dir.components().collect();
-    let names_itself = normal.file_name().is_some()
+    let names_itself = normal
+        .file_name()
+        .is_some_and(|name| Some(name) == identity.file_name())
         && !std::fs::symlink_metadata(&normal)
             .is_ok_and(|metadata| metadata.file_type().is_symlink());
     if names_itself {
-        store_dir.to_path_buf()
+        normal
     } else {
         identity.to_path_buf()
     }
@@ -946,9 +957,11 @@ impl OpenDirectoryLease {
 
     /// The path recovery reads for `store_dir`. Maintenance artifacts are named from the path's
     /// last component, so a path whose last component is not the directory's own name locates
-    /// none of them: a symlink, written with or without a trailing separator or `.`, and a path
-    /// ending in `.` or `..`. For those it is the directory's identity. Otherwise it is
-    /// `store_dir` itself, so that errors keep naming the path the caller gave.
+    /// none of them: a symlink, written with or without a trailing separator or `.`; a path
+    /// ending in `..`; and, on Windows, a name the system maps to another (`store.`, an 8.3
+    /// short name). For those it is the directory's identity. Otherwise it is `store_dir` read
+    /// lexically, so that errors name the path the caller gave, and `store/.` is recovered as
+    /// `store`, since renames into `store/.` are refused.
     pub(crate) fn maintenance_path(&self, store_dir: &Path) -> PathBuf {
         maintenance_path_for(store_dir, &self.identity)
     }
@@ -1287,14 +1300,22 @@ mod identity_tests {
         std::fs::create_dir_all(store.join("sub")).unwrap();
         let identity = std::fs::canonicalize(&store).unwrap();
 
-        for names_itself in [store.clone(), store.join(".")] {
+        // Folded, so that `store/.` names `store`: renames into `store/.` are refused.
+        for names_itself in [store.clone(), store.join("."), root.path().join("store/")] {
             assert_eq!(
                 maintenance_path_for(&names_itself, &identity),
-                names_itself,
+                store,
                 "{}",
                 names_itself.display()
             );
         }
+        // A last component that differs from the directory's own name, as Windows allows for
+        // `store.` or an 8.3 short name, locates none of its artifacts either.
+        let differently_named = root.path().join("STORE");
+        assert_eq!(
+            maintenance_path_for(&store, &differently_named),
+            differently_named
+        );
         for other in [store.join("sub").join(".."), Path::new(".").to_path_buf()] {
             assert_eq!(
                 maintenance_path_for(&other, &identity),

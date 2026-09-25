@@ -2014,6 +2014,80 @@ mod ownership {
         }
     }
 
+    /// specs/011, FR-7: an open that cannot open the replacement lock file to check it may skip
+    /// the check only while no maintenance is in progress. Stalled until another process's claim
+    /// has published its manifest, it must then take that lock and be refused, rather than
+    /// recover the live claim's work.
+    #[test]
+    fn an_open_that_cannot_check_the_replacement_lock_is_refused_during_a_claim() {
+        use crate::maintenance_coordination::lock_seams::{inject_open_error, Stall, StallPoint};
+        use crate::test_support::fault_checkpoint::{
+            pause_maintenance_child, MaintenanceCut, MaintenanceFaultPoint, MaintenancePhase,
+            MAINTENANCE_PAUSED_CHILD_COMPLETED,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let store_dir = root.path().join("store");
+        std::fs::create_dir(&store_dir).unwrap();
+        create_segmented_v2(&store_dir, FixtureFamily::KeyValue);
+        let stall = Stall::install_at(&store_dir, StallPoint::AfterMaintenanceCheck);
+        let opener = {
+            let store_dir = store_dir.clone();
+            std::thread::spawn(move || {
+                crate::key_value_store::DurableKeyValueStore::try_init_new(&store_dir)
+                    .map(|outcome| outcome.status())
+            })
+        };
+        stall.wait_entered();
+        let pause_dir = tempfile::tempdir().unwrap();
+        let child = pause_maintenance_child(
+            "compaction::recovery_tests::closed_compaction_checkpoint_child",
+            &store_dir,
+            pause_dir.path(),
+            MaintenanceFaultPoint {
+                phase: MaintenancePhase::Prepared,
+                cut: MaintenanceCut::ManifestPublish,
+            },
+        );
+        // Lock files beside the directory cannot be opened for writing, and not for want of
+        // permission, so the read-only fallback does not apply either.
+        inject_open_error(root.path(), std::io::ErrorKind::Other);
+        stall.release();
+        let opened = opener.join().unwrap();
+        let exit = child.resume();
+
+        assert!(
+            opened.is_err(),
+            "an open went live during another process's claim: {opened:?}"
+        );
+        assert_eq!(exit, MAINTENANCE_PAUSED_CHILD_COMPLETED);
+        let reopened = crate::key_value_store::DurableKeyValueStore::try_init_new(&store_dir)
+            .unwrap()
+            .into_store();
+        assert_eq!(reopened.get(b"alpha"), Some(b"one".to_vec()));
+    }
+
+    /// specs/011, FR-5: a path ending in `.` recovers the directory it names, like the plain path.
+    #[test]
+    fn a_path_ending_in_a_dot_recovers_the_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let store_dir = root.path().join("store");
+        std::fs::create_dir(&store_dir).unwrap();
+        interrupted_compaction(&store_dir);
+
+        let outcome =
+            crate::key_value_store::DurableKeyValueStore::try_init_new(store_dir.join("."))
+                .unwrap_or_else(|error| panic!("`store/.` must recover: {error:?}"));
+
+        assert_eq!(outcome.status(), crate::RecoveryStatus::Recovered);
+        let store = outcome.into_store();
+        store.put(b"late".to_vec(), b"kept".to_vec());
+        drop(store);
+        let reopened = crate::key_value_store::DurableKeyValueStore::try_init_new(&store_dir)
+            .unwrap()
+            .into_store();
+        assert_eq!(reopened.get(b"late"), Some(b"kept".to_vec()));
+    }
+
     /// Leaves `store_dir` replaced under an open of it: the open, stalled between taking the inner
     /// lock and checking the replacement lock, holds the lock file of a directory another
     /// process's closed compaction has since retired. `after_compaction` runs once the compaction
