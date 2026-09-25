@@ -2,8 +2,9 @@
 name = "pigment-db"
 version = "0.8.2"
 edition = "2021"
-# File::try_lock, which the cross-process directory lock uses (specs/011).
-rust-version = "1.89"
+# 1.91 for `PathBuf == String` (compaction/recovery.rs); the cross-process directory lock needs
+# File::try_lock, from 1.89 (specs/011). CI checks every target on this toolchain.
+rust-version = "1.91"
 
 [[bin]]
 name = "pigment-db-migrate"

@@ -258,3 +258,73 @@ fn windows_unsafe_and_dependency_are_confined_to_the_durability_boundary() {
     assert_eq!(cargo.matches("windows-sys").count(), 1);
     assert!(cargo.contains("features = [\"Win32_Storage_FileSystem\"]"));
 }
+
+#[test]
+fn directory_ownership_tests_run_on_every_operating_system() {
+    let workflow_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(".github")
+        .join("workflows")
+        .join("recovery.yml");
+    let workflow = fs::read_to_string(&workflow_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read recovery workflow {}: {error}",
+            workflow_path.display()
+        )
+    });
+    // `run:` directly after `name:` leaves no room for an `if:` gating the step to one OS.
+    let every_os_step = [
+        "      - name: Directory ownership seams and cross-process claims",
+        "        run: |",
+        "          cargo test maintenance_coordination:: -- --test-threads=1",
+        "          cargo test compaction::recovery_tests::ownership:: -- --test-threads=1",
+    ]
+    .join("\n");
+
+    assert!(
+        workflow.contains(&every_os_step),
+        "recovery workflow must run the directory ownership unit tests on every OS"
+    );
+}
+
+#[test]
+fn the_declared_minimum_toolchain_checks_every_target() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).expect("read Cargo.toml");
+    let declared = manifest
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("rust-version = "))
+        .expect("Cargo.toml declares a rust-version")
+        .trim_matches('"');
+    let toolchain = if declared.matches('.').count() == 1 {
+        format!("{declared}.0")
+    } else {
+        declared.to_owned()
+    };
+    let workflow_path = root.join(".github").join("workflows").join("recovery.yml");
+    let workflow = fs::read_to_string(&workflow_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read recovery workflow {}: {error}",
+            workflow_path.display()
+        )
+    });
+    // Clippy's incompatible_msrv lint misses trait impls and test code, so only a build on the
+    // declared toolchain enforces it.
+    let msrv_job = [
+        "  minimum-supported-rust:".to_owned(),
+        "    name: Minimum supported Rust".to_owned(),
+        "    runs-on: ubuntu-latest".to_owned(),
+        "    env:".to_owned(),
+        "      CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback".to_owned(),
+        "    steps:".to_owned(),
+        "      - uses: actions/checkout@v4".to_owned(),
+        format!("      - uses: dtolnay/rust-toolchain@{toolchain}"),
+        "      - name: Check every target on the declared minimum toolchain".to_owned(),
+        "        run: cargo check --all-targets".to_owned(),
+    ]
+    .join("\n");
+
+    assert!(
+        workflow.contains(&msrv_job),
+        "recovery workflow must check every target on rust-version {declared}"
+    );
+}
