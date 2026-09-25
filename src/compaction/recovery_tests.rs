@@ -1041,11 +1041,13 @@ fn closed_compaction_checkpoint_child() {
     else {
         return;
     };
-    crate::maintenance::compact_directory_in_place_internal(
+    if let Err(error) = crate::maintenance::compact_directory_in_place_internal(
         &store_dir,
         crate::ClosedCompactionOptions::default(),
-    )
-    .unwrap();
+    ) {
+        eprintln!("maintenance child: compaction failed: {error:?}");
+        std::process::exit(crate::test_support::fault_checkpoint::MAINTENANCE_CHILD_FAILED);
+    }
     if crate::test_support::fault_checkpoint::maintenance_child_pauses() {
         std::process::exit(
             crate::test_support::fault_checkpoint::MAINTENANCE_PAUSED_CHILD_COMPLETED,
@@ -1583,7 +1585,11 @@ mod ownership {
         let exit = child.resume();
 
         // Its staging stays as evidence, as it does for any source that changed after capture.
-        assert_eq!(exit, 101, "the compaction must fail closed");
+        assert_eq!(
+            exit,
+            crate::test_support::fault_checkpoint::MAINTENANCE_CHILD_FAILED,
+            "the compaction must fail closed"
+        );
         let paths = crate::compaction::publication::directory_artifact_paths(&store_dir).unwrap();
         assert!(!paths.manifest.exists(), "nothing may be published");
         assert!(

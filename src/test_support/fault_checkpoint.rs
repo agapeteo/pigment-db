@@ -20,6 +20,9 @@ const MAINTENANCE_PAUSE_ENV: &str = "PIGMENT_DB_MAINTENANCE_PAUSE_DIR";
 const MAINTENANCE_PAUSE_TIMEOUT_CODE: i32 = 88;
 /// A paused child that resumed and completed its maintenance.
 pub(crate) const MAINTENANCE_PAUSED_CHILD_COMPLETED: i32 = 89;
+/// Exit code of a maintenance child whose compaction returned an error. It exits rather than
+/// panicking, so the child's own test summary does not appear in its parent's output as a failure.
+pub(crate) const MAINTENANCE_CHILD_FAILED: i32 = 90;
 const WATCHDOG: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
