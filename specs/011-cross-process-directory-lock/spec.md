@@ -115,8 +115,9 @@ under that number in the constitution's Sync Impact Report, and it never reached
   2. Cross-process closed maintenance of an owned directory is refused.
   3. A store directory that is not writable and has no `.pigment-lock` is refused. Creating the file
      once, readable, restores it.
-  4. An open refused for any other reason, such as `MigrationRequired` or `InvalidArtifact`, leaves
-     the inner lock file behind.
+  4. An open or claim refused for any other reason, such as `MigrationRequired` or
+     `InvalidArtifact`, leaves the lock files it took behind: the inner one, or the replacement one
+     for a claim or a maintenance-state open.
 - **The first upgrade:** protection begins only when every process using a directory runs this
   version. An older process takes no lock, so drain it before the first restart onto this version.
 - **Known limitations:**
@@ -148,7 +149,8 @@ These tests use only the public API. Each re-executes its own test binary as a c
 | X1 | Open two families, then drop one. | A child is still refused. After the other is dropped too, the child opens. |
 | X2 | The parent holds the directory. A child opens it through a symlink alias. | Refused. |
 | X3 | The lock file holds a foreign process id or unparsable bytes, and no one holds it. | The open succeeds. |
-| R1 | A child parks mid closed-compaction, holding its claim. | The parent's open is refused by the replacement lock. |
+| R1 | A child parks mid closed-compaction, holding its claim, at three points. | The parent's open is refused by the replacement lock, and opens once the compaction finishes. |
+| Symlink | `.pigment-lock` is a symlink. | The open is refused, and the target is untouched. |
 
 The following are unit tests that use private seams:
 - lock-file I/O stalled for one directory while other directories open and drop;

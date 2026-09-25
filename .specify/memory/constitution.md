@@ -1,5 +1,21 @@
 <!--
 Sync Impact Report
+- Version change: 1.1.0 -> 1.2.0 (MINOR: a Project Constraint's mandatory
+  guidance expanded; no principle removed or redefined)
+- Modified sections:
+  - Project Constraints: single-process ownership of a store directory is now
+    enforced by the lock files specs/011 defines, and remains a convention only
+    where a lock cannot be taken.
+- Motivating consumer: penpack (two processes appended to one WAL for twelve
+  hours; see specs/011's Motivation note). Classified under VI as a
+  library-vocabulary primitive landing on main before any consumer pins it.
+- Dependent artifacts: specs/011-cross-process-directory-lock (spec, plan,
+  tasks, verification).
+- Compatibility impact: no persisted-format or public API change. The lock
+  files' names, locations and locking are now a compatibility contract.
+- Active work to revalidate: none.
+
+Sync Impact Report
 - Version change: unratified template -> 1.0.0
 - Modified principles:
   - Placeholder principle 1 -> I. RED-GREEN Test-Driven Development
@@ -193,8 +209,12 @@ change served.
 
 - pigment-db remains a Rust library crate; production dependencies MUST NOT be
   added without an approved plan explaining necessity and maintenance impact.
-- The existing single-process-per-store-directory ownership model remains the
-  default until an approved specification defines cross-process coordination.
+- Each file-backed store directory is owned by one process, and that ownership is
+  enforced by the lock files specs/011 defines; their names, locations and lock
+  semantics are a compatibility contract. Where a lock cannot be taken, single-
+  process ownership remains a convention: unsupported platforms or filesystems,
+  network filesystems, and closed maintenance while another mount view of the
+  directory exists.
 - Persistent-state changes MUST account for all three durable store families:
   key/value, key/set, and key/sorted-map, unless the specification explicitly
   demonstrates that a family is unaffected.
@@ -252,4 +272,4 @@ Every code review and Spec Kit analysis MUST verify applicable constitutional
 rules. Exceptions require an explicit, approved constitution amendment; a feature
 document alone cannot waive a principle.
 
-**Version**: 1.1.0 | **Ratified**: 2026-08-06 | **Last Amended**: 2026-09-21
+**Version**: 1.2.0 | **Ratified**: 2026-08-06 | **Last Amended**: 2026-09-25
