@@ -839,7 +839,8 @@ pub(crate) fn try_claim_closed(store_dir: &Path) -> io::Result<ClosedDirectoryCl
 #[cfg(test)]
 pub(crate) mod lock_seams {
     //! Private seams for lock-file I/O (specs/011), each keyed by the directory a lock file lives
-    //! in, so tests running in parallel do not see each other's.
+    //! in, so tests running in parallel do not see each other's. A directory is keyed by the
+    //! identity an open computes for it, so it may be one that does not exist yet.
 
     use std::io;
     use std::path::{Path, PathBuf};
@@ -887,7 +888,10 @@ pub(crate) mod lock_seams {
     }
 
     pub(crate) fn inject_lock_error(directory: &Path, kind: io::ErrorKind) {
-        guard(&LOCK_ERRORS).push((std::fs::canonicalize(directory).unwrap(), kind));
+        guard(&LOCK_ERRORS).push((
+            super::canonical_directory_identity(directory).unwrap(),
+            kind,
+        ));
     }
 
     /// Stalls every lock-file open in one directory until released or dropped.
@@ -898,7 +902,7 @@ pub(crate) mod lock_seams {
 
     impl Stall {
         pub(crate) fn install(directory: &Path) -> Self {
-            let directory = std::fs::canonicalize(directory).unwrap();
+            let directory = super::canonical_directory_identity(directory).unwrap();
             let gate: Gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
             guard(&STALLS).push((directory.clone(), gate.clone()));
             Self { directory, gate }

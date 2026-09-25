@@ -141,6 +141,11 @@ pub(crate) struct PausedMaintenanceChild {
 }
 
 impl PausedMaintenanceChild {
+    /// The parked child's process id.
+    pub(crate) fn id(&self) -> u32 {
+        self.child.as_ref().expect("paused child").id()
+    }
+
     /// Lets the child continue past its cut and returns its exit code.
     pub(crate) fn resume(mut self) -> i32 {
         std::fs::write(self.pause_dir.join("resume"), b"").expect("signal resume");

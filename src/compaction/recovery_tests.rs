@@ -1391,6 +1391,171 @@ fn an_open_stalled_across_another_processs_compaction_neither_opens_nor_breaks_i
     }
 }
 
+/// Whether some descriptor other than a fresh one holds `store_dir`'s inner lock. A lock taken
+/// through another descriptor refuses this one in the same process as in any other.
+fn inner_lock_is_held(store_dir: &std::path::Path) -> bool {
+    let file =
+        std::fs::File::open(store_dir.join(crate::maintenance_coordination::INNER_LOCK_NAME))
+            .expect("the inner lock file must exist");
+    match file.try_lock() {
+        Ok(()) => false,
+        Err(std::fs::TryLockError::WouldBlock) => true,
+        Err(std::fs::TryLockError::Error(error)) => panic!("cannot probe the inner lock: {error}"),
+    }
+}
+
+/// Leaves `store_dir` as a closed compaction killed after moving the directory aside, so the next
+/// open or claim must recover before it can do anything else.
+fn interrupted_compaction(store_dir: &std::path::Path) {
+    use crate::test_support::fault_checkpoint::{
+        run_maintenance_checkpoint_child_with_evidence_root, MaintenanceCut, MaintenanceFaultPoint,
+        MaintenancePhase,
+    };
+    create_segmented_v2(store_dir, FixtureFamily::KeyValue);
+    // Asserts that the child exited at exactly this cut. The directory is moved aside by then, so
+    // the evidence is taken of its parent.
+    run_maintenance_checkpoint_child_with_evidence_root(
+        "compaction::recovery_tests::closed_compaction_checkpoint_child",
+        store_dir,
+        store_dir.parent().unwrap(),
+        MaintenanceFaultPoint {
+            phase: MaintenancePhase::PreviousPublished,
+            cut: MaintenanceCut::PreviousPublish,
+        },
+    );
+    assert!(
+        crate::compaction::publication::directory_artifact_paths(store_dir)
+            .unwrap()
+            .manifest
+            .is_file(),
+        "the interrupted compaction must leave maintenance to recover"
+    );
+}
+
+/// specs/011, FR-5 step 3: an open that recovered interrupted maintenance holds the inner lock of
+/// the directory recovery left in place. Only the inner lock is shared by every mount view of the
+/// directory; the replacement lock the open also holds lives in its own view's parent.
+#[test]
+fn an_open_that_recovered_holds_the_inner_lock() {
+    let root = tempfile::tempdir().unwrap();
+    let store_dir = root.path().join("store");
+    std::fs::create_dir(&store_dir).unwrap();
+    interrupted_compaction(&store_dir);
+
+    let outcome = crate::key_value_store::DurableKeyValueStore::try_init_new(&store_dir).unwrap();
+
+    assert_eq!(outcome.status(), crate::RecoveryStatus::Recovered);
+    assert!(inner_lock_is_held(&store_dir));
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::read_to_string(store_dir.join(crate::maintenance_coordination::INNER_LOCK_NAME))
+            .unwrap(),
+        format!("{}\n", std::process::id())
+    );
+    drop(outcome);
+    assert!(!inner_lock_is_held(&store_dir));
+}
+
+/// specs/011: a closed-maintenance claim that recovered interrupted maintenance holds the inner
+/// lock while it stages the next compaction, until it retires it before publication.
+#[test]
+fn a_claim_that_recovered_holds_the_inner_lock_while_it_stages() {
+    use crate::test_support::fault_checkpoint::{
+        pause_maintenance_child, MaintenanceCut, MaintenanceFaultPoint, MaintenancePhase,
+        MAINTENANCE_PAUSED_CHILD_COMPLETED,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let store_dir = root.path().join("store");
+    std::fs::create_dir(&store_dir).unwrap();
+    interrupted_compaction(&store_dir);
+    let pause_dir = tempfile::tempdir().unwrap();
+    let child = pause_maintenance_child(
+        "compaction::recovery_tests::closed_compaction_checkpoint_child",
+        &store_dir,
+        pause_dir.path(),
+        MaintenanceFaultPoint {
+            phase: MaintenancePhase::Prepared,
+            cut: MaintenanceCut::StagingSync,
+        },
+    );
+
+    let held = inner_lock_is_held(&store_dir);
+    #[cfg(unix)]
+    let owner =
+        std::fs::read_to_string(store_dir.join(crate::maintenance_coordination::INNER_LOCK_NAME))
+            .unwrap();
+    #[cfg(unix)]
+    let child_id = child.id();
+
+    assert_eq!(child.resume(), MAINTENANCE_PAUSED_CHILD_COMPLETED);
+    assert!(held, "the claim must hold the inner lock while it stages");
+    #[cfg(unix)]
+    assert_eq!(owner, format!("{child_id}\n"));
+    let reopened = crate::key_value_store::DurableKeyValueStore::try_init_new(&store_dir)
+        .unwrap()
+        .into_store();
+    assert_eq!(reopened.get(b"alpha"), Some(b"one".to_vec()));
+}
+
+/// specs/011, FR-13: the inner lock an open takes after recovering is also opened outside the
+/// ownership registry's mutex. While that lock-file open is stalled for one directory, another
+/// directory opens and a third directory's store is dropped.
+#[test]
+fn a_stalled_inner_lock_after_recovery_holds_up_no_other_directory() {
+    use crate::maintenance_coordination::lock_seams::Stall;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let root = tempfile::tempdir().unwrap();
+    let store_dir = root.path().join("store");
+    std::fs::create_dir(&store_dir).unwrap();
+    interrupted_compaction(&store_dir);
+    let manifest = crate::compaction::publication::directory_artifact_paths(&store_dir)
+        .unwrap()
+        .manifest;
+    let other = tempfile::tempdir().unwrap();
+    let dropped = tempfile::tempdir().unwrap();
+    let held = crate::key_value_store::DurableKeyValueStore::try_init_new(dropped.path())
+        .unwrap()
+        .into_store();
+    let stall = Stall::install(&store_dir);
+
+    let recovering = {
+        let store_dir = store_dir.clone();
+        std::thread::spawn(move || {
+            crate::key_value_store::DurableKeyValueStore::try_init_new(&store_dir)
+                .map(|outcome| outcome.status())
+        })
+    };
+    stall.wait_entered();
+    let recovered_before_the_stall = !manifest.exists();
+    let (done, finished) = mpsc::channel();
+    let other_path = other.path().to_path_buf();
+    std::thread::spawn(move || {
+        let opened =
+            crate::key_value_store::DurableKeyValueStore::try_init_new(&other_path).is_ok();
+        drop(held);
+        let _ = done.send(opened);
+    });
+    let progressed = finished.recv_timeout(Duration::from_secs(5));
+
+    stall.release();
+    let recovered = recovering.join().unwrap();
+    // Joined before asserting, so a failure leaves no thread parked on the gate.
+    let _ = finished.recv_timeout(Duration::from_secs(30));
+
+    assert!(
+        recovered_before_the_stall,
+        "the stall must hold the inner lock taken after recovery"
+    );
+    assert_eq!(
+        progressed,
+        Ok(true),
+        "another directory's open and a third's drop waited behind a stalled lock file"
+    );
+    assert_eq!(recovered.unwrap(), crate::RecoveryStatus::Recovered);
+}
+
 fn reopen_after_checkpoint(
     store_dir: &std::path::Path,
     family: FixtureFamily,
