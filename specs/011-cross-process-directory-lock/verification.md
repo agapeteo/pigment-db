@@ -3,7 +3,8 @@
 Measured on Linux 7.1 with rustc 1.97.1, on branch `011-cross-process-directory-lock`, from
 `af25792` to `e03c2a1`. A review of that revision found three defects and several gaps. They were
 fixed from `1b79628` to `f57bdde`, and "Review fixes" below records that evidence. A re-review of
-`c026816` found two more defects, fixed from `01f0200` to `583ddbb` ("Second review" below).
+`c026816` found two more defects, fixed from `01f0200` to `583ddbb` ("Second review" below). A check
+of that fix found three more, fixed in `6a5b20b` ("Third review").
 
 ## Suites
 
@@ -13,6 +14,7 @@ fixed from `1b79628` to `f57bdde`, and "Review fixes" below records that evidenc
 | `e03c2a1` | 585 | 0 | 28 | 26 |
 | `f57bdde` | 597 | 0 | 28 | 26 |
 | `583ddbb` | 602 | 0 | 28 | 26 |
+| `6a5b20b` | 605 | 0 | 28 | 26 |
 
 The extra ignored test is `directory_lock::child_entry`, the child-process role runner.
 
@@ -90,7 +92,7 @@ lived in each namespace's private parent.
 
 ## Not verified
 
-- macOS and Windows: CI covers them from this revision on, and this record ran neither.
+- macOS and Windows: CI will cover them once the branch is pushed. This record ran neither.
 - Network filesystems.
 - Solaris and illumos.
 - The pid-namespace wording, beyond the documented limitation.
@@ -134,7 +136,7 @@ timed out after 5 s. With the guard left disarmed, it fails the same way.
 | The lease's `ensure_inner_lock` (FR-5 step 3) | `an_open_that_recovered_holds_the_inner_lock` | A no-op, which also fails the cleanup-pending tests' check that the open holds the lock. The progress test hung under it rather than failing; `wait_entered` now fails after 30 s. |
 | The claim's `ensure_inner_lock` | `a_claim_that_recovered_holds_the_inner_lock_while_it_stages` | A no-op, failing this test only |
 | Post-recovery lock I/O outside the mutex (FR-13) | `a_stalled_inner_lock_after_recovery_holds_up_no_other_directory` | The acquire moved under the mutex, which compiles warning-free |
-| The optional replacement-lock check on ordinary opens | the stalled-opener test | `check_existing(..).ok().flatten()`. The first point to fail is StagingValidate, where the open is admitted instead of refused. ReopenValidation was not run on its own. |
+| The optional replacement-lock check on ordinary opens | the stalled-opener test | `check_existing(..).ok().flatten()`. The first point to fail is StagingValidate. The open gets past the lock and then fails with `AuthorityUndetermined`, where the claim's `WouldBlock` was expected. ReopenValidation was not run on its own. |
 | The `ReadOnlyFilesystem` read-only fallback (FR-7) | `a_read_only_filesystem_opens_the_lock_file_read_only_and_records_nothing`, through an injected read-write-open error | The arm dropped |
 
 The stalled-opener test also covers PreviousPublish, where the directory is moved aside. The
@@ -280,3 +282,66 @@ items were not:
 - The cross-process stalled-opener test does not report the compactor's own cleanup status. The
   unit test `a_lock_file_in_the_replaced_generation_is_deleted_with_it` pins that removal instead.
 - A wording nit in the plan's Principle VI check.
+
+## Third review
+
+A focused adversarial check of `01f0200` and of the second review's documents ran at `2170d23`.
+It found three more defects, each measured, and each an open going live without the lock that
+excludes every view of the directory.
+
+| Defect | Measured |
+|---|---|
+| An alias open while the directory was moved aside keyed its identity by the alias's own name | It went live during another process's live claim. An acknowledged write through it was lost. |
+| Recovery at open used the path given, so an alias open found none of the directory's artifacts | It went live over an unrecovered directory, and a later real-path open rolled back its write. This predates the branch. |
+| An open stalled after taking the inner lock kept the lock of a directory a compaction then retired | It went live with no lock on the directory in place. Under `unshare -rm`, a view created afterwards became a second writer, and the next open found the WAL invalid. |
+
+RED before `6a5b20b` (Unix):
+
+| Test | Failure |
+|---|---|
+| `an_alias_opened_while_the_directory_is_moved_aside_is_refused_by_the_claim` | `NotFound` for the alias |
+| `an_alias_open_recovers_the_directory_it_names` | status `Normal` |
+| `an_open_whose_inner_lock_was_retired_under_it_takes_the_current_one` | went live without the directory's lock |
+
+The alias-recovery test's first draft died in its own setup, because the evidence snapshot refuses
+a symlink. That was not counted as its RED.
+
+Each neutralization fails exactly its test:
+- the symlink resolution removed;
+- recovery through the alias's own name;
+- a held lock trusted;
+- `still_at` comparing nothing;
+- the directory dropped from the FR-11 warning. Before, the test asked for the directory only
+  through the lock path, and this neutralization passed.
+
+Workflow pins: with all five files they read converted to CRLF, 10 of 10 pass. Before, a CRLF
+`src/wal/mod.rs` failed one.
+
+Documentation corrections:
+- the `ensure_inner_lock` doc comment, which still described the defect `01f0200` fixed;
+- the `check_existing` neutralization record;
+- the Numbering note, which missed a third use of 010;
+- the acceptance notes on A2 and A8;
+- Compatibility item 4, qualified for maintenance-state operations;
+- the plan's attribution of the lock-free entry;
+- a task for `583ddbb`.
+
+Mutations of `01f0200` that still pass every test:
+
+| Mutation | Why it passes |
+|---|---|
+| `OPEN_STATE_ATTEMPTS` 3 changed to 2 | No test flips the directory three times |
+| The error kind after the attempts are exhausted | Not asserted |
+| The re-check dropping its `&& !identity.is_dir()` | Reaching it needs a stall between the directory check and the re-check, and there is no seam there |
+| `ensure_inner_lock`'s arm for a directory absent after recovery leaving `Acquiring` | No second waiter reaches it. The directory is never absent after a successful recovery |
+
+These are recorded and not pinned. The missing-directory error's `NotFound` kind is now asserted.
+
+Found, not fixed: two families of one process recovering at once can refuse one of them (spec,
+"Found during review").
+
+Checks at `6a5b20b`:
+- Suite: 605 passed, 0 failed, 28 ignored, across 26 binaries.
+- `cargo fmt --check` is clean.
+- Clippy reports nothing on Linux, and only the 14 warnings that predate the branch for Windows.
+- The ownership, progress and lock-error tests passed 15 runs out of 15.

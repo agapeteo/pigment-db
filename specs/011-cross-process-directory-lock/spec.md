@@ -19,11 +19,13 @@ when the store directory is a mount point.
 
 ## Numbering
 
-This is spec 011. Two earlier pieces of work used the number 010, and neither reached `main`:
+This is spec 011. Earlier work used the number 010 three times:
 - `specs/010`, the refused bounded key-set snapshot change, is cited under that number in the
-  constitution's Sync Impact Report.
+  constitution's Sync Impact Report. It never reached `main`.
 - The `010-cross-process-directory-lock` branch was this feature's first prototype. It used a lock
-  beside the directory only. The verification record calls it "the spec 010 prototype".
+  beside the directory only, and the verification record calls it "the spec 010 prototype". It
+  never reached `main`.
+- The branch `codex/010-fix-i128-key` reached `main` as `specs/007-fix-i128-key`.
 
 ## Requirements
 
@@ -49,6 +51,16 @@ This is spec 011. Two earlier pieces of work used the number 010, and neither re
     - A closed-maintenance claim takes it, creating it if absent.
     - So does an open that finds directory-level maintenance artifacts for the directory.
     - Every other open checks it only if it already exists, and never creates it.
+  - **Identity.** A directory is known by its canonical path, which also locates both lock files.
+    - A symlink alias whose target does not exist, because a compaction has moved the directory
+      aside, is followed by hand, up to 40 links. So it still names the directory it points to.
+    - Recovery at open reads the maintenance artifacts of that canonical directory whenever the
+      path given is a symlink. For any other path it uses the path given, so errors name it.
+  - **A held inner lock must still be the directory's.** An open stalled after taking the inner
+    lock can end up holding the lock file of a directory that a compaction then retired. Before
+    an open or a claim goes on, a held inner lock is checked against the file now at the lock
+    path, by device and inode, and re-taken if they differ. Windows std exposes no stable file
+    identity, so there a held lock is kept (Known limitations).
 - **FR-3 Refusal.**
   - An open of a directory another live process owns fails before any store artifact is opened,
     created or written. This covers `try_init_new`, `try_init_new_with_options` and `init_new` of
@@ -158,7 +170,8 @@ This is spec 011. Two earlier pieces of work used the number 010, and neither re
      `InvalidArtifact`, leaves behind the lock files it took:
      - the inner one, for an open;
      - both, for a claim;
-     - the replacement one alone, for an open or claim in a maintenance state.
+     - for an open or claim in a maintenance state, the replacement one alone when recovery
+       itself refuses, and both when recovery completed before the refusal.
   5. An open of a directory that does not exist now fails before it takes a lock or touches any
      artifact, with `Inspect` naming the directory (FR-8). It used to fail creating the WAL's
      staging file (`CreateStaging`, naming `<dir>/.kv.wal.dat.next` for the key/value family).
@@ -189,6 +202,12 @@ This is spec 011. Two earlier pieces of work used the number 010, and neither re
     illumos, AIX or GNU/Hurd, where one build locks and the other skips.
   - Closed compaction through a symlinked store path replaces the symlink rather than the directory.
     That defect predates this spec and is tracked separately.
+  - On Windows a held inner lock is not checked against the file at the lock path (FR-2), since
+    std exposes no stable file identity there. An open stalled across a whole compaction can
+    therefore keep the retired directory's lock, and a view of the directory created afterwards
+    is not excluded by it. Opens through the same parent are still excluded by the replacement
+    lock. It is not known whether Windows lets a compaction rename a directory holding an open
+    lock file.
 - **Out of scope:**
   - locking the destination of `pigment-db-migrate`;
   - waiting for a lock;
@@ -213,6 +232,14 @@ is recorded here. The minimum-toolchain job checks Linux only.
 
 ## Found during review, not fixed here
 
+**Two families of one process recovering at once can refuse one of them.** When the kv and key-set
+opens of one process start together on an interrupted compaction, both run directory recovery.
+- Measured once in 120 runs: one open failed with a raw `NotFound`, reported under `Inspect`.
+- The next open was clean in every run. Other processes stay excluded throughout, because both
+  threads share the entry's replacement lock.
+- This predates this spec. It needs recovery serialized per registry entry, as FR-5 now does for
+  the inner lock.
+
 **A write after an open whose closed cleanup stays pending makes the next open fail.** This defect
 is present at `af25792`.
 - CleanupPending recovery re-verifies the canonical directory against the replacement inventory,
@@ -228,14 +255,14 @@ inventory). The canonical directory would then only have to inspect as a valid g
 
 ## Acceptance
 
-Most of these tests re-execute their own test binary as a child process. X3, A7, A8 and Symlink
-run in one process. X2, A6, A7, A8 and Symlink are Unix-only. All but R1 use only the public API.
-R1 parks its child with a private pause seam.
+Most of these tests re-execute their own test binary as a child process. X3, A7 and Symlink run
+in one process. A8 spawns `true`, not the test binary. X2, A6, A7, A8 and Symlink are Unix-only.
+All but R1 use only the public API. R1 parks its child with a private pause seam.
 
 | Test | Scenario | Expected |
 |---|---|---|
 | A1 | The parent holds one family. A child opens every family, the first twice. | Each open is refused (`Inspect`, `WouldBlock`), and the message names the inner lock file. A recursive snapshot of the store's parent, lock files included, is unchanged. |
-| A2 (Unix) | A child holds the directory. The parent opens it. | Refused, naming the lock file and the child's process id. On Windows, the lock file only. |
+| A2 | A child holds the directory. The parent opens it. | Refused, naming the lock file, and on Unix the child's process id. |
 | A3 | The parent holds the directory. A child runs closed compaction. | `FailedClosed`, naming the lock file, and nothing changes. |
 | A4 (control) | One process opens all three families, then drops them. | A child then opens them, and the inner lock file still exists. |
 | A5 (control) | A child holding the directory is killed and reaped. | The parent opens it. |
@@ -257,6 +284,9 @@ These unit tests use private seams or fixtures:
 | Opener stalled earlier | The same, stalled just after its maintenance check, with PreviousPublished/ManifestPublish added. | Refused by the replacement lock at every point, including those at which the directory is moved aside. |
 | Inner lock in flight | A second family opens while the first is taking the inner lock after recovery, and another holder has that lock; or the first attempt panics. | The second family waits. It is refused while the other holder has the lock, and takes the lock itself after a panic. |
 | A directory named like the lock file | It appears in the source after the claim retired its lock. | The compaction fails closed and publishes nothing. |
+| Alias, moved aside (Unix) | An open through a symlink alias while a compaction has moved the directory aside. | Refused by the claim's replacement lock. |
+| Alias, recovery (Unix) | An open through a symlink alias after a compaction was interrupted. | It recovers the directory it names, and its writes survive a later open of the real path. |
+| Retired inner lock (Unix) | An open stalled after taking the inner lock while a compaction replaces the directory. | Before going live it holds the lock of the directory in place. |
 | Lock file in `.previous` | A replaced generation holds `.pigment-lock`. | Both cleanups delete it. A directory of that name keeps cleanup pending. |
 | Recovering owners | An open, or a claim paused while staging, recovers an interrupted compaction. | Each holds the inner lock and records its process id. |
 | Progress | Lock-file I/O for one directory is stalled, at entry creation and again after recovery. | Other directories open and drop. |

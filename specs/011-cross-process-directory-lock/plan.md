@@ -76,8 +76,14 @@ changes. `rust-version = "1.91"` is declared, and a CI job checks every target o
 - **No entry without a lock.** An open that finds no directory asks again whether maintenance is
   in progress, because a claim may have moved the directory aside in between. If none is, the
   open fails at once (FR-8). An entry that held no lock could neither recover maintenance nor go
-  live safely. The first version of this plan let such an entry proceed, and a re-review measured
-  it recovering, and wedging, another process's live compaction.
+  live safely. The first version of the spec (FR-8) and of `open_locks` let such an entry proceed,
+  and a re-review measured it recovering, and wedging, another process's live compaction.
+- **Checks that can go stale.** Each check the open makes can be overtaken by another process's
+  compaction, so a check is re-asked where its answer decides something:
+  - An alias's identity is computed even while its target is moved aside, by following the link.
+  - Recovery through a symlink reads the canonical directory's artifacts.
+  - A held inner lock is compared with the file at the lock path before going live, by device and
+    inode. The comparison runs outside the mutex. Windows has no such comparison.
 - **Unwinding.** A panic while an entry is `Pending` removes the entry, through a guard that is
   disarmed once creation returns. Otherwise every later open of that directory would wait forever.
 

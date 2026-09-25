@@ -79,5 +79,14 @@ Fixes after the re-review of `c026816`:
     behind an unwinding guard. FR-5 step 3 is pinned for every family (`01f0200`).
 - [x] T020 Harden the ownership tests: the FR-11 warning, foreign entries at revalidation and in
   `.previous`, the claim's retirement, the inspection assertions, CRLF-safe pins, and Windows
-  lock release (`a00e12b`).
+  lock release (`a00e12b`). A failing checkpoint child exits with its own code (`583ddbb`).
 - [x] T021 Correct the documents after the re-review.
+
+Fixes after the check of `2170d23`:
+
+- [x] T022 An alias names its directory, recovery through an alias reads that directory, and a
+  held inner lock must still be the directory's:
+  - RED: an alias open during a move answered `NotFound`; an alias open skipped recovery
+    (`Normal`); a stalled open went live on a retired lock.
+  - GREEN: the three fixes (`6a5b20b`).
+- [x] T023 Correct the documents after the check.
