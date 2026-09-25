@@ -262,6 +262,8 @@ pub(crate) enum ProcessLockPolicy {
 /// A lock file this process holds.
 struct LockFile {
     file: std::fs::File,
+    /// False only where the platform or filesystem cannot lock, and the lock was skipped (FR-11).
+    locked: bool,
 }
 
 impl LockFile {
@@ -270,7 +272,9 @@ impl LockFile {
     /// so closing alone would leave it held for as long as the child takes to exec: measured, 312
     /// of 400 immediate reopens were refused.
     fn unlock(&self) {
-        let _ = self.file.unlock();
+        if self.locked {
+            let _ = self.file.unlock();
+        }
     }
 }
 
@@ -301,14 +305,38 @@ impl LockFile {
     }
 
     fn lock(file: std::fs::File, writable: bool, path: &Path, identity: &Path) -> io::Result<Self> {
-        match file.try_lock() {
+        #[cfg(test)]
+        let attempt = match lock_error_tests::injected_error(path) {
+            Some(kind) => Err(std::fs::TryLockError::Error(io::Error::from(kind))),
+            None => file.try_lock(),
+        };
+        #[cfg(not(test))]
+        let attempt = file.try_lock();
+        match attempt {
             Ok(()) => {
                 if writable {
                     record_owner(&file);
                 }
-                Ok(Self { file })
+                Ok(Self { file, locked: true })
             }
             Err(std::fs::TryLockError::WouldBlock) => Err(held_refusal(&file, path, identity)),
+            // A platform without file locking, or a filesystem that refuses it: the directory
+            // keeps the previous, process-local ownership rather than becoming impossible to open
+            // (FR-11). Any other error refuses.
+            Err(std::fs::TryLockError::Error(error))
+                if error.kind() == io::ErrorKind::Unsupported =>
+            {
+                log::warn!(
+                    "pigment-db cannot lock {} ({error}); another process opening {} is not \
+                     excluded",
+                    path.display(),
+                    identity.display()
+                );
+                Ok(Self {
+                    file,
+                    locked: false,
+                })
+            }
             Err(std::fs::TryLockError::Error(error)) => Err(io::Error::new(
                 error.kind(),
                 format!("cannot lock {}: {error}", path.display()),
@@ -876,5 +904,59 @@ mod progress_tests {
             "another directory's open and a third's drop waited behind a stalled lock file"
         );
         assert!(stalled_opened);
+    }
+}
+
+#[cfg(test)]
+mod lock_error_tests {
+    //! FR-11 (specs/011): a lock the platform or filesystem cannot take is skipped with a warning;
+    //! any other lock error refuses the open.
+
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    /// Lock errors to report in place of a real attempt, for lock files in the given directories.
+    static INJECTED: Mutex<Vec<(PathBuf, io::ErrorKind)>> = Mutex::new(Vec::new());
+
+    pub(super) fn injected_error(path: &Path) -> Option<io::ErrorKind> {
+        let injected = INJECTED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        injected
+            .iter()
+            .find(|(directory, _)| path.parent() == Some(directory.as_path()))
+            .map(|(_, kind)| *kind)
+    }
+
+    fn inject(directory: &Path, kind: io::ErrorKind) {
+        INJECTED
+            .lock()
+            .unwrap()
+            .push((std::fs::canonicalize(directory).unwrap(), kind));
+    }
+
+    #[test]
+    fn a_lock_the_platform_cannot_take_is_skipped_and_the_store_opens() {
+        let directory = tempfile::tempdir().unwrap();
+        inject(directory.path(), io::ErrorKind::Unsupported);
+
+        let opened = crate::key_value_store::DurableKeyValueStore::try_init_new(directory.path());
+
+        assert!(opened.is_ok(), "{:?}", opened.err());
+    }
+
+    #[test]
+    fn any_other_lock_error_refuses_the_open() {
+        let directory = tempfile::tempdir().unwrap();
+        inject(directory.path(), io::ErrorKind::Other);
+
+        match crate::key_value_store::DurableKeyValueStore::try_init_new(directory.path()) {
+            Err(crate::RecoveryError::Io { source, .. }) => {
+                assert_eq!(source.kind(), io::ErrorKind::Other);
+                assert!(source.to_string().contains(".pigment-lock"), "{source}");
+            }
+            other => panic!("expected an I/O refusal, got {:?}", other.map(|_| ())),
+        }
     }
 }
