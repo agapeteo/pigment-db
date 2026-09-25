@@ -1,9 +1,11 @@
 # Cross-process ownership of store directories
 Status: approved for implementation, 2026-09-25.
 
-**Motivation (provenance):** a penpack deployment was restarted while its previous process was
-still alive: that process's HTTP shutdown never completed, but its listener had already closed. The
-replacement opened the same store directory. For about twelve hours both processes appended to
+## Motivation (provenance)
+
+A penpack deployment was restarted while its previous process was still alive: that process's
+HTTP shutdown never completed, but its listener had already closed. The replacement opened the same
+store directory. For about twelve hours both processes appended to
 `kv.wal.dat`. Each V2 record carries its writer's own view of the file length (the physical-start
 and mutation-start fields), so the next open refused the WAL as `InvalidArtifact`.
 
@@ -15,7 +17,9 @@ until an approved specification defines cross-process coordination". This is tha
 penpack's container image keeps its store at a volume path, `/opt/db`, so the lock must also hold
 when the store directory is a mount point.
 
-**Numbering.** This is spec 011. `specs/010` is the refused bounded key-set snapshot change, cited
+## Numbering
+
+This is spec 011. `specs/010` is the refused bounded key-set snapshot change, cited
 under that number in the constitution's Sync Impact Report, and it never reached `main`.
 
 ## Requirements
@@ -55,8 +59,13 @@ under that number in the constitution's Sync Impact Report, and it never reached
   - The claim holds both locks. The replacement lock excludes every other process until the claim
     ends.
   - After validating its staging directory, and before revalidating the source or publishing any
-    manifest, the compactor unlocks and deletes the inner lock file. The replaced directory then
-    holds exactly the store files it captured.
+    manifest, the compactor unlocks and deletes the inner lock file.
+  - An open in another process can still reach the directory afterwards: one that checked for
+    maintenance before staging began, and reaches its inner lock only after that deletion.
+    - Where the directory is present, the open creates a lock file there and is refused by the
+      replacement lock. The file it leaves is not a store artifact (FR-9).
+    - While the directory is moved aside, the open finds no directory. It fails with `NotFound`,
+      naming the lock file, and creates nothing.
   - The next open creates an inner lock file in the replacement directory.
 - **FR-5 Recovery at open.** When directory-level maintenance artifacts exist, an open does the
   following:
@@ -81,14 +90,24 @@ under that number in the constitution's Sync Impact Report, and it never reached
 - **FR-8 A missing directory.** When the store directory does not exist and no directory-level
   maintenance artifacts exist, no lock is taken and nothing is created. The open fails as it does
   today.
-- **FR-9 Inspection ignores the inner lock file.** `inspect_storage` and closed compaction ignore
-  `.pigment-lock` inside a store directory, and its bytes count toward no family.
+- **FR-9 The inner lock file is not a store artifact.**
+  - A regular file named `.pigment-lock` in a store generation belongs to no family, and its bytes
+    count toward no total.
+  - These checks ignore it: `inspect_storage`, closed compaction's revalidation of its source, and
+    every recovery check that compares a generation's exact inventory.
+  - The cleanup that deletes a replaced generation deletes the file with it.
+  - Anything else of that name, such as a directory, is foreign.
 - **FR-10 In-process behaviour is unchanged.** One process opens all three families of a directory
   under one set of locks, and a closed claim still excludes open leases in the same process.
 - **FR-11 Locking support.**
-  - Where the standard library cannot lock (`ErrorKind::Unsupported`, from the platform or the
-    filesystem), that lock is skipped and a warning is logged.
-  - Any other lock error refuses the open.
+  - Where std reports a lock as `ErrorKind::Unsupported`, that lock is skipped and a warning is
+    logged. std reports it for these:
+    - targets whose std takes no lock (see Platform coverage);
+    - `ENOSYS` and `EOPNOTSUPP` on Unix;
+    - `ERROR_CALL_NOT_IMPLEMENTED` on Windows.
+  - Any other lock error refuses the open. That includes the codes other filesystems use to
+    decline a lock, which std does not classify as unsupported: `ENOTSUP` on Apple platforms,
+    `ENOLCK`, `ERROR_NOT_SUPPORTED` and `ERROR_INVALID_FUNCTION`.
 - **FR-12 Release.** A lock is released by an explicit unlock, then the file is closed. A child
   process spawned by any thread keeps a copy of the descriptor until it execs, and closing alone
   would leave the lock held for that long.
@@ -97,6 +116,8 @@ under that number in the constitution's Sync Impact Report, and it never reached
     open for one directory does not block opens, claims or drops of other directories.
   - Unlocking at release stays under the mutex, so the same process's next open of that directory
     cannot see its own stale lock.
+  - A panic while a directory's locks are being taken leaves no entry behind, so the process's
+    next open of that directory proceeds.
 
 ## Compatibility
 
@@ -109,7 +130,8 @@ under that number in the constitution's Sync Impact Report, and it never reached
 - **What is new:**
   - The inner lock file appears in every opened store directory.
   - The replacement lock file appears beside a directory once closed compaction or recovery has run.
-  - `rust-version = "1.89"` is declared, for `File::try_lock`.
+  - `rust-version = "1.91"` is declared. `File::try_lock` needs 1.89, and an existing
+    `PathBuf == String` comparison needs 1.91.
 - **Intended behaviour changes:**
   1. A second process's open of an owned directory is refused.
   2. Cross-process closed maintenance of an owned directory is refused.
@@ -120,21 +142,71 @@ under that number in the constitution's Sync Impact Report, and it never reached
      for a claim or a maintenance-state open.
 - **The first upgrade:** protection begins only when every process using a directory runs this
   version. An older process takes no lock, so drain it before the first restart onto this version.
+- **Windows:**
+  - While `.pigment-lock` is held, no handle can read it except the one that locked it. That
+    includes the holder's own other handles.
+    - A hot copy or backup of a live store directory fails on that file.
+    - A refused open cannot read the owner record, so its refusal names only the lock file.
+  - A terminated owner's locks are released asynchronously. An immediate restart can therefore be
+    refused with `WouldBlock`. The library does not wait, so a supervisor should retry the open.
 - **Known limitations:**
   - A process that forks without exec shares its parent's locks.
   - Closed compaction while another mount view of the directory exists is unsupported: a
     bind-mounted view keeps the old directory, and a mount point cannot be renamed.
   - Network filesystems are not verified. On NFS an exclusive lock may need a writable descriptor.
-  - On Solaris and illumos, std locks with `fcntl(F_WRLCK)`, so the read-only path of FR-7 is
-    unavailable there.
+  - On Solaris, std takes `fcntl` record locks, which belong to the process rather than to a
+    descriptor. Cross-process ownership is not supported there. This is inferred from std's
+    source and was not run.
+    - The read-only path of FR-7 is unavailable, because `F_WRLCK` needs a descriptor open for
+      writing.
+    - Closing any descriptor of a lock file drops the process's lock on it. So FR-12's close
+      outside the mutex can drop a lock that the same process's next owner of the directory has
+      just taken.
+  - Which targets lock depends on the toolchain the crate is built with (see Platform coverage).
+    Two builds of one revision made with different toolchains may not exclude each other on
+    illumos, AIX or GNU/Hurd, where one build locks and the other skips.
   - Closed compaction through a symlinked store path replaces the symlink rather than the directory.
     That defect predates this spec and is tracked separately.
-- **Out of scope:** locking the destination of `pigment-db-migrate`, waiting for a lock, and
-  repairing a WAL that two processes wrote.
+- **Out of scope:**
+  - locking the destination of `pigment-db-migrate`;
+  - waiting for a lock;
+  - repairing a WAL that two processes wrote;
+  - the pre-existing defect recorded under "Found during review".
+
+## Platform coverage
+
+std decides what `File::try_lock` does on each target. Read from its source at 1.91.0, the declared
+minimum, and at 1.97.1, the toolchain this was verified with:
+
+| Target | 1.91 | 1.97.1 |
+|---|---|---|
+| Linux, Apple platforms, FreeBSD, NetBSD, OpenBSD, Fuchsia, Cygwin | `flock(LOCK_EX \| LOCK_NB)` | the same |
+| Windows | `LockFileEx`, exclusive and fail-immediately, over offset 0, length 2^64 − 1 | the same |
+| Solaris | `fcntl(F_SETLK)` with `F_WRLCK`, whole file | the same |
+| illumos, AIX, GNU/Hurd | no lock: `Unsupported`, skipped with a warning (FR-11) | `flock` |
+| DragonFly BSD and every other Unix target | no lock: skipped with a warning | no lock: skipped with a warning |
+
+Only Linux was run. macOS and Windows are covered by CI.
+
+## Found during review, not fixed here
+
+**A write after an open whose closed cleanup stays pending makes the next open fail.** This defect
+is present at `af25792`.
+- CleanupPending recovery re-verifies the canonical directory against the replacement inventory,
+  byte for byte.
+- An open whose cleanup stays Pending still goes live.
+- Any accepted write breaks that match, and so does a second family's first open, which creates its
+  WAL. The next open then fails with `AuthorityUndetermined`.
+
+This spec's own lock file broke the same match with no write at all, and that part is fixed (FR-9).
+The pre-existing part needs a specification of its own. One remedy: once a ReplacementPublished or
+CleanupPending manifest is durable, verify only what cleanup deletes (`.previous` against the source
+inventory). The canonical directory would then only have to inspect as a valid generation.
 
 ## Acceptance
 
-These tests use only the public API. Each re-executes its own test binary as a child process.
+Each of these tests re-executes its own test binary as a child process. All but R1 use only the
+public API. R1 parks its child with a private pause seam.
 
 | Test | Scenario | Expected |
 |---|---|---|
@@ -152,14 +224,23 @@ These tests use only the public API. Each re-executes its own test binary as a c
 | R1 | A child parks mid closed-compaction, holding its claim, at three points. | The parent's open is refused by the replacement lock, and opens once the compaction finishes. |
 | Symlink | `.pigment-lock` is a symlink. | The open is refused, and the target is untouched. |
 
-The following are unit tests that use private seams:
-- lock-file I/O stalled for one directory while other directories open and drop;
-- an injected `Unsupported` lock result;
-- `init_new`'s panic naming the lock file.
+These unit tests use private seams or fixtures:
+
+| Test | Scenario | Expected |
+|---|---|---|
+| Cleanup left pending | An open recovers a compaction whose cleanup stays pending. Cleanup is then allowed to proceed. | The next open, a second family opened in the same process, and a compaction retry each finish cleanup. |
+| Stalled opener | An open is stalled after its maintenance check. Meanwhile another process's compaction reaches StagingValidate, PreviousPublish or ReopenValidation. | The open is refused: `WouldBlock` naming the replacement lock, or `NotFound` while the directory is moved aside. The compaction completes and the directory reopens. |
+| Lock file in `.previous` | A replaced generation holds `.pigment-lock`. | Both cleanups delete it. A directory of that name keeps cleanup pending. |
+| Recovering owners | An open, or a claim paused while staging, recovers an interrupted compaction. | Each holds the inner lock and records its process id. |
+| Progress | Lock-file I/O for one directory is stalled, at entry creation and again after recovery. | Other directories open and drop. |
+| Lock errors | An injected `Unsupported`, another lock error, or `ReadOnlyFilesystem` from the read-write open. | Skipped with a warning; refused; locked read-only with nothing recorded. |
+| Panic | The lock-file open panics. | The next open of the directory proceeds. |
 
 A mount-namespace run (`unshare -rm`), with the store directory bind-mounted as a volume under a
 private parent, is recorded as verification evidence.
 
 The existing suites pass. Tests that assert a namespace is unchanged exclude exactly the lock files
 this spec creates, and assert that those files exist. `cargo fmt --check` is clean, and Clippy
-reports no new diagnostics. `tests/directory_lock.rs` runs on every CI operating system.
+reports no new diagnostics. These run on every CI operating system: `tests/directory_lock.rs`, the
+library's `maintenance_coordination::` tests, and `compaction::recovery_tests::ownership`. A CI job
+checks every target on the declared minimum toolchain.

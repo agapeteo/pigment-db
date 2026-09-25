@@ -9,7 +9,9 @@ canonical directory, and every file-backed open and every closed-maintenance cla
 
 A registry entry gains the directory's inner and replacement locks, and a `Pending` state that
 keeps lock-file I/O outside the mutex. The other changes are small:
-- `compaction/inspection.rs`: `inspect_generation` skips `.pigment-lock` (FR-9).
+- `compaction/inspection.rs`, `compaction/recovery.rs`, `compaction/publication.rs` and
+  `compaction/mod.rs`: every exact inventory of a store generation skips a regular-file
+  `.pigment-lock`, and both cleanups of `.previous` delete it (FR-9).
 - `compaction/mod.rs`: the closed compactor retires the inner lock before revalidating and
   publishing (FR-4). The staging-validation reopen takes no lock, because the compactor's claim
   covers it.
@@ -44,14 +46,16 @@ keeps lock-file I/O outside the mutex. The other changes are small:
 
 **II.** WAL, replay, recovery and publication formats are unchanged.
 - An open refused for ownership opens, creates and writes no store artifact.
-- Closed compaction's authority transitions are unchanged: the inner lock file is deleted before any
-  manifest is published or the source is revalidated, so every existing exact-content check on the
-  source and on `.previous` still holds.
+- Closed compaction's authority transitions are unchanged. The claim deletes its inner lock file
+  before any manifest is published or the source is revalidated. The exact-content checks on the
+  source, the canonical directory and `.previous` compare store artifacts. A lock file that a
+  refused open creates in a generation is ownership state, so those checks skip it and cleanup
+  deletes it (FR-9).
 - The fault-checkpoint suite runs across every cut.
 
 **III.** The spec lists the behaviour changes and the migration: the first upgrade, and the
 unwritable store directory. It declares the lock files a contract. There are no signature or type
-changes. `rust-version` is declared.
+changes. `rust-version = "1.91"` is declared, and a CI job checks every target on it.
 
 **IV.**
 - **Lock ordering.** The registry mutex is taken, the entry is marked `Pending`, and the mutex is
@@ -65,16 +69,23 @@ changes. `rust-version` is declared.
   progress test stalls one directory's lock-file open, and requires another directory's open and a
   third's drop to complete.
 - **Post-recovery.** The inner lock taken after recovery (FR-5) is set once per entry, through an
-  `Acquiring` marker.
+  `Acquiring` marker. Its lock-file I/O also runs outside the mutex, and has its own progress test.
+- **Unwinding.** A panic while an entry is `Pending` removes the entry, through a guard that is
+  disarmed once creation returns. Otherwise every later open of that directory would wait forever.
 
 **V.** The acceptance tests observe public results, errors, and file bytes and permissions. Private
-seams are `#[cfg(test)]` only: a stall hook, an injected lock error, and a maintenance pause. Each
+seams are `#[cfg(test)]` only: a stall hook, an injected lock error, an injected error from the
+read-write open, a one-shot panic, and a maintenance pause. Each
 schedules an interleaving that is otherwise unobservable. No dependency and no API is added.
 
 ## Decisions
 
-- **Mechanism.** `std::fs::File::try_lock`, which is `flock(LOCK_EX|LOCK_NB)` on Linux, macOS and
-  the BSDs and `LockFileEx` on Windows. It needs no `unsafe` code and no dependency.
+- **Mechanism.** `std::fs::File::try_lock`. It needs no `unsafe` code and no dependency. What it
+  does is decided per target by std and changes between toolchains (the spec's Platform coverage):
+  - `flock(LOCK_EX|LOCK_NB)` on Linux, Apple platforms, FreeBSD, NetBSD, OpenBSD and Fuchsia;
+  - `LockFileEx` over the whole file on Windows;
+  - `fcntl` on Solaris;
+  - no lock at all on some other targets.
 - **Why two lock files.** They cover different ground:
   - **The inner lock** is inside the directory, so it is shared by every view of it: bind mounts,
     container volumes, symlinks. It needs no write access outside the store.
@@ -88,9 +99,18 @@ schedules an interleaving that is otherwise unobservable. No dependency and no A
     a mount point, and to refuse every open under a read-only parent.
   - **A lock on the directory's own descriptor:** unavailable on Windows, and lost on the swap.
   - **Locking the WAL files:** each rotation and compaction replaces them.
-- **Retiring the inner lock during compaction.** Deleting it before the manifest keeps `.previous`
-  byte-exact. That is safe because, from staging onward, every other same-parent open finds
-  maintenance artifacts and is refused by the replacement lock before it touches the inner file.
+- **Retiring the inner lock during compaction.** The claim deletes its own lock file before the
+  manifest, so `.previous` normally holds exactly the captured artifacts.
+  - This plan first called that sufficient. It argued that from staging onward, every other
+    same-parent open finds maintenance artifacts and is refused by the replacement lock before it
+    touches the inner file.
+  - That misses an open that checked before staging began, and reaches its inner lock after the
+    retirement. Such an open creates a new file in the source. The review measured it with the
+    stall seam: the compaction failed revalidation and left the directory undetermined.
+  - The same exact checks also broke on the canonical directory. An open whose cleanup stays
+    pending takes the inner lock there, and the next recovery then refused the directory.
+  - So the lock file is ownership state wherever a generation is compared exactly, not only in
+    inspection (FR-9).
 - **Explicit unlock at release (FR-12).** Measured: closing without unlocking left the lock held by
   children in the middle of being spawned, refusing 343 of 400 immediate reopens. With the unlock,
   none were refused.
@@ -114,11 +134,17 @@ No format changes. The new files hold a diagnostic process id and are never read
 Replace the Project Constraint "The existing single-process-per-store-directory ownership model
 remains the default until an approved specification defines cross-process coordination" with:
 
-> Each file-backed store directory is owned by one process, and that ownership is enforced by the
-> lock files that specs/011 defines. Their names, locations and lock semantics are a compatibility
-> contract. Where a lock cannot be taken, single-process ownership remains a convention:
-> unsupported platforms or filesystems, network filesystems, and closed maintenance while another
-> mount view of the directory exists.
+> Every file-backed open of a store directory, and every closed-maintenance claim, MUST take the
+> lock files specs/011 defines and MUST refuse while another process holds them. Their names,
+> locations and lock semantics are a compatibility contract, and changing them requires a
+> specification with a migration. The exclusion this gives is bounded by specs/011's Known
+> limitations, among them: targets and filesystems where the standard library takes no lock,
+> network filesystems, closed maintenance while another mount view of the directory exists, a
+> process that forks without exec, the first upgrade from a version that takes no lock, and the
+> destination of `pigment-db-migrate`. Within those limitations, single-process ownership is
+> enforced, not a convention.
 
 This makes enforcement mandatory rather than conventional, which is materially expanded mandatory
-guidance, so the amendment is MINOR.
+guidance, so the amendment is MINOR. The first wording stated the constraint descriptively, and
+listed as exceptions only cases where a lock cannot be taken. It left out cases where the locks are
+taken but exclusion still fails, which the spec itself lists. The review corrected both.

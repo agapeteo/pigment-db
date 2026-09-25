@@ -39,7 +39,8 @@ probed rather than observed failing in sequence (see verification.md).
   - RED: an injected `Unsupported` lock result refuses the open.
   - GREEN: skip that lock and warn.
 - [x] T010 Contract and CI:
-  - Declare `rust-version = "1.89"`.
+  - Declare `rust-version = "1.89"`. This was wrong: an existing comparison needs 1.91, and T016
+    corrects it.
   - Update the rustdoc of `try_init_new` and `compact_directory_in_place`.
   - Add `tests/directory_lock.rs` to every CI operating system, with its pin in `ci_workflow.rs`,
     whose RED comes first.
@@ -48,3 +49,22 @@ probed rather than observed failing in sequence (see verification.md).
   - Record the mount-namespace run.
   - Apply the constitution amendment.
   - Write verification.md.
+
+Review fixes, after the review of `df1fef1`:
+
+- [x] T012 Exact inventories skip the inner lock:
+  - RED: the reopen, the second family and the compaction retry after a pending cleanup; the stalled
+    opener at StagingValidate.
+  - GREEN: `generation_matches`, source revalidation and both `.previous` cleanups skip a regular
+    `.pigment-lock`, and the cleanups delete it (`1b79628`).
+- [x] T013 Pin the recovering owners' inner lock and its progress, by neutralization (`7da7807`).
+- [x] T014 The `Pending` slot guard:
+  - RED: a panic while taking locks wedged the directory.
+  - GREEN: the guard. The `ReadOnlyFilesystem` fallback is pinned by neutralization (`1012318`).
+- [x] T015 The Windows-run tests, the open-each report length, and the lock-file existence
+  assertions (`a0310da`, `b6194a7`).
+- [x] T016 rust-version 1.91, a CI job on it, and the ownership tests on every OS. Both pins were
+  RED first (`edc0afa`).
+- [x] T017 Pin the stalled opener while the directory is moved aside (`f57bdde`).
+- [x] T018 Correct the spec, plan, constitution and this record: FR-4, FR-9, FR-11, Platform
+  coverage, the Windows semantics, Solaris, and the pre-existing defect.

@@ -1,21 +1,5 @@
 <!--
 Sync Impact Report
-- Version change: 1.1.0 -> 1.2.0 (MINOR: a Project Constraint's mandatory
-  guidance expanded; no principle removed or redefined)
-- Modified sections:
-  - Project Constraints: single-process ownership of a store directory is now
-    enforced by the lock files specs/011 defines, and remains a convention only
-    where a lock cannot be taken.
-- Motivating consumer: penpack (two processes appended to one WAL for twelve
-  hours; see specs/011's Motivation note). Classified under VI as a
-  library-vocabulary primitive landing on main before any consumer pins it.
-- Dependent artifacts: specs/011-cross-process-directory-lock (spec, plan,
-  tasks, verification).
-- Compatibility impact: no persisted-format or public API change. The lock
-  files' names, locations and locking are now a compatibility contract.
-- Active work to revalidate: none.
-
-Sync Impact Report
 - Version change: unratified template -> 1.0.0
 - Modified principles:
   - Placeholder principle 1 -> I. RED-GREEN Test-Driven Development
@@ -62,6 +46,23 @@ Sync Impact Report
     competing_batches_have_one_winner_and_losers_write_nothing (its
     b"book"/b"receipt" bytes are opaque test data and stay).
   - The atomic compare-exchange batch code on main is generic and stays.
+
+Sync Impact Report
+- Version change: 1.1.0 -> 1.2.0 (MINOR: a Project Constraint's mandatory
+  guidance expanded; no principle removed or redefined)
+- Modified sections:
+  - Project Constraints: every file-backed open of a store directory and every
+    closed-maintenance claim MUST take the lock files specs/011 defines and
+    refuse while another process holds them. The exclusion is bounded by that
+    spec's Known limitations, which the constraint cites rather than restates.
+- Motivating consumer: penpack (two processes appended to one WAL for twelve
+  hours; see specs/011's Motivation note). Classified under VI as a
+  library-vocabulary primitive landing on main before any consumer pins it.
+- Dependent artifacts: specs/011-cross-process-directory-lock (spec, plan,
+  tasks, verification).
+- Compatibility impact: no persisted-format or public API change. The lock
+  files' names, locations and locking are now a compatibility contract.
+- Active work to revalidate: none.
 -->
 # pigment-db Constitution
 
@@ -209,12 +210,17 @@ change served.
 
 - pigment-db remains a Rust library crate; production dependencies MUST NOT be
   added without an approved plan explaining necessity and maintenance impact.
-- Each file-backed store directory is owned by one process, and that ownership is
-  enforced by the lock files specs/011 defines; their names, locations and lock
-  semantics are a compatibility contract. Where a lock cannot be taken, single-
-  process ownership remains a convention: unsupported platforms or filesystems,
-  network filesystems, and closed maintenance while another mount view of the
-  directory exists.
+- Every file-backed open of a store directory, and every closed-maintenance
+  claim, MUST take the lock files specs/011 defines and MUST refuse while another
+  process holds them. Their names, locations and lock semantics are a
+  compatibility contract, and changing them requires a specification with a
+  migration. The exclusion this gives is bounded by specs/011's Known
+  limitations, among them: targets and filesystems where the standard library
+  takes no lock, network filesystems, closed maintenance while another mount
+  view of the directory exists, a process that forks without exec, the first
+  upgrade from a version that takes no lock, and the destination of
+  `pigment-db-migrate`. Within those limitations, single-process ownership is
+  enforced, not a convention.
 - Persistent-state changes MUST account for all three durable store families:
   key/value, key/set, and key/sorted-map, unless the specification explicitly
   demonstrates that a family is unaffected.

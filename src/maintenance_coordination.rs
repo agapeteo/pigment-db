@@ -338,9 +338,11 @@ impl LockFile {
                 Ok(Self { file, locked: true })
             }
             Err(std::fs::TryLockError::WouldBlock) => Err(held_refusal(&file, path, identity)),
-            // A platform without file locking, or a filesystem that refuses it: the directory
-            // keeps the previous, process-local ownership rather than becoming impossible to open
-            // (FR-11). Any other error refuses.
+            // Only what std reports as Unsupported: a target whose std takes no lock, ENOSYS or
+            // EOPNOTSUPP on Unix, ERROR_CALL_NOT_IMPLEMENTED on Windows. The directory then keeps
+            // the previous, process-local ownership rather than becoming impossible to open
+            // (FR-11). Any other error refuses, including the codes other filesystems use to
+            // decline a lock (ENOTSUP on Apple platforms, ENOLCK, ERROR_NOT_SUPPORTED).
             Err(std::fs::TryLockError::Error(error))
                 if error.kind() == io::ErrorKind::Unsupported =>
             {
