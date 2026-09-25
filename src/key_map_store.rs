@@ -137,6 +137,12 @@ impl DurableKeyMapStore<File> {
 
     /// Opens a file-backed key/sorted-map store and returns structured recovery
     /// status or error information without panicking for expected failures.
+    ///
+    /// One process owns a store directory at a time. The open takes the directory's lock files,
+    /// `.pigment-lock` inside it (and `.<name>.pigment-lock` beside it while the directory is
+    /// being replaced), and fails with [`RecoveryError::Io`] of kind
+    /// [`std::io::ErrorKind::WouldBlock`] while another process holds them. The files stay; their
+    /// names and locking are a compatibility contract (specs/011).
     pub fn try_init_new(
         store_dir: impl AsRef<Path>,
     ) -> Result<RecoveryOutcome<Self>, RecoveryError> {

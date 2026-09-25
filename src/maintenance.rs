@@ -443,8 +443,9 @@ pub fn inspect_storage(
 /// Compacts every current-format family in a closed directory in place.
 ///
 /// The caller must close every store instance for `store_dir` before calling
-/// this function. Pigment DB detects same-process overlap and returns
-/// [`CompactionError::FailedClosed`] without changing storage.
+/// this function. A store open in this process or in another one -- the
+/// directory's lock files record ownership across processes -- makes it
+/// return [`CompactionError::FailedClosed`] without changing storage.
 ///
 /// [`CleanupStatus::Pending`] in a successful outcome means replacement
 /// authority is established but obsolete evidence remains. Reopening the store

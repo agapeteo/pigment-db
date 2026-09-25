@@ -52,6 +52,7 @@ jobs:
         run: |
           cargo test --test async_compute_conflicts -- --test-threads=1
           cargo test --test ci_workflow -- --test-threads=1
+          cargo test --test directory_lock -- --test-threads=1
           cargo test --test i128_key -- --test-threads=1
           cargo test --test map_pop_return_values -- --test-threads=1
           cargo test --test numeric_increment_overflow -- --test-threads=1

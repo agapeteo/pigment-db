@@ -2,6 +2,8 @@
 name = "pigment-db"
 version = "0.8.2"
 edition = "2021"
+# File::try_lock, which the cross-process directory lock uses (specs/011).
+rust-version = "1.89"
 
 [[bin]]
 name = "pigment-db-migrate"

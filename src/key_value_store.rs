@@ -318,6 +318,12 @@ impl DurableKeyValueStore<File> {
     /// The returned status is [`RecoveryStatus::Recovered`] when startup
     /// resolves legacy recovery or staging artifacts. Staging is never chosen
     /// as authority, and ambiguous candidates are preserved on error.
+    ///
+    /// One process owns a store directory at a time. The open takes the directory's lock files,
+    /// `.pigment-lock` inside it (and `.<name>.pigment-lock` beside it while the directory is
+    /// being replaced), and fails with [`RecoveryError::Io`] of kind
+    /// [`std::io::ErrorKind::WouldBlock`] while another process holds them. The files stay; their
+    /// names and locking are a compatibility contract (specs/011).
     pub fn try_init_new(
         store_dir: impl AsRef<Path>,
     ) -> Result<RecoveryOutcome<Self>, RecoveryError> {

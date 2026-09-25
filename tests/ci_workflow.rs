@@ -17,6 +17,7 @@ fn recovery_workflow_runs_every_dedicated_issue_regression_target() {
     for target in [
         "async_compute_conflicts",
         "ci_workflow",
+        "directory_lock",
         "i128_key",
         "map_pop_return_values",
         "numeric_increment_overflow",

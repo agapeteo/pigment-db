@@ -413,8 +413,19 @@ fn a_killed_owner_leaves_the_directory_openable() {
     let mut holder = spawn_holder(&fixture);
     holder.kill_and_reap();
 
-    let stores = open_all(&fixture.store());
-    seed(&stores);
+    // Windows releases a terminated process's locks asynchronously, so allow it a moment.
+    let started = Instant::now();
+    let stores = loop {
+        match DurableKeyValueStore::try_init_new(fixture.store()) {
+            Ok(outcome) => break outcome.into_parts().0,
+            Err(error) if started.elapsed() < Duration::from_secs(5) => {
+                let _ = error;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => panic!("a killed owner left the directory owned: {error:?}"),
+        }
+    };
+    stores.put(b"key".to_vec(), b"value".to_vec());
 }
 
 /// X1: ownership belongs to the process, not to the first open: dropping one family keeps the
