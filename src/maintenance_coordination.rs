@@ -238,10 +238,11 @@ impl OwnershipState {
 
 enum InnerLock {
     Held(LockFile),
-    /// Not held: while directory-level maintenance is being recovered, for a directory that does
-    /// not exist, after a closed compaction retired it, or for an entry that takes no locks.
+    /// Not held: while directory-level maintenance is being recovered, after a closed compaction
+    /// retired it, or for an entry that takes no locks.
     Absent,
-    /// One thread is taking it after a recovery; others go on without waiting.
+    /// One thread is taking it after a recovery. Every other open of the directory waits for the
+    /// outcome before it goes live, and takes the lock itself if that attempt failed.
     Acquiring,
 }
 
@@ -562,24 +563,50 @@ fn directory_maintenance_in_progress(identity: &Path) -> io::Result<bool> {
     Ok(false)
 }
 
-/// The locks a new registry entry takes for an open.
+/// How many times an open looks at a directory that another process keeps replacing before it
+/// gives up.
+const OPEN_STATE_ATTEMPTS: usize = 3;
+
+/// The locks a new registry entry takes for an open. Every entry that takes locks holds at least
+/// one, because an open holding none could neither recover maintenance nor go live safely.
 ///
 /// - While directory-level maintenance is in progress, only the replacement lock: recovery may
 ///   replace the directory, so its inner lock is taken afterwards (`ensure_inner_lock`).
-/// - For a directory that does not exist, none: the open fails as it always has, creating nothing.
-/// - Otherwise the inner lock, plus the replacement lock if that file exists, so an open cannot
-///   slip in while another process still holds it after a replacement.
+/// - For a directory that exists, the inner lock, plus the replacement lock if that file exists,
+///   so an open cannot slip in while another process still holds it after a replacement.
+/// - For a directory that does not exist, none, and the open fails at once, creating nothing
+///   (FR-8). Another process's closed compaction moves the directory aside while its claim holds
+///   the replacement lock, and it may do so after the first check here, so a missing directory is
+///   taken as missing only once maintenance has been asked about again.
 fn open_locks(identity: &Path) -> io::Result<(Option<LockFile>, Option<LockFile>)> {
-    if directory_maintenance_in_progress(identity)? {
-        let replacement = LockFile::acquire(&replacement_lock_path(identity)?, identity)?;
-        return Ok((None, Some(replacement)));
+    for _ in 0..OPEN_STATE_ATTEMPTS {
+        if directory_maintenance_in_progress(identity)? {
+            let replacement = LockFile::acquire(&replacement_lock_path(identity)?, identity)?;
+            return Ok((None, Some(replacement)));
+        }
+        #[cfg(test)]
+        lock_seams::after_maintenance_check(identity);
+        if identity.is_dir() {
+            let inner = LockFile::acquire(&identity.join(INNER_LOCK_NAME), identity)?;
+            let replacement =
+                LockFile::check_existing(&replacement_lock_path(identity)?, identity)?;
+            return Ok((Some(inner), replacement));
+        }
+        if !directory_maintenance_in_progress(identity)? && !identity.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("store directory {} does not exist", identity.display()),
+            ));
+        }
     }
-    if !identity.is_dir() {
-        return Ok((None, None));
-    }
-    let inner = LockFile::acquire(&identity.join(INNER_LOCK_NAME), identity)?;
-    let replacement = LockFile::check_existing(&replacement_lock_path(identity)?, identity)?;
-    Ok((Some(inner), replacement))
+    Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        format!(
+            "store directory {} kept being replaced while it was opened; another process is \
+             compacting it",
+            identity.display()
+        ),
+    ))
 }
 
 /// The locks a closed-maintenance claim takes: the inner lock unless maintenance must first be
@@ -655,6 +682,26 @@ fn with_entry<T>(
     }
 }
 
+/// Returns a directory's inner lock from `Acquiring` to `Absent` when the thread taking it unwinds,
+/// so the opens waiting on that attempt take the lock themselves.
+struct AcquiringInnerLock<'a> {
+    identity: &'a Path,
+    armed: bool,
+}
+
+impl Drop for AcquiringInnerLock<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut registry = lock_registry();
+            if let Some(Slot::Owned(state)) = registry.get_mut(self.identity) {
+                if matches!(state.inner, InnerLock::Acquiring) {
+                    state.inner = InnerLock::Absent;
+                }
+            }
+        }
+    }
+}
+
 /// Removes a directory's `Pending` entry when the thread creating it unwinds instead of returning.
 struct PendingEntry<'a> {
     identity: &'a Path,
@@ -700,21 +747,37 @@ fn release(identity: &Path, update: impl FnOnce(&mut OwnershipState) -> bool) {
 /// opened with the registry mutex released; a concurrent opener in this process goes on without
 /// waiting, because the entry already owns the directory through its replacement lock.
 fn ensure_inner_lock(identity: &Path) -> io::Result<()> {
-    {
+    loop {
         let mut registry = lock_registry();
         let Some(Slot::Owned(state)) = registry.get_mut(identity) else {
             return Ok(());
         };
-        if !state.takes_locks || !matches!(state.inner, InnerLock::Absent) {
+        if !state.takes_locks {
             return Ok(());
         }
-        state.inner = InnerLock::Acquiring;
+        match state.inner {
+            InnerLock::Held(_) => return Ok(()),
+            // Another thread's attempt decides whether this open may go live: wait for it.
+            InnerLock::Acquiring => {
+                drop(registry);
+                std::thread::sleep(PENDING_POLL);
+            }
+            InnerLock::Absent => {
+                state.inner = InnerLock::Acquiring;
+                break;
+            }
+        }
     }
+    let mut acquiring = AcquiringInnerLock {
+        identity,
+        armed: true,
+    };
     let acquired = if identity.is_dir() {
         LockFile::acquire(&identity.join(INNER_LOCK_NAME), identity).map(Some)
     } else {
         Ok(None)
     };
+    acquiring.armed = false;
     let mut registry = lock_registry();
     let Some(Slot::Owned(state)) = registry.get_mut(identity) else {
         return acquired.map(|_| ());
@@ -885,8 +948,19 @@ pub(crate) mod lock_seams {
 
     type Gate = Arc<(Mutex<(bool, bool)>, Condvar)>;
 
-    /// Directories whose lock-file opens stall, each with its gate: `(entered, released)`.
-    static STALLS: Mutex<Vec<(PathBuf, Gate)>> = Mutex::new(Vec::new());
+    /// Where an open stalls.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum StallPoint {
+        /// At the top of every lock-file open whose file lives in the directory.
+        LockFileOpen,
+        /// In an open of the directory, just after it first looked for maintenance artifacts.
+        AfterMaintenanceCheck,
+    }
+
+    /// Stalls, each with its gate: `(entered, released)`.
+    static STALLS: Mutex<Vec<(StallPoint, PathBuf, Gate)>> = Mutex::new(Vec::new());
+    /// How long a test waits for an open to reach its stall before failing.
+    const STALL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
     /// Lock errors reported in place of a real attempt.
     static LOCK_ERRORS: Mutex<Vec<(PathBuf, io::ErrorKind)>> = Mutex::new(Vec::new());
     /// Errors reported in place of the read-write open.
@@ -905,6 +979,10 @@ pub(crate) mod lock_seams {
     }
 
     pub(super) fn before_lock_file_open(path: &Path) {
+        if let Some(directory) = path.parent() {
+            stall_at(StallPoint::LockFileOpen, directory);
+        }
+        // After any stall, so a test can make an open panic that is already under way.
         let panics = {
             let mut panics = guard(&PANICS);
             let before = panics.len();
@@ -914,10 +992,17 @@ pub(crate) mod lock_seams {
         if panics {
             panic!("injected panic opening {}", path.display());
         }
+    }
+
+    pub(super) fn after_maintenance_check(identity: &Path) {
+        stall_at(StallPoint::AfterMaintenanceCheck, identity);
+    }
+
+    fn stall_at(point: StallPoint, directory: &Path) {
         let gate = guard(&STALLS)
             .iter()
-            .find(|(directory, _)| in_directory(path, directory))
-            .map(|(_, gate)| gate.clone());
+            .find(|(at, stalled, _)| *at == point && stalled == directory)
+            .map(|(_, _, gate)| gate.clone());
         let Some(gate) = gate else {
             return;
         };
@@ -963,26 +1048,48 @@ pub(crate) mod lock_seams {
         ));
     }
 
-    /// Stalls every lock-file open in one directory until released or dropped.
+    /// Stalls opens of one directory at one point until released or dropped.
     pub(crate) struct Stall {
+        point: StallPoint,
         directory: PathBuf,
         gate: Gate,
     }
 
     impl Stall {
+        /// Stalls every lock-file open in `directory`.
         pub(crate) fn install(directory: &Path) -> Self {
-            let directory = super::canonical_directory_identity(directory).unwrap();
-            let gate: Gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
-            guard(&STALLS).push((directory.clone(), gate.clone()));
-            Self { directory, gate }
+            Self::install_at(directory, StallPoint::LockFileOpen)
         }
 
-        /// Waits until some open has reached the stall.
+        pub(crate) fn install_at(directory: &Path, point: StallPoint) -> Self {
+            let directory = super::canonical_directory_identity(directory).unwrap();
+            let gate: Gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+            guard(&STALLS).push((point, directory.clone(), gate.clone()));
+            Self {
+                point,
+                directory,
+                gate,
+            }
+        }
+
+        /// Waits until some open has reached the stall, and fails the test if none does within
+        /// the deadline rather than hanging it.
         pub(crate) fn wait_entered(&self) {
             let (state, signal) = &*self.gate;
+            let started = std::time::Instant::now();
             let mut flags = state.lock().unwrap();
             while !flags.0 {
-                flags = signal.wait(flags).unwrap();
+                let left = STALL_DEADLINE.saturating_sub(started.elapsed());
+                if left.is_zero() {
+                    drop(flags);
+                    self.release();
+                    panic!(
+                        "no open reached the {:?} stall for {} within {STALL_DEADLINE:?}",
+                        self.point,
+                        self.directory.display()
+                    );
+                }
+                flags = signal.wait_timeout(flags, left).unwrap().0;
             }
         }
 
@@ -990,7 +1097,9 @@ pub(crate) mod lock_seams {
             let (state, signal) = &*self.gate;
             state.lock().unwrap().1 = true;
             signal.notify_all();
-            guard(&STALLS).retain(|(directory, _)| directory != &self.directory);
+            guard(&STALLS).retain(|(point, directory, _)| {
+                !(*point == self.point && directory == &self.directory)
+            });
         }
     }
 
