@@ -1886,6 +1886,156 @@ mod ownership {
         assert!(held, "the open second family must hold the inner lock");
     }
 
+    /// specs/011, FR-2: a symlink alias names the directory it points to, including while another
+    /// process's closed compaction has moved that directory aside. The alias open is then refused
+    /// by that claim's replacement lock, as an open of the real path is.
+    #[cfg(unix)]
+    #[test]
+    fn an_alias_opened_while_the_directory_is_moved_aside_is_refused_by_the_claim() {
+        use crate::test_support::fault_checkpoint::{
+            pause_maintenance_child, MaintenanceCut, MaintenanceFaultPoint, MaintenancePhase,
+            MAINTENANCE_PAUSED_CHILD_COMPLETED,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let store_dir = root.path().join("store");
+        std::fs::create_dir(&store_dir).unwrap();
+        create_segmented_v2(&store_dir, FixtureFamily::KeyValue);
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&store_dir, &alias).unwrap();
+        let pause_dir = tempfile::tempdir().unwrap();
+        let child = pause_maintenance_child(
+            "compaction::recovery_tests::closed_compaction_checkpoint_child",
+            &store_dir,
+            pause_dir.path(),
+            MaintenanceFaultPoint {
+                phase: MaintenancePhase::PreviousPublished,
+                cut: MaintenanceCut::PreviousPublish,
+            },
+        );
+        assert!(!store_dir.exists(), "the directory must be moved aside");
+
+        let refused = crate::key_value_store::DurableKeyValueStore::try_init_new(&alias);
+        let exit = child.resume();
+
+        match refused {
+            Err(crate::RecoveryError::Io { source, .. }) => {
+                assert_eq!(source.kind(), std::io::ErrorKind::WouldBlock, "{source}");
+                assert!(
+                    source.to_string().contains(".store.pigment-lock"),
+                    "the claim's replacement lock must refuse: {source}"
+                );
+            }
+            other => panic!("expected a WouldBlock refusal, got {:?}", other.map(|_| ())),
+        }
+        assert_eq!(exit, MAINTENANCE_PAUSED_CHILD_COMPLETED);
+    }
+
+    /// specs/011, FR-5: an open through a symlink alias recovers the directory's interrupted
+    /// maintenance, as an open of the real path does. Recovering against the alias's own name
+    /// found nothing, so the open went live over a directory still to be recovered, and a later
+    /// open of the real path rolled back what it had written.
+    #[cfg(unix)]
+    #[test]
+    fn an_alias_open_recovers_the_directory_it_names() {
+        use crate::test_support::fault_checkpoint::{
+            run_maintenance_checkpoint_child_with_evidence_root, MaintenanceCut,
+            MaintenanceFaultPoint, MaintenancePhase,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let store_dir = root.path().join("store");
+        std::fs::create_dir(&store_dir).unwrap();
+        create_segmented_v2(&store_dir, FixtureFamily::KeyValue);
+        run_maintenance_checkpoint_child_with_evidence_root(
+            "compaction::recovery_tests::closed_compaction_checkpoint_child",
+            &store_dir,
+            root.path(),
+            MaintenanceFaultPoint {
+                phase: MaintenancePhase::ReplacementPublished,
+                cut: MaintenanceCut::ReplacementPublish,
+            },
+        );
+        let manifest = crate::compaction::publication::directory_artifact_paths(&store_dir)
+            .unwrap()
+            .manifest;
+        assert!(manifest.is_file(), "the compaction must be left to recover");
+        // Made after the child, whose evidence snapshot takes only files and directories.
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&store_dir, &alias).unwrap();
+
+        let outcome = crate::key_value_store::DurableKeyValueStore::try_init_new(&alias).unwrap();
+
+        assert_eq!(outcome.status(), crate::RecoveryStatus::Recovered);
+        assert!(
+            !manifest.exists(),
+            "the alias open must finish the recovery"
+        );
+        let store = outcome.into_store();
+        store.put(b"late".to_vec(), b"kept".to_vec());
+        drop(store);
+        let reopened = crate::key_value_store::DurableKeyValueStore::try_init_new(&store_dir)
+            .unwrap()
+            .into_store();
+        assert_eq!(reopened.get(b"late"), Some(b"kept".to_vec()));
+        assert_eq!(reopened.get(b"alpha"), Some(b"one".to_vec()));
+    }
+
+    /// specs/011, FR-2: an open stalled between taking the inner lock and checking the replacement
+    /// lock, while another process's compaction replaces the directory, ends up holding the lock
+    /// file of the directory that was retired. It must not go live on that: before it does, it
+    /// takes the lock of the directory now in place.
+    #[cfg(unix)]
+    #[test]
+    fn an_open_whose_inner_lock_was_retired_under_it_takes_the_current_one() {
+        use crate::maintenance_coordination::lock_seams::{Stall, StallPoint};
+        use crate::test_support::fault_checkpoint::{
+            pause_maintenance_child, MaintenanceCut, MaintenanceFaultPoint, MaintenancePhase,
+            MAINTENANCE_PAUSED_CHILD_COMPLETED,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let store_dir = root.path().join("store");
+        std::fs::create_dir(&store_dir).unwrap();
+        create_segmented_v2(&store_dir, FixtureFamily::KeyValue);
+        let before_the_directory = Stall::install_at(&store_dir, StallPoint::AfterMaintenanceCheck);
+        let opener = {
+            let store_dir = store_dir.clone();
+            std::thread::spawn(move || {
+                crate::key_value_store::DurableKeyValueStore::try_init_new(&store_dir)
+                    .map(|outcome| outcome.into_store())
+            })
+        };
+        before_the_directory.wait_entered();
+        let pause_dir = tempfile::tempdir().unwrap();
+        let child = pause_maintenance_child(
+            "compaction::recovery_tests::closed_compaction_checkpoint_child",
+            &store_dir,
+            pause_dir.path(),
+            MaintenanceFaultPoint {
+                phase: MaintenancePhase::Prepared,
+                cut: MaintenanceCut::StagingValidate,
+            },
+        );
+        // The replacement lock lives in the parent: stall its open, after the inner lock is taken.
+        let before_the_replacement_lock = Stall::install(root.path());
+        before_the_directory.release();
+        before_the_replacement_lock.wait_entered();
+        assert!(
+            inner_lock_file_is_held(&store_dir),
+            "the open must hold the retired directory's lock file by now"
+        );
+        assert_eq!(child.resume(), MAINTENANCE_PAUSED_CHILD_COMPLETED);
+        before_the_replacement_lock.release();
+
+        let opened = opener.join().unwrap();
+        let held = inner_lock_file_is_held(&store_dir);
+
+        let store = opened.unwrap_or_else(|error| panic!("the open must succeed: {error:?}"));
+        assert!(
+            held,
+            "the open went live without the lock of the directory in place"
+        );
+        drop(store);
+    }
+
     /// specs/011, FR-13: the inner lock an open takes after recovering is also opened outside the
     /// ownership registry's mutex. While that lock-file open is stalled for one directory, another
     /// directory opens and a third directory's store is dropped.

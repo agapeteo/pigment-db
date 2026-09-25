@@ -415,11 +415,14 @@ fn filesystem_failures_include_operation_path_and_source() {
     // Since specs/011 an open of a directory that does not exist fails before it takes any lock
     // or touches any artifact (FR-8). It used to fail creating the WAL's staging file.
     let missing_parent = parent.path().join("missing");
-    assert_io(
-        DurableKeyValueStore::try_init_new(&missing_parent),
-        RecoveryOperation::Inspect,
-        &missing_parent,
+    let missing = DurableKeyValueStore::try_init_new(&missing_parent);
+    assert!(
+        matches!(&missing, Err(RecoveryError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound),
+        "a missing directory is NotFound: {:?}",
+        missing.as_ref().err()
     );
+    assert_io(missing, RecoveryOperation::Inspect, &missing_parent);
     assert!(!missing_parent.exists());
     assert_eq!(
         std::fs::read_dir(parent.path())

@@ -1,6 +1,14 @@
 use std::fs;
 use std::path::Path;
 
+/// A file's text with CRLF line endings folded to LF, so a Windows checkout matches the same
+/// multi-line needles.
+fn read_text(path: &Path) -> String {
+    fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()))
+        .replace("\r\n", "\n")
+}
+
 #[test]
 fn recovery_workflow_runs_every_dedicated_issue_regression_target() {
     let workflow_path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -208,7 +216,7 @@ fn maintenance_public_api_is_narrow_while_implementation_modules_remain_private(
         assert!(root.join(relative).is_file(), "missing private {relative}");
     }
 
-    let crate_root = fs::read_to_string(root.join("src/lib.rs")).expect("read crate root");
+    let crate_root = read_text(&root.join("src/lib.rs"));
     assert!(crate_root.lines().any(|line| line == "mod compaction;"));
     assert!(crate_root.lines().any(|line| line == "mod maintenance;"));
     assert!(!crate_root.contains("pub mod compaction"));
@@ -216,8 +224,7 @@ fn maintenance_public_api_is_narrow_while_implementation_modules_remain_private(
     assert!(crate_root.contains("compact_directory_in_place, inspect_storage"));
     assert!(!crate_root.contains("pub use compaction"));
 
-    let compaction = fs::read_to_string(root.join("src/compaction/mod.rs"))
-        .expect("read compaction module root");
+    let compaction = read_text(&root.join("src/compaction/mod.rs"));
     for module in ["inspection", "manifest", "publication", "recovery"] {
         assert!(
             compaction
@@ -237,7 +244,7 @@ fn maintenance_public_api_is_narrow_while_implementation_modules_remain_private(
         assert!(compaction.lines().any(|line| line == registration));
     }
 
-    let wal = fs::read_to_string(root.join("src/wal/mod.rs")).expect("read WAL module root");
+    let wal = read_text(&root.join("src/wal/mod.rs"));
     assert!(wal.contains("#[cfg(test)]\nmod maintenance_tests;"));
 }
 
@@ -269,9 +276,9 @@ fn windows_unsafe_and_dependency_are_confined_to_the_durability_boundary() {
         .collect::<Vec<_>>();
     assert_eq!(unsafe_files, [boundary]);
 
-    let crate_root = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+    let crate_root = read_text(&root.join("src/lib.rs"));
     assert!(crate_root.contains("#![deny(unsafe_code)]"));
-    let cargo = fs::read_to_string(root.join("Cargo.toml")).unwrap();
+    let cargo = read_text(&root.join("Cargo.toml"));
     assert!(cargo.contains("[target.'cfg(windows)'.dependencies]"));
     assert_eq!(cargo.matches("windows-sys").count(), 1);
     assert!(cargo.contains("features = [\"Win32_Storage_FileSystem\"]"));

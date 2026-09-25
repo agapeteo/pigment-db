@@ -283,7 +283,7 @@ impl DurableKeySetStore<File> {
                     source,
                 })?;
         let maintenance_recovered = crate::compaction::recovery::resolve_store_maintenance(
-            store_dir,
+            &open_lease.maintenance_path(store_dir),
             crate::compaction::inspection::InspectedFamily::KeySet,
         )?;
         open_lease

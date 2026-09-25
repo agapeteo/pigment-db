@@ -283,6 +283,46 @@ struct LockFile {
     file: std::fs::File,
     /// False only where the platform or filesystem cannot lock, and the lock was skipped (FR-11).
     locked: bool,
+    /// Which file this is, where the platform says (device and inode on Unix), so an owner can
+    /// tell whether the file it holds is still the one at the lock path.
+    id: Option<FileId>,
+}
+
+/// A file's identity: device and inode. std exposes no stable equivalent on Windows.
+type FileId = (u64, u64);
+
+fn file_id(file: &std::fs::File) -> Option<FileId> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        file.metadata()
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        None
+    }
+}
+
+/// Whether the file identified by `held` is still the one at `path`. A file that cannot be
+/// identified is taken to be; a path with no file, or another file, is not.
+fn still_at(held: Option<FileId>, path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (held, std::fs::symlink_metadata(path)) {
+            (None, _) => true,
+            (Some(id), Ok(metadata)) => (metadata.dev(), metadata.ino()) == id,
+            (Some(_), Err(_)) => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (held, path);
+        true
+    }
 }
 
 impl LockFile {
@@ -336,7 +376,12 @@ impl LockFile {
                 if writable {
                     record_owner(&file);
                 }
-                Ok(Self { file, locked: true })
+                let id = file_id(&file);
+                Ok(Self {
+                    file,
+                    locked: true,
+                    id,
+                })
             }
             Err(std::fs::TryLockError::WouldBlock) => Err(held_refusal(&file, path, identity)),
             // Only what std reports as Unsupported: a target whose std takes no lock, ENOSYS or
@@ -356,6 +401,7 @@ impl LockFile {
                 Ok(Self {
                     file,
                     locked: false,
+                    id: None,
                 })
             }
             Err(std::fs::TryLockError::Error(error)) => Err(io::Error::new(
@@ -480,6 +526,9 @@ fn lock_registry() -> MutexGuard<'static, HashMap<PathBuf, Slot>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// How many symbolic links an identity follows by hand, as the kernel's own limit does.
+const MAX_SYMLINK_HOPS: usize = 40;
+
 fn canonical_directory_identity(store_dir: &Path) -> io::Result<PathBuf> {
     match std::fs::metadata(store_dir) {
         Ok(metadata) if !metadata.is_dir() => {
@@ -500,6 +549,32 @@ fn canonical_directory_identity(store_dir: &Path) -> io::Result<PathBuf> {
     } else {
         std::env::current_dir()?.join(store_dir)
     };
+    // A symlink whose target does not exist still names that target: most often a store
+    // directory that another process's closed compaction has moved aside. Keyed by the link's own
+    // name, the open would check another directory's lock files and maintenance artifacts, and
+    // miss the claim that is replacing this one (FR-2).
+    let mut hops = 0;
+    while std::fs::symlink_metadata(&cursor).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        hops += 1;
+        if hops > MAX_SYMLINK_HOPS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "store directory {} is a chain of more than {MAX_SYMLINK_HOPS} symbolic links",
+                    store_dir.display()
+                ),
+            ));
+        }
+        let target = std::fs::read_link(&cursor)?;
+        cursor = match cursor.parent() {
+            Some(parent) if target.is_relative() => parent.join(target),
+            _ => target,
+        };
+        if let Ok(canonical) = std::fs::canonicalize(&cursor) {
+            return Ok(canonical);
+        }
+    }
     let mut missing = Vec::<OsString>::new();
     loop {
         match std::fs::canonicalize(&cursor) {
@@ -742,11 +817,18 @@ fn release(identity: &Path, update: impl FnOnce(&mut OwnershipState) -> bool) {
     drop(removed);
 }
 
-/// Takes the inner lock of the directory now at `identity`, if this entry takes locks and does
-/// not hold it yet: after a recovery that may have replaced the directory. The lock file is
-/// opened with the registry mutex released; a concurrent opener in this process goes on without
-/// waiting, because the entry already owns the directory through its replacement lock.
+/// Makes this entry hold the inner lock of the directory now at `identity`, before an open or a
+/// claim goes on: after a recovery that may have replaced the directory, and after an open whose
+/// lock file was retired with the directory while it was stalled (FR-2, FR-5).
+///
+/// - Not held: it is taken, with the registry mutex released.
+/// - Being taken by another thread: this one waits for the outcome, and takes the lock itself if
+///   that attempt failed. A guard clears the marker if the attempt unwinds.
+/// - Held: kept only while it is still the file at the lock path, which is checked outside the
+///   mutex. Otherwise it is released and the current file's lock taken. Where the platform gives
+///   no file identity (Windows), a held lock is kept.
 fn ensure_inner_lock(identity: &Path) -> io::Result<()> {
+    let lock_path = identity.join(INNER_LOCK_NAME);
     loop {
         let mut registry = lock_registry();
         let Some(Slot::Owned(state)) = registry.get_mut(identity) else {
@@ -755,17 +837,32 @@ fn ensure_inner_lock(identity: &Path) -> io::Result<()> {
         if !state.takes_locks {
             return Ok(());
         }
-        match state.inner {
-            InnerLock::Held(_) => return Ok(()),
+        let held = match &state.inner {
+            InnerLock::Held(lock) => lock.id,
             // Another thread's attempt decides whether this open may go live: wait for it.
             InnerLock::Acquiring => {
                 drop(registry);
                 std::thread::sleep(PENDING_POLL);
+                continue;
             }
             InnerLock::Absent => {
                 state.inner = InnerLock::Acquiring;
                 break;
             }
+        };
+        drop(registry);
+        if still_at(held, &lock_path) {
+            return Ok(());
+        }
+        let mut registry = lock_registry();
+        let Some(Slot::Owned(state)) = registry.get_mut(identity) else {
+            return Ok(());
+        };
+        if matches!(&state.inner, InnerLock::Held(lock) if lock.id == held) {
+            let stale = std::mem::replace(&mut state.inner, InnerLock::Acquiring);
+            drop(registry);
+            drop(stale);
+            break;
         }
     }
     let mut acquiring = AcquiringInnerLock {
@@ -808,6 +905,16 @@ impl OpenDirectoryLease {
     /// in place (specs/011 FR-5). A no-op when it is already held.
     pub(crate) fn ensure_inner_lock(&self) -> io::Result<()> {
         ensure_inner_lock(&self.identity)
+    }
+
+    /// The path recovery reads for `store_dir`. A symlink's own name locates no maintenance
+    /// artifacts of the directory it names, so for a symlink it is the directory's identity.
+    /// Otherwise it is `store_dir` itself, so that errors keep naming the path the caller gave.
+    pub(crate) fn maintenance_path(&self, store_dir: &Path) -> PathBuf {
+        match std::fs::symlink_metadata(store_dir) {
+            Ok(metadata) if metadata.file_type().is_symlink() => self.identity.clone(),
+            _ => store_dir.to_path_buf(),
+        }
     }
 }
 
@@ -1189,11 +1296,9 @@ mod lock_error_tests {
         inject_lock_error(directory.path(), io::ErrorKind::Unsupported);
         let identity = super::canonical_directory_identity(directory.path()).unwrap();
         let lock = identity.join(INNER_LOCK_NAME).display().to_string();
-        let warned = |message: &str| {
-            message.contains(&lock)
-                && message.contains("is not excluded")
-                && message.contains(&identity.display().to_string())
-        };
+        // The directory is asked for on its own, since the lock path already contains it.
+        let unexcluded = format!("opening {} is not excluded", identity.display());
+        let warned = |message: &str| message.contains(&lock) && message.contains(&unexcluded);
 
         // Another test may clear the shared buffer between an open and the look, so each attempt
         // opens again and so logs again.
