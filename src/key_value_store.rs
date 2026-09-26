@@ -942,13 +942,21 @@ impl<W: Write> DurableKeyValueStore<W> {
     ///
     /// Not a snapshot. An entry present and unchanged for the whole call is visited exactly once;
     /// one inserted, replaced or removed during the call, including by a compare-exchange batch,
-    /// may be visited before or after that change, or not at all. The batch gate is deliberately
-    /// not taken: a batch waiting on a long visit would make every later reader and writer wait
-    /// behind it.
+    /// may be visited before or after that change, or not at all. Nothing is copied.
     ///
-    /// `visit` runs while the entry's part of the map is read-guarded, so it must not call any
-    /// method of this store, which may deadlock, as for compute callbacks. Writers to that part wait
-    /// until `visit` returns; readers do not. Nothing is copied and nothing is logged.
+    /// The map is visited one part at a time. Each part stays read-guarded from its first entry
+    /// until the visit moves on, and the previous part's guard is held until the next part's is
+    /// taken. `visit` must not call any method of this store, which may deadlock, as for compute
+    /// callbacks. While a part is guarded:
+    /// - reads of any key, and writes to other parts, proceed;
+    /// - writes to the guarded part wait until the visit leaves it;
+    /// - the batch gate is not taken, so batches on other parts proceed. A compare-exchange batch
+    ///   that writes to the guarded part, or one queued behind a writer waiting on it, holds the gate
+    ///   while it waits, and every read and write of this store then waits until the visit leaves
+    ///   the part. Taking the gate for the whole visit would make every batch, and everything
+    ///   queued behind one, wait for the whole visit instead.
+    /// - On a file-backed store, a compaction queued behind such a writer makes every writer wait
+    ///   with it.
     pub fn for_each_entry(&self, mut visit: impl FnMut(&[u8], &[u8])) {
         for entry in self.store.iter() {
             visit(entry.key(), entry.value());

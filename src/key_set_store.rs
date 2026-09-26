@@ -23,17 +23,23 @@ use std::collections::HashSet;
 #[cfg(test)]
 use crate::test_support::mutation_schedule::{MutationObserver, MutationPhase};
 
-/// Shrinks a set's table to hold at most twice its length (specs/012 FR-3).
+/// Releases a set's spare capacity: shrinks its table to the smallest one that holds `2 * len`
+/// (specs/012 FR-3).
 ///
 /// Called unconditionally wherever a published set may have lost members or been handed spare
 /// capacity. `shrink_to` compares the bucket count `2 * len` needs with the table's real one and
-/// resizes only when the real one is larger, so this is O(1) when there is nothing to release.
-/// `capacity()` cannot be the trigger: it is `len + growth_left`, and a removal that leaves a
-/// tombstone does not give its slot back to `growth_left`.
+/// resizes only when the real one is larger, so this is O(1) when there is nothing to release. A
+/// call that does resize rehashes the members while the shard's write guard is held. `capacity()`
+/// cannot be the trigger: it is `len + growth_left`, and a removal that leaves a tombstone does not
+/// give its slot back to `growth_left`.
 ///
-/// Afterwards the table's capacity is below `4 * len` for every `len >= 1`, and a set must double
-/// before it grows or halve before it shrinks again, so alternating appends and removals do not
-/// reallocate each time.
+/// Afterwards the capacity is below `4 * len` for every `len >= 1`. Insertion keeps it at most
+/// `4 * len`: a table with no growth left doubles once half its usable slots hold members, even on
+/// an append of an existing member. Resizing is amortised. After a release that resizes, the table
+/// has room for at least `len` more insertions before it can grow, and removal one member at a time
+/// shrinks it again only when the length falls to about a quarter of its capacity. A set released at an arbitrary
+/// length (by a compute, or at open) may sit just above a threshold and shrink on its next
+/// removal.
 pub(crate) fn release_spare_capacity(set: &mut HashSet<Vec<u8>>) {
     set.shrink_to(2 * set.len());
 }
@@ -1085,11 +1091,14 @@ impl<W: Write> DurableKeySetStore<W> {
     ///
     /// Not a snapshot. A set present and unchanged for the whole call is visited exactly once; one
     /// created, changed or removed during the call may be visited before or after that change, or
-    /// not at all.
+    /// not at all. Nothing is copied.
     ///
-    /// `visit` runs while the set's part of the map is read-guarded, so it must not call any method
-    /// of this store, which may deadlock, as for compute callbacks. Writers to that part wait until
-    /// `visit` returns; readers do not. Nothing is copied.
+    /// The map is visited one part at a time. Each part stays read-guarded from its first set until
+    /// the visit moves on, and the previous part's guard is held until the next part's is taken.
+    /// `visit` must not call any method of this store, which may deadlock, as for compute callbacks.
+    /// While a part is guarded, reads of any key and writes to other parts proceed, and writes to
+    /// the guarded part wait until the visit leaves it. On a file-backed store, a compaction queued
+    /// behind such a writer makes every writer wait with it.
     pub fn for_each_set(&self, mut visit: impl FnMut(&[u8], &HashSet<Vec<u8>>)) {
         for entry in self.store.iter() {
             visit(entry.key(), entry.value());

@@ -11,20 +11,31 @@ needs FR-1/FR-2 to recount, and FR-3 so that the fixed charge bounds a set's tab
 
 ## Constitution check
 - **VI.** The API and the capacity rule are stated in the library's own terms: entries, sets,
-  capacity. Any consumer can use them unchanged. The motivating consumer is named only in the
-  Motivation notes, and the change lands on `main` before penpack pins it.
+  capacity. Any consumer can use them unchanged. The motivating consumer is penpack (finding V263).
+  It is named in the Motivation notes, in this record and in the release line below. No
+  identifier, type, error, limit, test, branch or spec title carries it. The change lands on
+  `main` before penpack pins it.
 - **V.** Assertions use public reads: the enumeration, and `HashSet::capacity()` of the sets it
   visits. No private seam is needed.
 - **IV.**
-  - The enumeration takes no new lock. It uses the map's own shard guards, one at a time.
-  - The `transaction` gate is deliberately not taken. Holding it for a long visit would make a
-    waiting batch block every later reader and writer on the fair lock. So a batch may be observed
-    in part, which FR-1 states.
-  - The capacity release is O(1) to decide. Its reallocation is amortised by the hysteresis.
-    Baseline below.
+  - The enumeration takes no new lock. It uses the map's own shard read guards. `visit` always runs
+    under exactly one, but the iterator keeps the previous shard's guard until it has taken the
+    next, so at most two are held, and the second only while `next()` waits.
+  - The `transaction` gate is deliberately not taken. Holding it for the whole visit would make
+    every batch, and everything queued behind one on the fair lock, wait for the whole visit. Not
+    taking it lets batches on other parts proceed, and a batch may then be observed in part, which
+    FR-1 states.
+  - The stall FR-1 states remains. A batch that writes to the guarded part, or one queued behind a
+    writer waiting on it, holds the gate until the visit leaves that part.
+  - The capacity release is O(1) to decide. A release that resizes rehashes the set's members
+    while that shard's write guard is held, O(len). The hysteresis bounds how often that happens,
+    and the cost is smaller than the growth rehash the same table already made on append. Baseline
+    below.
 - **III.** Two methods are added, and nothing else changes signature, semantics or format.
-- **II.** No write path changes what is accepted, persisted or published. Only a table's spare
-  capacity changes, after publication.
+- **II.** No write path changes what is accepted, persisted or published. Only a set's spare
+  capacity changes. It is released after WAL acceptance and before publication, so it never runs on
+  an error path. For compute it is released on the private working copy. For removals it is released
+  on the live set, under the same entry guard.
 
 ## Decisions
 - **Enumeration.** Iterate `self.store.iter()` and pass `(key, value)` borrowed from each guard.
@@ -38,13 +49,22 @@ needs FR-1/FR-2 to recount, and FR-3 so that the fixed charge bounds a set's tab
   - `shrink_to` compares the bucket count that `2 * len` needs with the table's real bucket count.
     It resizes only when the real count is larger, and is O(1) otherwise.
   - Gating it on `capacity()` would be wrong. `capacity()` is `len + growth_left`, and a removal that
-    leaves a tombstone does not return its slot to `growth_left`. Measured at `d5ad6ee`: a set cut
-    from 10,000 members to 10 reported capacity between 13,019 and 13,228, in a table sized for
-    14,336.
-  - After the call, the power-of-two sizing gives a capacity below `4 * len()` for every `len >= 1`.
-    Growth by insertion keeps that true, because a table doubles only when it is full.
-  - Hysteresis: after a shrink to `2 * len`, the set must double before it grows and halve before it
-    shrinks again.
+    leaves a tombstone does not return its slot to `growth_left`.
+    - Measured at `d5ad6ee`: a set cut from 10,000 members to 10 reported capacity of 12,843 to
+      13,228 across the recorded runs, in a table sized for 14,336. The figure varies with the hash
+      seed; verification.md T004 has the per-path ranges.
+    - A table filled before the cut leaves most removed slots as tombstones. There, a
+      `capacity()`-gated trigger never fires while the real table reaches six to seven times the
+      length (the 012 review measured this).
+  - Right after the call, the power-of-two sizing gives a capacity below `4 * len()` for every
+    `len >= 1`. Insertion keeps it at most `4 * len()`: a table with no growth left doubles once
+    half its usable slots hold members, even on an append of an existing member.
+  - Resizing is amortised:
+    - after a release that resizes, the table has room for at least `len` more insertions;
+    - removal one member at a time shrinks it again only when the length falls to about a quarter
+      of its capacity;
+    - a set released at an arbitrary length (by a compute, or at open) may sit just above a
+      threshold and shrink on its next removal.
 - **Where the rule is applied.** Every place a set that stays published loses members:
   - `try_remove_from_set_core`, on both of its non-final paths;
   - `try_remove_from_set_callback_core`, on its non-final path;

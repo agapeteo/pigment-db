@@ -131,7 +131,8 @@ fn an_unchanged_entry_is_visited_exactly_once_while_other_keys_change() {
         std::thread::spawn(move || {
             let mut index = 0_usize;
             while !stop.load(Ordering::Acquire) {
-                let key = format!("churn-{:05}", index % 500).into_bytes();
+                // A put and then a removal of the same key, so the churn both inserts and removes.
+                let key = format!("churn-{:05}", (index / 2) % 500).into_bytes();
                 if index.is_multiple_of(2) {
                     store.put(key, vec![0; index % 64]);
                 } else {
@@ -279,7 +280,8 @@ fn an_unchanged_set_is_visited_exactly_once_while_other_keys_change() {
         std::thread::spawn(move || {
             let mut index = 0_usize;
             while !stop.load(Ordering::Acquire) {
-                let key = format!("churn-{:05}", index % 500).into_bytes();
+                // An append and then a removal of the same key, so the churn both inserts and removes.
+                let key = format!("churn-{:05}", (index / 2) % 500).into_bytes();
                 if index.is_multiple_of(2) {
                     store.append(key, b"m".to_vec());
                 } else {
@@ -418,6 +420,13 @@ fn a_set_cut_down_by_remove_from_set_releases_its_spare_capacity() {
         store.remove_from_set(key.to_vec(), member)
     });
     assert_within_fr3(len, capacity, "remove_from_set");
+
+    // A large set, so a release applied only to small ones is seen.
+    let (len, capacity) = grown_then_cut(20_000, 3_000, |store, key, member| {
+        store.remove_from_set(key.to_vec(), member)
+    });
+    assert_eq!(len, 3_000);
+    assert_within_fr3(len, capacity, "remove_from_set, large");
 }
 
 #[test]
