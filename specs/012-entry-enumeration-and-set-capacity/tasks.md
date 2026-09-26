@@ -28,4 +28,4 @@ compile error.
   everything in verification.md.
 - [x] T007 Review fixes (verification.md, "Review"): corrected contracts, a real-table-size test, the
   hysteresis sweep, a large cut, and churn that removes what it inserts.
-- [ ] T008 MSRV 1.91, macOS and Windows: CI after publication, recorded with the run id.
+- [x] T008 MSRV 1.91, macOS and Windows: CI run 36275769798 on `869fba1`, all four jobs green.

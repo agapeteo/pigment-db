@@ -117,9 +117,13 @@ Candidate, same crate and machine, three sets of five release runs:
 | W1 | 0.063544, 0.065238, 0.066026 | 0.065238 | 0.078225 | +8% |
 | W2 | 0.040662, 0.040376, 0.041352 | 0.040662 | 0.050879 | +4% |
 
-## Not verified locally
-Rust 1.91 (the MSRV), macOS and Windows are covered by CI. No toolchain of that version is
-installed here. The new code uses APIs stable by then:
+## CI after publication
+`869fba1` was pushed to `main` on 2026-09-26. GitHub Actions run 36275769798 passed all four jobs:
+Minimum supported Rust (1.91), Recovery (ubuntu-latest), Recovery (macos-latest) and Recovery
+(windows-latest). The allocation test's calibration therefore ran on at least one non-x86 group
+width wherever the macOS runner is Apple silicon.
+
+No toolchain of 1.91 is installed locally. The new code uses APIs stable by then:
 - `HashSet::shrink_to` (1.56);
 - `Waker::noop` (1.85);
 - async closures (1.85);
