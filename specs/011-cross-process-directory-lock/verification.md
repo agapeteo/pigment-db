@@ -443,3 +443,16 @@ Checks at `c99dfc4`:
 - `cargo fmt --check` is clean.
 - Clippy reports nothing on Linux, and only the 14 warnings that predate the branch for Windows.
 - The ownership, progress, lock-error and identity tests passed 15 runs out of 15.
+
+## CI after publication
+
+`39b78b4` was pushed to `main` on 2026-09-25. GitHub Actions run 36204454412 ("Recovery", push)
+passed every job:
+- Recovery (ubuntu-latest), which runs the complete suite;
+- Recovery (macos-latest);
+- Recovery (windows-latest), including `tests/windows_physical_durability`, `tests/directory_lock.rs`,
+  the ownership tests and the Windows fault models;
+- Minimum supported Rust (1.91).
+
+That is the first run of the macOS and Windows code. The earlier "Not verified" entries for those
+two platforms are closed by it.
