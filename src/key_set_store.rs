@@ -23,6 +23,21 @@ use std::collections::HashSet;
 #[cfg(test)]
 use crate::test_support::mutation_schedule::{MutationObserver, MutationPhase};
 
+/// Shrinks a set's table to hold at most twice its length (specs/012 FR-3).
+///
+/// Called unconditionally wherever a published set may have lost members or been handed spare
+/// capacity. `shrink_to` compares the bucket count `2 * len` needs with the table's real one and
+/// resizes only when the real one is larger, so this is O(1) when there is nothing to release.
+/// `capacity()` cannot be the trigger: it is `len + growth_left`, and a removal that leaves a
+/// tombstone does not give its slot back to `growth_left`.
+///
+/// Afterwards the table's capacity is below `4 * len` for every `len >= 1`, and a set must double
+/// before it grows or halve before it shrinks again, so alternating appends and removals do not
+/// reallocate each time.
+pub(crate) fn release_spare_capacity(set: &mut HashSet<Vec<u8>>) {
+    set.shrink_to(2 * set.len());
+}
+
 /// Mutations are ordered per logical outer key, while mutations of keys in different data-map shards remain concurrent except during shared WAL acceptance.
 ///
 /// Different keys in the same DashMap shard may wait for one another during
@@ -323,7 +338,10 @@ impl DurableKeySetStore<File> {
                 source,
             })?;
         let store = DashMap::new();
-        for (key, values) in initialized.snapshot {
+        // Replay builds each set in a private map, so a set its WAL grew and then cut down arrives
+        // at its largest table. Release that here, where every recovery path publishes (FR-3).
+        for (key, mut values) in initialized.snapshot {
+            release_spare_capacity(&mut values);
             store.insert(key, values);
         }
         let file_backing =
@@ -589,6 +607,7 @@ impl<W: Write> DurableKeySetStore<W> {
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
                 entry.remove(&set_entry);
+                release_spare_capacity(&mut entry);
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(entry.key(), MutationPhase::Published);
@@ -616,6 +635,7 @@ impl<W: Write> DurableKeySetStore<W> {
                     self.mutation_observer
                         .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
                     entry.get_mut().remove(&set_entry);
+                    release_spare_capacity(entry.get_mut());
                 }
             }
             Entry::Vacant(entry) => {
@@ -697,6 +717,7 @@ impl<W: Write> DurableKeySetStore<W> {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(&key, MutationPhase::AcceptedBeforePublication);
+                release_spare_capacity(&mut working);
                 *occupied_entry.get_mut() = working;
                 #[cfg(test)]
                 self.mutation_observer
@@ -726,6 +747,7 @@ impl<W: Write> DurableKeySetStore<W> {
                 #[cfg(test)]
                 self.mutation_observer
                     .notify(&key, MutationPhase::AcceptedBeforePublication);
+                release_spare_capacity(&mut working);
                 vacant_entry.insert(working);
                 #[cfg(test)]
                 self.mutation_observer
@@ -795,6 +817,7 @@ impl<W: Write> DurableKeySetStore<W> {
                     value,
                 }));
                 self.wal.commit_set_compute_batch(actions)?;
+                release_spare_capacity(&mut working);
                 *occupied_entry.get_mut() = working;
                 Ok(())
             }
@@ -813,6 +836,7 @@ impl<W: Write> DurableKeySetStore<W> {
                         })
                         .collect(),
                 )?;
+                release_spare_capacity(&mut working);
                 vacant_entry.insert(working);
                 Ok(())
             }
@@ -867,6 +891,7 @@ impl<W: Write> DurableKeySetStore<W> {
                     value,
                 }));
                 self.wal.commit_set_compute_batch(actions)?;
+                release_spare_capacity(&mut working);
                 *occupied_entry.get_mut() = working;
                 Ok(())
             }
@@ -909,6 +934,7 @@ impl<W: Write> DurableKeySetStore<W> {
                         })
                         .collect(),
                 )?;
+                release_spare_capacity(&mut working);
                 vacant_entry.insert(working);
                 Ok(())
             }
@@ -978,6 +1004,7 @@ impl<W: Write> DurableKeySetStore<W> {
                         self.mutation_observer
                             .notify(entry.key(), MutationPhase::AcceptedBeforePublication);
                         entry.get_mut().remove(&set_entry);
+                        release_spare_capacity(entry.get_mut());
                         false
                     }
                 }
@@ -1052,6 +1079,21 @@ impl<W: Write> DurableKeySetStore<W> {
 
     pub fn size(&self) -> usize {
         self.store.len()
+    }
+
+    /// Calls `visit` once for each published set key and its set (specs/012 FR-2).
+    ///
+    /// Not a snapshot. A set present and unchanged for the whole call is visited exactly once; one
+    /// created, changed or removed during the call may be visited before or after that change, or
+    /// not at all.
+    ///
+    /// `visit` runs while the set's part of the map is read-guarded, so it must not call any method
+    /// of this store, which may deadlock, as for compute callbacks. Writers to that part wait until
+    /// `visit` returns; readers do not. Nothing is copied.
+    pub fn for_each_set(&self, mut visit: impl FnMut(&[u8], &HashSet<Vec<u8>>)) {
+        for entry in self.store.iter() {
+            visit(entry.key(), entry.value());
+        }
     }
 }
 

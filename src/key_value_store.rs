@@ -937,6 +937,23 @@ impl<W: Write> DurableKeyValueStore<W> {
         let _transaction = self.transaction.read();
         self.store.len()
     }
+
+    /// Calls `visit` once for each published key and its value (specs/012 FR-1).
+    ///
+    /// Not a snapshot. An entry present and unchanged for the whole call is visited exactly once;
+    /// one inserted, replaced or removed during the call, including by a compare-exchange batch,
+    /// may be visited before or after that change, or not at all. The batch gate is deliberately
+    /// not taken: a batch waiting on a long visit would make every later reader and writer wait
+    /// behind it.
+    ///
+    /// `visit` runs while the entry's part of the map is read-guarded, so it must not call any
+    /// method of this store, which may deadlock, as for compute callbacks. Writers to that part wait
+    /// until `visit` returns; readers do not. Nothing is copied and nothing is logged.
+    pub fn for_each_entry(&self, mut visit: impl FnMut(&[u8], &[u8])) {
+        for entry in self.store.iter() {
+            visit(entry.key(), entry.value());
+        }
+    }
 }
 
 #[cfg(test)]
