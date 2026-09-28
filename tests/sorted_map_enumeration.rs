@@ -5,6 +5,7 @@
 
 use pigment_db::key_map_store::DurableKeyMapStore;
 use pigment_db::model::SearchKey;
+use pigment_db::OnlineCompactionOptions;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -103,21 +104,25 @@ fn an_unchanged_map_is_visited_exactly_once_while_other_keys_change() {
         std::thread::yield_now();
     }
 
-    let before = writes.load(Ordering::Acquire);
     let mut stable: HashMap<Vec<u8>, usize> = HashMap::new();
+    let (mut first, mut last) = (None, 0);
     store.for_each_sorted_map(|key, _| {
         if key.starts_with(b"stable-") {
+            // Read the counter, not the store: this is how many writes landed between the first
+            // stable key visited and the last.
+            let now = writes.load(Ordering::Acquire);
+            first.get_or_insert(now);
+            last = now;
             *stable.entry(key.to_vec()).or_default() += 1;
             std::thread::yield_now();
         }
     });
-    let during = writes.load(Ordering::Acquire) - before;
     stop.store(true, Ordering::Release);
     writer.join().unwrap();
 
     assert!(
-        during > 0,
-        "the writer made no progress during the visit, so nothing was tested"
+        last > first.expect("a stable key was visited"),
+        "no write interleaved with the visit, so nothing was tested"
     );
     assert_eq!(stable.len(), 2_000);
     assert!(
@@ -170,6 +175,8 @@ fn reads_progress_while_a_map_visit_is_blocked_and_writers_finish_after_it() {
     );
     reader.join().unwrap();
 
+    let other_parts = writers_to_other_parts_proceed(&store);
+
     let (wrote_tx, wrote_rx) = mpsc::channel();
     let writer = {
         let store = store.clone();
@@ -192,9 +199,100 @@ fn reads_progress_while_a_map_visit_is_blocked_and_writers_finish_after_it() {
         .recv_timeout(WATCHDOG)
         .expect("the writer finished after the visit returned");
     writer.join().unwrap();
+    for handle in other_parts {
+        handle.join().unwrap();
+    }
     let seen = maps(&*store);
     assert_eq!(seen.len(), KEYS);
     assert!(seen.values().all(|(map, _)| map.len() == 2));
+}
+
+/// While a visit is blocked, 64 writers each rewrite one entry of a different key. A writer waits only
+/// when its key shares the guarded part, so at least one finishes unless the visit guards every part.
+/// Returns the writers, some of which may still be waiting, to be joined after the visit returns.
+fn writers_to_other_parts_proceed<W: std::io::Write + Send + 'static>(
+    store: &Arc<DurableKeyMapStore<W>>,
+) -> Vec<std::thread::JoinHandle<()>>
+where
+    DurableKeyMapStore<W>: Send + Sync,
+{
+    let finished = Arc::new(AtomicUsize::new(0));
+    let handles: Vec<_> = (0..64)
+        .map(|index| {
+            let (store, finished) = (store.clone(), finished.clone());
+            std::thread::spawn(move || {
+                store.put(key(index), SearchKey::from(1), b"m".to_vec());
+                finished.fetch_add(1, Ordering::Release);
+            })
+        })
+        .collect();
+    let deadline = std::time::Instant::now() + WATCHDOG;
+    while finished.load(Ordering::Acquire) == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no write to another part finished while the visit was blocked"
+        );
+        std::thread::yield_now();
+    }
+    handles
+}
+
+#[test]
+fn on_a_file_backed_store_compaction_and_other_parts_proceed_while_a_visit_is_blocked() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        DurableKeyMapStore::try_init_new(directory.path())
+            .unwrap()
+            .into_store(),
+    );
+    for index in 0..KEYS {
+        store.put(key(index), SearchKey::from(1), b"m".to_vec());
+    }
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let visitor = {
+        let store = store.clone();
+        std::thread::spawn(move || {
+            let mut first = true;
+            store.for_each_sorted_map(|_, _| {
+                if first {
+                    first = false;
+                    entered_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(WATCHDOG)
+                        .expect("the test released the visit");
+                }
+            });
+        })
+    };
+    entered_rx
+        .recv_timeout(WATCHDOG)
+        .expect("the visit started");
+
+    // A compaction first, while no writer waits on the guarded part: its capture takes only read
+    // guards, so it completes during the visit.
+    let (compacted_tx, compacted_rx) = mpsc::channel();
+    let compactor = {
+        let store = store.clone();
+        std::thread::spawn(move || {
+            let outcome = store.try_compact_online(OnlineCompactionOptions::default());
+            compacted_tx.send(outcome.is_ok()).unwrap();
+        })
+    };
+    assert_eq!(
+        compacted_rx.recv_timeout(WATCHDOG),
+        Ok(true),
+        "a compaction did not complete while the visit was blocked"
+    );
+    compactor.join().unwrap();
+
+    let other_parts = writers_to_other_parts_proceed(&store);
+    release_tx.send(()).unwrap();
+    visitor.join().unwrap();
+    for handle in other_parts {
+        handle.join().unwrap();
+    }
+    assert_eq!(maps(&*store).len(), KEYS);
 }
 
 #[test]
@@ -219,7 +317,14 @@ fn a_reopened_store_is_visited_as_it_was_written() {
         for index in (3..300).step_by(11) {
             store.remove_from_sorted_map(key(index), SearchKey::from(0));
         }
-        maps(&store)
+        let before = store.storage_stats().unwrap().total_bytes();
+        let written = maps(&store);
+        assert_eq!(
+            store.storage_stats().unwrap().total_bytes(),
+            before,
+            "the visit wrote to the WAL"
+        );
+        written
     };
     assert!(!written.is_empty());
     let reopened = DurableKeyMapStore::try_init_new(directory.path())

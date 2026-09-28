@@ -12,6 +12,6 @@ compile error.
     `visit` blocks and writers held by it finish after it; a reopened file-backed store is visited
     as written; a visit leaves the WAL's size unchanged.
 - [x] T003 Run the new target on every operating system: `recovery.yml` and `tests/ci_workflow.rs`.
-- [ ] T004 Full suite, `cargo fmt --check` and Clippy. Neutralization probes and an adversarial
+- [x] T004 Full suite, `cargo fmt --check` and Clippy. Neutralization probes and an adversarial
   review. Record everything in verification.md.
 - [ ] T005 MSRV 1.91, macOS and Windows: CI after publication.

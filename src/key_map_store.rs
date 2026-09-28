@@ -705,15 +705,20 @@ impl<W: Write> DurableKeyMapStore<W> {
     ///
     /// Not a snapshot. A key present and unchanged for the whole call is visited exactly once; one
     /// inserted, changed or removed during the call may be visited before or after that change, or
-    /// not at all. Every published key is visited, including one whose map is empty. Nothing is
-    /// copied.
+    /// not at all. Nothing is copied, and nothing is written to the WAL.
     ///
     /// The map is visited one part at a time. Each part stays read-guarded from its first key until
     /// the visit moves on, and the previous part's guard is held until the next part's is taken.
-    /// `visit` must not call any method of this store, which may deadlock, as for compute callbacks.
-    /// While a part is guarded, reads of any key and writes to other parts proceed, and writes to
-    /// the guarded part wait until the visit leaves it. On a file-backed store, a compaction queued
-    /// behind such a writer makes every writer wait with it.
+    /// While a part is guarded, reads of any key and writes to other parts proceed. A writer to the
+    /// guarded part busy-waits, spinning on its thread without sleeping, until the visit leaves it.
+    /// On a file-backed store, a compaction queued behind such a writer makes every writer wait
+    /// with it. Keep `visit` short and non-blocking: copy out what is needed and process it after
+    /// the call.
+    ///
+    /// `visit` must not call any method of this store, and must not wait for anything that waits on
+    /// a write to this store: another thread's write, a channel whose consumer writes, a join.
+    /// Either may deadlock, as for compute callbacks. On a file-backed store this holds for writes
+    /// to other parts too, because a queued compaction makes them wait.
     pub fn for_each_sorted_map(&self, mut visit: impl FnMut(&[u8], &BTreeMap<SearchKey, Vec<u8>>)) {
         for entry in self.store.iter() {
             visit(entry.key(), entry.value());
