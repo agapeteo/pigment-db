@@ -120,8 +120,15 @@ Candidate, same crate and machine, three sets of five release runs:
 ## CI after publication
 `869fba1` was pushed to `main` on 2026-09-26. GitHub Actions run 36275769798 passed all four jobs:
 Minimum supported Rust (1.91), Recovery (ubuntu-latest), Recovery (macos-latest) and Recovery
-(windows-latest). The allocation test's calibration therefore ran on at least one non-x86 group
-width wherever the macOS runner is Apple silicon.
+(windows-latest).
+
+**Corrected 2026-09-28.** This paragraph also said the allocation test's calibration therefore ran on
+a non-x86 group width wherever the macOS runner is Apple silicon. It did not. The complete suite runs
+on Linux only, and neither `tests/entry_enumeration.rs` nor `tests/set_capacity_hysteresis.rs` is
+among the targets `recovery.yml` runs on every operating system, so both ran on the Linux x86 runner
+alone. The calibration has not been exercised on an 8-byte group width. spec 013's review found
+this. The busy-wait of a writer blocked by a visit, which the review also found, applies to
+`for_each_entry` and `for_each_set` as it does to 013's enumeration; their rustdoc now says so.
 
 No toolchain of 1.91 is installed locally. The new code uses APIs stable by then:
 - `HashSet::shrink_to` (1.56);

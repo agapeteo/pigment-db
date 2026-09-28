@@ -946,10 +946,12 @@ impl<W: Write> DurableKeyValueStore<W> {
     ///
     /// The map is visited one part at a time. Each part stays read-guarded from its first entry
     /// until the visit moves on, and the previous part's guard is held until the next part's is
-    /// taken. `visit` must not call any method of this store, which may deadlock, as for compute
-    /// callbacks. While a part is guarded:
+    /// taken. `visit` must not call any method of this store, and must not wait for anything that
+    /// waits on a write to this store (another thread's write, a channel whose consumer writes, a
+    /// join); either may deadlock, as for compute callbacks. While a part is guarded:
     /// - reads of any key, and writes to other parts, proceed;
-    /// - writes to the guarded part wait until the visit leaves it;
+    /// - a writer to the guarded part busy-waits, spinning on its thread without sleeping, until the
+    ///   visit leaves it, so keep `visit` short and non-blocking;
     /// - the batch gate is not taken, so batches on other parts proceed. A compare-exchange batch
     ///   that writes to the guarded part, or one queued behind a writer waiting on it, holds the gate
     ///   while it waits, and every read and write of this store then waits until the visit leaves

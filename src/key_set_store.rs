@@ -1095,10 +1095,13 @@ impl<W: Write> DurableKeySetStore<W> {
     ///
     /// The map is visited one part at a time. Each part stays read-guarded from its first set until
     /// the visit moves on, and the previous part's guard is held until the next part's is taken.
-    /// `visit` must not call any method of this store, which may deadlock, as for compute callbacks.
-    /// While a part is guarded, reads of any key and writes to other parts proceed, and writes to
-    /// the guarded part wait until the visit leaves it. On a file-backed store, a compaction queued
-    /// behind such a writer makes every writer wait with it.
+    /// `visit` must not call any method of this store, and must not wait for anything that waits on
+    /// a write to this store (another thread's write, a channel whose consumer writes, a join);
+    /// either may deadlock, as for compute callbacks. While a part is guarded, reads of any key and
+    /// writes to other parts proceed. A writer to the guarded part busy-waits, spinning on its
+    /// thread without sleeping, until the visit leaves it, so keep `visit` short and non-blocking.
+    /// On a file-backed store, a compaction queued behind such a writer makes every writer wait
+    /// with it.
     pub fn for_each_set(&self, mut visit: impl FnMut(&[u8], &HashSet<Vec<u8>>)) {
         for entry in self.store.iter() {
             visit(entry.key(), entry.value());
