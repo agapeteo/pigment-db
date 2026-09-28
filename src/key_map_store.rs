@@ -701,6 +701,25 @@ impl<W: Write> DurableKeyMapStore<W> {
         self.store.get(key).map(|v| v.value().len())
     }
 
+    /// Calls `visit` once for each published key and its sorted map (specs/013 FR-1).
+    ///
+    /// Not a snapshot. A key present and unchanged for the whole call is visited exactly once; one
+    /// inserted, changed or removed during the call may be visited before or after that change, or
+    /// not at all. Every published key is visited, including one whose map is empty. Nothing is
+    /// copied.
+    ///
+    /// The map is visited one part at a time. Each part stays read-guarded from its first key until
+    /// the visit moves on, and the previous part's guard is held until the next part's is taken.
+    /// `visit` must not call any method of this store, which may deadlock, as for compute callbacks.
+    /// While a part is guarded, reads of any key and writes to other parts proceed, and writes to
+    /// the guarded part wait until the visit leaves it. On a file-backed store, a compaction queued
+    /// behind such a writer makes every writer wait with it.
+    pub fn for_each_sorted_map(&self, mut visit: impl FnMut(&[u8], &BTreeMap<SearchKey, Vec<u8>>)) {
+        for entry in self.store.iter() {
+            visit(entry.key(), entry.value());
+        }
+    }
+
     pub fn range_search_keys_filtered<P>(
         &self,
         key: &[u8],

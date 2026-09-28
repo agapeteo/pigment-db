@@ -33,6 +33,7 @@ fn recovery_workflow_runs_every_dedicated_issue_regression_target() {
         "map_pop_return_values",
         "numeric_increment_overflow",
         "ordered_map_append",
+        "sorted_map_enumeration",
         "v2_wal_segments",
     ] {
         let command = format!("cargo test --test {target} -- --test-threads=1");

@@ -57,6 +57,7 @@ jobs:
           cargo test --test map_pop_return_values -- --test-threads=1
           cargo test --test numeric_increment_overflow -- --test-threads=1
           cargo test --test ordered_map_append -- --test-threads=1
+          cargo test --test sorted_map_enumeration -- --test-threads=1
           cargo test --test v2_wal_segments -- --test-threads=1
       - name: Directory ownership seams and cross-process claims
         run: |
