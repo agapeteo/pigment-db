@@ -14,4 +14,4 @@ compile error.
 - [x] T003 Run the new target on every operating system: `recovery.yml` and `tests/ci_workflow.rs`.
 - [x] T004 Full suite, `cargo fmt --check` and Clippy. Neutralization probes and an adversarial
   review. Record everything in verification.md.
-- [ ] T005 MSRV 1.91, macOS and Windows: CI after publication.
+- [x] T005 MSRV 1.91, macOS and Windows: CI run 36510511873 on `82aaf6b`, all four jobs green.

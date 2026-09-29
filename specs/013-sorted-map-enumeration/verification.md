@@ -93,3 +93,10 @@ in plan.md's Principle VI record and in its Release line, and in this record.
 - **`tests/sorted_map_enumeration.rs`:** 6 passed.
 - **Full suite:** 628 passed, 0 failed, 28 ignored across 28 binaries.
 - **`cargo fmt --check`:** clean. **`cargo clippy --all-targets --all-features`:** no warnings.
+
+## CI after publication
+`82aaf6b` was pushed to `main` on 2026-09-28. GitHub Actions run 36510511873 passed all four jobs:
+Minimum supported Rust (1.91), Recovery (ubuntu-latest), Recovery (macos-latest) and Recovery
+(windows-latest). The step running `tests/sorted_map_enumeration.rs`, whose command
+`tests/ci_workflow.rs` requires, carries no platform condition, so the enumeration's tests ran on
+all three platforms.
