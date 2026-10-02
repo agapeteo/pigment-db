@@ -29,4 +29,4 @@ error.
     a test for a panic that began before the write side was taken; the FR-1 test's timing
     recorded; the nits, and the deferred defects filed in
     `reviews/opus-5.5-maintenance-2026-10-02.md`.
-- [ ] T006 MSRV 1.91, macOS and Windows: CI run on the published revision.
+- [x] T006 MSRV 1.91, macOS and Windows: CI run 37072628152 on `1afb66e`, all four jobs green.

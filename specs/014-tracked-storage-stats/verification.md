@@ -487,3 +487,9 @@ line.
 ## Not done here
 T006: MSRV 1.91, macOS and Windows in CI on the published revision, and the `main` revision a
 consumer pins.
+
+## CI on the published revision
+GitHub Actions run 37072628152 on `1afb66e` (published 2026-10-02): Minimum supported Rust, and
+Recovery on ubuntu-latest, macos-latest and windows-latest, all green. The new integration target,
+its allocation target and the "Tracked storage stats seams" step run on every operating system; the
+complete suite runs on Linux. penpack pins `1afb66e` (penpack `1134a76`).
