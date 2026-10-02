@@ -1,7 +1,9 @@
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-use std::sync::RwLock;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{fence, AtomicU64, Ordering};
+use std::sync::{LockResult, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use log::{error, info};
 
@@ -69,6 +71,266 @@ pub(crate) struct OnlineCaptureMetadata {
     pub(crate) granularity_nanos: u64,
     pub(crate) last_bucket: u64,
     pub(crate) durability_policy: crate::config::DurabilityPolicy,
+}
+
+/// The WAL's size as its writer accounts for it (specs/014): the active segment's length, and the
+/// sealed segments' total length and count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TrackedWalLengths {
+    pub(crate) active_len: u64,
+    pub(crate) sealed_bytes: u64,
+    pub(crate) sealed_count: u64,
+}
+
+/// What [`WalStorage::tracked_lengths`] reports for one state of the WAL (specs/014).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TrackedFigures {
+    Readable(TrackedWalLengths),
+    FailedClosed(UnreadableFigures),
+}
+
+/// Why a WAL reports no figures: in each of these states its files need not match them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UnreadableFigures {
+    RollbackUnconfirmed,
+    MaintenanceIndeterminate,
+    NoSegmentAccounting,
+    LockPoisoned,
+}
+
+impl UnreadableFigures {
+    /// A fixed sentence naming the cause, so that a caller reporting it allocates only its copy.
+    pub(crate) fn detail(self) -> &'static str {
+        match self {
+            Self::RollbackUnconfirmed => {
+                "the WAL is failed closed: a rejected write or rotation could not be rolled back, \
+                 so its files need not match its figures; reopen and recover the store"
+            }
+            Self::MaintenanceIndeterminate => {
+                "the WAL is failed closed: an online compaction's publication is indeterminate, so \
+                 its files need not match its figures; reopen and recover the store"
+            }
+            Self::NoSegmentAccounting => "the WAL keeps no segment accounting to report",
+            Self::LockPoisoned => {
+                "the WAL is failed closed: a panic unwound out of a write that held the WAL's \
+                 lock, poisoning it, so its files need not match its figures; reopen and recover \
+                 the store"
+            }
+        }
+    }
+}
+
+impl TrackedFigures {
+    fn of<W: Write>(state: &WalState<W>) -> Self {
+        match (&state.health, &state.rotation) {
+            (WalHealth::FailedRollback { .. }, _) => {
+                Self::FailedClosed(UnreadableFigures::RollbackUnconfirmed)
+            }
+            (WalHealth::MaintenanceIndeterminate { .. }, _) => {
+                Self::FailedClosed(UnreadableFigures::MaintenanceIndeterminate)
+            }
+            (WalHealth::Ready | WalHealth::WriterDetached { .. }, None) => {
+                Self::FailedClosed(UnreadableFigures::NoSegmentAccounting)
+            }
+            (WalHealth::Ready | WalHealth::WriterDetached { .. }, Some(rotation)) => {
+                Self::Readable(TrackedWalLengths {
+                    active_len: state.active_len,
+                    sealed_bytes: rotation.state.segment_base,
+                    sealed_count: rotation.state.segment_id,
+                })
+            }
+        }
+    }
+
+    /// The figures as four words: a status, then the three lengths.
+    fn encode(self) -> [u64; 4] {
+        match self {
+            Self::Readable(lengths) => [
+                0,
+                lengths.active_len,
+                lengths.sealed_bytes,
+                lengths.sealed_count,
+            ],
+            Self::FailedClosed(UnreadableFigures::RollbackUnconfirmed) => [1, 0, 0, 0],
+            Self::FailedClosed(UnreadableFigures::MaintenanceIndeterminate) => [2, 0, 0, 0],
+            Self::FailedClosed(UnreadableFigures::NoSegmentAccounting) => [3, 0, 0, 0],
+            Self::FailedClosed(UnreadableFigures::LockPoisoned) => [4, 0, 0, 0],
+        }
+    }
+
+    /// The inverse of [`Self::encode`], which writes every status there is.
+    fn decode([status, active_len, sealed_bytes, sealed_count]: [u64; 4]) -> Self {
+        match status {
+            0 => Self::Readable(TrackedWalLengths {
+                active_len,
+                sealed_bytes,
+                sealed_count,
+            }),
+            1 => Self::FailedClosed(UnreadableFigures::RollbackUnconfirmed),
+            2 => Self::FailedClosed(UnreadableFigures::MaintenanceIndeterminate),
+            3 => Self::FailedClosed(UnreadableFigures::NoSegmentAccounting),
+            _ => Self::FailedClosed(UnreadableFigures::LockPoisoned),
+        }
+    }
+}
+
+/// The WAL's tracked figures, published for readers that must not take the WAL state's lock
+/// (specs/014). A write holds that lock for its whole I/O, and where a platform's lock lets
+/// waiting writers go first, as Linux's does, a reader that took it could wait for as long as
+/// writes keep arriving.
+///
+/// A sequence lock over atomics: a coordination layer of its own, owned by the holder of the WAL
+/// state's write side. [`Self::publish`] is private to this module and its only caller is
+/// [`WalStateWriteGuard`]'s `Drop`, which runs while that write side is held, so no two
+/// publications overlap; that exclusion is what lets the sequence be advanced by a plain load and
+/// store rather than a read-modify-write. A reading copies the figures between two reads of an
+/// even sequence and retries if a publication was in progress or completed meanwhile, so it never
+/// sees one in part, never an earlier one after a later, and waits for no lock and no I/O.
+///
+/// A reading's progress depends on the publisher being scheduled: one preempted part-way through
+/// its few stores keeps readers retrying until it runs again. A reading must therefore never be
+/// taken from a signal handler, which could interrupt a publication on its own thread.
+///
+/// The orderings are the fence-based sequence lock of Boehm, "Can seqlocks get along with
+/// programming language memory models?" (MSPC 2012), and of crossbeam-utils' `SeqLock`;
+/// specs/014's plan.md records the argument and the instructions they compile to.
+pub(crate) struct PublishedFigures {
+    sequence: AtomicU64,
+    words: [AtomicU64; 4],
+}
+
+impl PublishedFigures {
+    pub(crate) fn new(figures: TrackedFigures) -> Self {
+        Self {
+            sequence: AtomicU64::new(0),
+            words: figures.encode().map(AtomicU64::new),
+        }
+    }
+
+    /// Publishes `figures`. The caller must exclude every other publisher of this value, as the
+    /// WAL state's write side does for [`WalStateWriteGuard`]'s `Drop`, its only caller.
+    fn publish(&self, figures: TrackedFigures) {
+        let values = figures.encode();
+        // Publications are serialised by the WAL state's write side, so these loads see the latest
+        // publication's words. Figures that have not changed are not published again: a memory
+        // store's never change, and the readers' copy is the same either way.
+        if self
+            .words
+            .iter()
+            .zip(values)
+            .all(|(word, value)| word.load(Ordering::Relaxed) == value)
+        {
+            return;
+        }
+        let sequence = self.sequence.load(Ordering::Relaxed);
+        self.sequence
+            .store(sequence.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+        for (word, value) in self.words.iter().zip(values) {
+            word.store(value, Ordering::Relaxed);
+        }
+        self.sequence
+            .store(sequence.wrapping_add(2), Ordering::Release);
+    }
+
+    /// [`Self::publish`] for the cell's own test, which plays the WAL state's write side.
+    #[cfg(test)]
+    pub(crate) fn publish_probe(&self, figures: TrackedFigures) {
+        self.publish(figures);
+    }
+
+    pub(crate) fn read(&self) -> TrackedFigures {
+        let mut attempts = 0_u32;
+        loop {
+            let before = self.sequence.load(Ordering::Acquire);
+            if before.is_multiple_of(2) {
+                let words = [0, 1, 2, 3].map(|index| self.words[index].load(Ordering::Relaxed));
+                fence(Ordering::Acquire);
+                if self.sequence.load(Ordering::Relaxed) == before {
+                    return TrackedFigures::decode(words);
+                }
+            }
+            attempts = attempts.wrapping_add(1);
+            if attempts.is_multiple_of(64) {
+                std::thread::yield_now();
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// The WAL state behind its lock, with the figures its writer last left (specs/014). Releasing the
+/// write side publishes them, so they change exactly when the state does and never mid-change.
+struct WalStateLock<W: Write> {
+    state: RwLock<WalState<W>>,
+    figures: PublishedFigures,
+}
+
+impl<W: Write> WalStateLock<W> {
+    fn new(state: WalState<W>) -> Self {
+        let figures = PublishedFigures::new(TrackedFigures::of(&state));
+        Self {
+            state: RwLock::new(state),
+            figures,
+        }
+    }
+
+    fn read(&self) -> LockResult<RwLockReadGuard<'_, WalState<W>>> {
+        self.state.read()
+    }
+
+    fn write(&self) -> LockResult<WalStateWriteGuard<'_, W>> {
+        let guard = |guard| WalStateWriteGuard {
+            guard,
+            lock: self,
+            panicking_on_entry: std::thread::panicking(),
+        };
+        match self.state.write() {
+            Ok(acquired) => Ok(guard(acquired)),
+            Err(poisoned) => Err(PoisonError::new(guard(poisoned.into_inner()))),
+        }
+    }
+}
+
+/// The write side of [`WalStateLock`]. Dropping it publishes the figures of the state it leaves
+/// while the write side is still held, so publications follow the order of the changes.
+///
+/// A panic that unwinds out of a holder can leave the state part-way through a change, which is
+/// when the standard lock poisons. The figures then fail closed for good, as every mutation that
+/// unwraps the poisoned lock does. A holder that took the lock while its thread was already
+/// unwinding poisons nothing, and publishes the state it leaves as usual.
+struct WalStateWriteGuard<'a, W: Write> {
+    guard: RwLockWriteGuard<'a, WalState<W>>,
+    lock: &'a WalStateLock<W>,
+    panicking_on_entry: bool,
+}
+
+impl<W: Write> Deref for WalStateWriteGuard<'_, W> {
+    type Target = WalState<W>;
+
+    fn deref(&self) -> &WalState<W> {
+        &self.guard
+    }
+}
+
+impl<W: Write> DerefMut for WalStateWriteGuard<'_, W> {
+    fn deref_mut(&mut self) -> &mut WalState<W> {
+        &mut self.guard
+    }
+}
+
+impl<W: Write> Drop for WalStateWriteGuard<'_, W> {
+    fn drop(&mut self) {
+        let poisoned =
+            (std::thread::panicking() && !self.panicking_on_entry) || self.lock.state.is_poisoned();
+        let figures = if poisoned {
+            TrackedFigures::FailedClosed(UnreadableFigures::LockPoisoned)
+        } else {
+            TrackedFigures::of(&self.guard)
+        };
+        self.lock.figures.publish(figures);
+    }
 }
 
 #[cfg(test)]
@@ -396,7 +658,7 @@ impl std::error::Error for MutationFailure {
 }
 
 pub struct WalStorage<W: Write> {
-    wal_state: RwLock<WalState<W>>,
+    wal_state: WalStateLock<W>,
 }
 
 pub(crate) struct DetachedWalWriter<W: Write> {
@@ -577,7 +839,7 @@ impl WalStorage<File> {
             delta_recorder: None,
             online_owner_token: None,
         };
-        let wal_state = RwLock::new(wal_state);
+        let wal_state = WalStateLock::new(wal_state);
 
         Ok(WalStorage { wal_state })
     }
@@ -642,7 +904,7 @@ impl WalStorage<File> {
         }
 
         Ok(Self {
-            wal_state: RwLock::new(WalState {
+            wal_state: WalStateLock::new(WalState {
                 offset,
                 active_len: validated_len,
                 writer: Some(file),
@@ -675,7 +937,7 @@ impl WalStorage<File> {
         last_bucket: u64,
     ) -> Self {
         Self {
-            wal_state: RwLock::new(WalState {
+            wal_state: WalStateLock::new(WalState {
                 offset: u64::from(offset),
                 active_len: u64::from(offset),
                 writer: Some(file),
@@ -703,7 +965,7 @@ impl WalStorage<File> {
         last_bucket: u64,
     ) -> Self {
         Self {
-            wal_state: RwLock::new(WalState {
+            wal_state: WalStateLock::new(WalState {
                 offset,
                 active_len: offset,
                 writer: Some(file),
@@ -990,7 +1252,7 @@ impl WalStorage<Vec<u8>> {
             delta_recorder: None,
             online_owner_token: None,
         };
-        let wal_state = RwLock::new(wal_state);
+        let wal_state = WalStateLock::new(wal_state);
 
         WalStorage { wal_state }
     }
@@ -1012,7 +1274,7 @@ impl WalStorage<Vec<u8>> {
         assert!(valid, "vector-backed V1 storage requires a valid header");
 
         Self {
-            wal_state: RwLock::new(WalState {
+            wal_state: WalStateLock::new(WalState {
                 offset: header.len() as u64,
                 active_len: header.len() as u64,
                 writer: Some(header.to_vec()),
@@ -1063,6 +1325,20 @@ impl<W: Write> WalStorage<W> {
             last_bucket: state.last_bucket,
             durability_policy: state.durability_policy,
         })
+    }
+
+    /// Reads the WAL's size from the writer's accounting (specs/014): the figures its writer last
+    /// published, without the WAL state's lock. Every change to them is made under that lock's
+    /// write side and published as it is released, so a reading sees them at one instant. Reads
+    /// no file.
+    ///
+    /// A detached writer still reports the generation an online compaction is replacing. A WAL
+    /// failed closed reports nothing, because its files need not match the figures.
+    pub(crate) fn tracked_lengths(&self) -> Result<TrackedWalLengths, UnreadableFigures> {
+        match self.wal_state.figures.read() {
+            TrackedFigures::Readable(lengths) => Ok(lengths),
+            TrackedFigures::FailedClosed(cause) => Err(cause),
+        }
     }
 
     pub(crate) fn activate_delta_recorder(&self, token: u64, limit: u64) -> Result<(), ()> {
@@ -1186,7 +1462,7 @@ impl<W: Write> WalStorage<W> {
         rollback: fn(&mut W, usize) -> std::io::Result<()>,
     ) -> Self {
         Self {
-            wal_state: RwLock::new(WalState {
+            wal_state: WalStateLock::new(WalState {
                 offset: 0,
                 active_len: 0,
                 writer: Some(writer),
@@ -1213,7 +1489,7 @@ impl<W: Write> WalStorage<W> {
         rollback: fn(&mut W, usize) -> std::io::Result<()>,
     ) -> Self {
         Self {
-            wal_state: RwLock::new(WalState {
+            wal_state: WalStateLock::new(WalState {
                 offset: format::V1CodecProbe::HEADER_LEN as u64,
                 active_len: format::V1CodecProbe::HEADER_LEN as u64,
                 writer: Some(writer),
@@ -1254,7 +1530,7 @@ impl<W: Write> WalStorage<W> {
         data_barrier: crate::durability::DataBarrier<W>,
     ) -> Self {
         Self {
-            wal_state: RwLock::new(WalState {
+            wal_state: WalStateLock::new(WalState {
                 offset: format::V2CodecProbe::HEADER_LEN as u64,
                 active_len: format::V2CodecProbe::HEADER_LEN as u64,
                 writer: Some(writer),

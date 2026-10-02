@@ -491,6 +491,49 @@ pub(crate) fn public_file_family_storage_stats(
         .map_err(|error| map_inspection_error(store_dir.to_path_buf(), error))
 }
 
+/// Storage usage of an open family from its WAL writer's own accounting (specs/014). Takes no
+/// maintenance coordination: online compaction holds it exclusively across whole-WAL passes.
+pub(crate) fn tracked_family_storage_stats(
+    wal: &crate::wal::WalStorage<std::fs::File>,
+    family: InspectedFamily,
+) -> Result<FamilyStorageStats, CompactionError> {
+    // The cause's fixed detail, copied once: the only allocation a failed-closed reading makes.
+    let lengths = wal
+        .tracked_lengths()
+        .map_err(|cause| CompactionError::FailedClosed {
+            detail: cause.detail().to_owned(),
+        })?;
+    family_storage_stats_from_tracked(family, lengths)
+}
+
+pub(crate) fn family_storage_stats_from_tracked(
+    family: InspectedFamily,
+    lengths: crate::wal::TrackedWalLengths,
+) -> Result<FamilyStorageStats, CompactionError> {
+    let total_bytes = lengths
+        .sealed_bytes
+        .checked_add(lengths.active_len)
+        .ok_or_else(|| CompactionError::FailedClosed {
+            detail: "the tracked WAL size overflows u64".to_owned(),
+        })?;
+    let sealed_segment_count =
+        usize::try_from(lengths.sealed_count).map_err(|_| CompactionError::FailedClosed {
+            detail: "the tracked sealed segment count exceeds usize".to_owned(),
+        })?;
+    Ok(FamilyInspection {
+        family,
+        active_bytes: lengths.active_len,
+        sealed_segment_bytes: lengths.sealed_bytes,
+        sealed_segment_count,
+        total_bytes,
+    }
+    .into())
+}
+
+#[cfg(test)]
+#[path = "tracked_storage_stats_tests.rs"]
+mod tracked_storage_stats_tests;
+
 #[cfg(test)]
 pub(crate) fn test_sentinel() {
     crate::compaction::test_sentinel();

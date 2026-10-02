@@ -58,11 +58,16 @@ jobs:
           cargo test --test numeric_increment_overflow -- --test-threads=1
           cargo test --test ordered_map_append -- --test-threads=1
           cargo test --test sorted_map_enumeration -- --test-threads=1
+          cargo test --test tracked_storage_stats -- --test-threads=1
+          cargo test --test tracked_storage_stats_allocation -- --test-threads=1
           cargo test --test v2_wal_segments -- --test-threads=1
       - name: Directory ownership seams and cross-process claims
         run: |
           cargo test maintenance_coordination:: -- --test-threads=1
           cargo test compaction::recovery_tests::ownership:: -- --test-threads=1
+      - name: Tracked storage stats seams
+        run: |
+          cargo test maintenance::tracked_storage_stats_tests:: -- --test-threads=1
       - name: Physical durability capability and publication matrix
         run: cargo test --test durable_write_policy public_ -- --test-threads=1
       - name: Windows physical durability and buffered compatibility matrix

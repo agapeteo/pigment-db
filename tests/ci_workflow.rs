@@ -34,6 +34,8 @@ fn recovery_workflow_runs_every_dedicated_issue_regression_target() {
         "numeric_increment_overflow",
         "ordered_map_append",
         "sorted_map_enumeration",
+        "tracked_storage_stats",
+        "tracked_storage_stats_allocation",
         "v2_wal_segments",
     ] {
         let command = format!("cargo test --test {target} -- --test-threads=1");
@@ -285,34 +287,124 @@ fn windows_unsafe_and_dependency_are_confined_to_the_durability_boundary() {
     assert!(cargo.contains("features = [\"Win32_Storage_FileSystem\"]"));
 }
 
+fn recovery_workflow() -> String {
+    // `read_text` folds CRLF line endings, which would otherwise defeat every multi-line match.
+    read_text(&Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/recovery.yml"))
+}
+
+/// The lines of the step named `name` in a job's `steps:` list, from its `- name:` line up to the
+/// next step or the end of the list. `None` when no step starts with that `- name:` line.
+fn workflow_step<'a>(workflow: &'a str, name: &str) -> Option<Vec<&'a str>> {
+    let header = format!("      - name: {name}");
+    let mut lines = workflow.lines();
+    let first = lines.by_ref().find(|line| *line == header)?;
+    let mut step = vec![first];
+    for line in lines {
+        let indent = line.len() - line.trim_start().len();
+        // A step's keys are indented eight spaces and its block scalars further; a line at six or
+        // fewer begins the next step or leaves the list.
+        if !line.trim().is_empty() && indent <= 6 {
+            break;
+        }
+        step.push(line);
+    }
+    Some(step)
+}
+
+/// The step named `name` runs exactly `commands`, and nothing gates it to fewer runners than the
+/// job's matrix names: its only keys are `name` and `run`, wherever an `if:` would be written.
+fn runs_on_every_runner(workflow: &str, name: &str, commands: &[&str]) -> bool {
+    let Some(step) = workflow_step(workflow, name) else {
+        return false;
+    };
+    let keys = step[1..]
+        .iter()
+        .filter(|line| line.len() - line.trim_start().len() == 8)
+        .map(|line| {
+            line.trim_start()
+                .split(':')
+                .next()
+                .unwrap_or_default()
+                .trim()
+        })
+        .collect::<Vec<_>>();
+    let script = step[1..]
+        .iter()
+        .skip_while(|line| line.trim() != "run: |")
+        .skip(1)
+        .take_while(|line| line.starts_with("          "))
+        .map(|line| line.trim())
+        .collect::<Vec<_>>();
+    keys == ["run"] && script == commands
+}
+
+const DIRECTORY_OWNERSHIP_STEP: (&str, &[&str]) = (
+    "Directory ownership seams and cross-process claims",
+    &[
+        "cargo test maintenance_coordination:: -- --test-threads=1",
+        "cargo test compaction::recovery_tests::ownership:: -- --test-threads=1",
+    ],
+);
+
+const TRACKED_STORAGE_STATS_STEP: (&str, &[&str]) = (
+    "Tracked storage stats seams",
+    &["cargo test maintenance::tracked_storage_stats_tests:: -- --test-threads=1"],
+);
+
 #[test]
 fn directory_ownership_tests_run_on_every_operating_system() {
-    let workflow_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(".github")
-        .join("workflows")
-        .join("recovery.yml");
-    // A checkout with CRLF line endings would otherwise defeat every multi-line match.
-    let workflow = fs::read_to_string(&workflow_path)
-        .unwrap_or_else(|error| {
-            panic!(
-                "failed to read recovery workflow {}: {error}",
-                workflow_path.display()
-            )
-        })
-        .replace("\r\n", "\n");
-    // `run:` directly after `name:` leaves no room for an `if:` gating the step to one OS.
-    let every_os_step = [
-        "      - name: Directory ownership seams and cross-process claims",
-        "        run: |",
-        "          cargo test maintenance_coordination:: -- --test-threads=1",
-        "          cargo test compaction::recovery_tests::ownership:: -- --test-threads=1",
-    ]
-    .join("\n");
-
+    let (name, commands) = DIRECTORY_OWNERSHIP_STEP;
     assert!(
-        workflow.contains(&every_os_step),
+        runs_on_every_runner(&recovery_workflow(), name, commands),
         "recovery workflow must run the directory ownership unit tests on every OS"
     );
+}
+
+#[test]
+fn tracked_storage_stats_seam_tests_run_on_every_operating_system() {
+    let (name, commands) = TRACKED_STORAGE_STATS_STEP;
+    assert!(
+        runs_on_every_runner(&recovery_workflow(), name, commands),
+        "recovery workflow must run the tracked storage stats unit tests on every OS"
+    );
+}
+
+/// The two pins above, against copies of the workflow in which each pinned step is gated to one
+/// OS: by an `if:` after its commands, by one between its name and `run:`, and by one on the
+/// step's first line. Each copy must fail the pin, and the unchanged workflow must pass it.
+#[test]
+fn a_pinned_step_gated_to_one_operating_system_fails_its_pin() {
+    let workflow = recovery_workflow();
+    for (name, commands) in [DIRECTORY_OWNERSHIP_STEP, TRACKED_STORAGE_STATS_STEP] {
+        assert!(runs_on_every_runner(&workflow, name, commands), "{name}");
+        let header = format!("      - name: {name}\n");
+        let last = format!("          {}\n", commands.last().unwrap());
+        let gate = "if: runner.os == 'Linux'";
+        for (place, from, to) in [
+            (
+                "after its commands",
+                last.clone(),
+                format!("{last}        {gate}\n"),
+            ),
+            (
+                "before `run:`",
+                header.clone(),
+                format!("{header}        {gate}\n"),
+            ),
+            (
+                "on its first line",
+                header.clone(),
+                format!("      - {gate}\n        name: {name}\n"),
+            ),
+        ] {
+            assert_eq!(workflow.matches(&from).count(), 1, "{name}: {place}");
+            let gated = workflow.replacen(&from, &to, 1);
+            assert!(
+                !runs_on_every_runner(&gated, name, commands),
+                "the pin accepted {name} with an `{gate}` {place}"
+            );
+        }
+    }
 }
 
 #[test]

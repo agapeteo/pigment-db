@@ -223,6 +223,53 @@ impl DurableKeySetStore<File> {
         )
     }
 
+    /// Returns this open key/set store's WAL size from the writer's own accounting.
+    ///
+    /// The figures are the five [`Self::storage_stats`] reports for the same generation: the
+    /// active segment's length, the sealed segments' total length and count, and their sum. They
+    /// are what the writer records as it appends and rotates, so the call lists, stats, opens and
+    /// reads no file, and allocates nothing beyond its result.
+    ///
+    /// The figures are those of the WAL at one instant during the call: an append or a rotation
+    /// happened either before it or not at all, never in part. The call takes no lock. Each
+    /// write, rotation and rollback of this store publishes the figures as it completes, and the
+    /// call copies the latest publication, retrying while a publication, a few stores at the end
+    /// of a write, overlaps the copy. So it waits for no write's I/O and never for an online
+    /// compaction's capture or cutover, and it may be called from a compute callback of this
+    /// store. Its progress does depend on the writer that is publishing being scheduled to finish
+    /// those stores, so it must not be called from a signal handler, which could interrupt that
+    /// publication on its own thread and would then wait for ever. While an online compaction
+    /// installs its replacement, the figures are those of the generation being replaced. Like
+    /// [`Self::storage_stats`], they exclude maintenance residue, staging, lock files and
+    /// anything outside the authoritative generation.
+    ///
+    /// The figures are not a validation: damage to the files after the store opened is invisible
+    /// to them. [`Self::storage_stats`] remains the validating reading.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::CompactionError::FailedClosed`], and no figures, when the WAL is failed closed
+    /// because a rejected write or rotation could not be rolled back, an online compaction's
+    /// publication is indeterminate, or a panic unwound out of a write that held the WAL's lock,
+    /// poisoning it: in those states the figures need not match the files. Also when a figure does
+    /// not fit its type.
+    ///
+    /// Vector-backed stores do not expose it:
+    ///
+    /// ```compile_fail
+    /// use pigment_db::key_set_store::DurableKeySetStore;
+    /// let store = DurableKeySetStore::new_vec_based();
+    /// let _ = store.tracked_storage_stats();
+    /// ```
+    pub fn tracked_storage_stats(
+        &self,
+    ) -> Result<crate::FamilyStorageStats, crate::CompactionError> {
+        crate::maintenance::tracked_family_storage_stats(
+            &self.wal,
+            crate::compaction::inspection::InspectedFamily::KeySet,
+        )
+    }
+
     #[allow(dead_code)]
     pub(crate) fn storage_stats_internal(
         &self,
