@@ -1411,3 +1411,687 @@ fn block_on_online<F: Future>(future: F) -> F::Output {
         }
     }
 }
+
+/// specs/015 FR-2: an online compaction whose first `Prepared` publication fails, or whose
+/// finalize rewrite fails, before its rename leaves no manifest temporary, and its store goes on.
+#[test]
+fn an_online_manifest_publication_that_fails_leaves_no_temporary() {
+    use crate::compaction::publication::manifest_publication_faults::{inject, Fault};
+    use crate::compaction::publication::{family_artifact_paths, ManifestPublishStage};
+
+    let mut left = Vec::new();
+    // The first publication is the unfinalized `Prepared`; the second is its finalize rewrite.
+    for publication in [1, 2] {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DurableKeyValueStore::try_init_new(directory.path())
+            .unwrap()
+            .into_store();
+        store.put(b"stable".to_vec(), b"authority".to_vec());
+        let paths = family_artifact_paths(&directory.path().join("kv.wal.dat")).unwrap();
+        {
+            let _injection = inject(
+                &paths.manifest_next,
+                publication,
+                ManifestPublishStage::Written,
+                Fault::Error,
+            );
+            assert!(
+                store
+                    .try_compact_online(crate::OnlineCompactionOptions::default())
+                    .is_err(),
+                "publication {publication}: the compaction must fail"
+            );
+        }
+        if paths.manifest_next.exists() {
+            left.push(publication);
+            continue;
+        }
+        for path in [&paths.manifest, &paths.staging, &paths.previous] {
+            assert!(
+                !path.exists(),
+                "publication {publication}: {path:?} remains"
+            );
+        }
+        store
+            .try_put(b"after".to_vec(), b"accepted".to_vec())
+            .unwrap();
+        drop(store);
+        let reopened = DurableKeyValueStore::try_init_new(directory.path())
+            .unwrap()
+            .into_store();
+        assert_eq!(reopened.get(b"stable"), Some(b"authority".to_vec()));
+        assert_eq!(reopened.get(b"after"), Some(b"accepted".to_vec()));
+    }
+    assert!(
+        left.is_empty(),
+        "online publications that failed before their rename left their temporary: {left:?}"
+    );
+}
+
+/// A finalized online `Prepared` whose cutover failed before its first source move, its store
+/// dropped: the finalized manifest, the staging file and an empty previous directory remain beside
+/// a segmented source. Returns the source inventory's file names, sealed segments first.
+fn finalized_prepared_before_its_first_move(
+    directory: &std::path::Path,
+) -> (
+    crate::compaction::publication::MaintenanceArtifactPaths,
+    Vec<std::ffi::OsString>,
+) {
+    let options = crate::DurableStoreOptions::default()
+        .with_wal_segment_size(crate::WalSegmentSize::try_from(170_u64).unwrap());
+    let store = DurableKeyValueStore::try_init_new_with_options(directory, options)
+        .unwrap()
+        .into_store();
+    for index in 0..4 {
+        store.put(format!("key-{index}").into_bytes(), b"value".to_vec());
+    }
+    let capture = store
+        .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
+        .unwrap();
+    let staged = super::prepare_online_staging(capture, |_| Ok(())).unwrap();
+    let paths = staged.prepared.paths.clone();
+    std::fs::create_dir(&paths.previous).unwrap();
+    assert!(store.complete_online_cutover_probe(staged).is_err());
+    drop(store);
+    let manifest = crate::compaction::publication::read_published_manifest(&paths)
+        .unwrap()
+        .unwrap();
+    assert!(manifest.source_finalized);
+    let names = manifest
+        .source_inventory
+        .iter()
+        .map(|descriptor| descriptor.relative_path.file_name().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert!(names.len() >= 2, "the source must span several artifacts");
+    (paths, names)
+}
+
+fn assert_four_keys(directory: &std::path::Path) {
+    let reopened = DurableKeyValueStore::try_init_new(directory)
+        .unwrap()
+        .into_store();
+    for index in 0..4 {
+        assert_eq!(
+            reopened.get(format!("key-{index}").as_bytes()),
+            Some(b"value".to_vec())
+        );
+    }
+}
+
+/// specs/015 FR-5, withdrawn by the third review: a finalized online `Prepared` whose source
+/// artifacts are split between the canonical directory and the previous directory -- by a cutover
+/// stopped part-way through its moves, or by one still moving them in another open instance of the
+/// family -- keeps the error it returned at `1eb9de5`, and the open changes nothing. Recovery
+/// cannot tell a live cutover's split from a stopped one's without coordination this spec does not
+/// add.
+#[test]
+fn a_finalized_prepared_split_by_its_source_move_keeps_its_error_and_its_bytes() {
+    use super::unpublished_attempt_tests::namespace;
+
+    for (label, moved) in [
+        ("after the first move", 1),
+        ("after every move", usize::MAX),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let (paths, names) = finalized_prepared_before_its_first_move(directory.path());
+        for name in names.iter().take(moved) {
+            std::fs::rename(directory.path().join(name), paths.previous.join(name)).unwrap();
+        }
+        let without_lock = |mut snapshot: super::unpublished_attempt_tests::Namespace| {
+            snapshot.remove(std::path::Path::new(".pigment-lock"));
+            snapshot
+        };
+        let before = without_lock(namespace(directory.path()));
+        match DurableKeyValueStore::try_init_new(directory.path()) {
+            Err(crate::RecoveryError::AuthorityUndetermined { .. }) => {}
+            Err(other) => panic!("{label}: expected AuthorityUndetermined, got {other:?}"),
+            Ok(outcome) => panic!("{label}: a split source opened {:?}", outcome.status()),
+        }
+        assert_eq!(
+            without_lock(namespace(directory.path())),
+            before,
+            "{label}: a refused open changed the directory"
+        );
+    }
+}
+
+/// A split beside an unfinalized `Prepared` keeps its error (specs/015 FR-5, a control from before
+/// the third review withdrew the restore). Publication never moves a source artifact under an
+/// unfinalized manifest, whose source inventory is only a prefix of a WAL that was still growing.
+#[test]
+fn a_split_beside_an_unfinalized_prepared_keeps_its_error_and_its_bytes() {
+    use super::unpublished_attempt_tests::namespace;
+
+    let directory = tempfile::tempdir().unwrap();
+    let options = crate::DurableStoreOptions::default()
+        .with_wal_segment_size(crate::WalSegmentSize::try_from(170_u64).unwrap());
+    let store = DurableKeyValueStore::try_init_new_with_options(directory.path(), options)
+        .unwrap()
+        .into_store();
+    for index in 0..4 {
+        store.put(format!("key-{index}").into_bytes(), b"value".to_vec());
+    }
+    let capture = store
+        .begin_online_capture_probe(u64::MAX, MaintenanceObserver::default())
+        .unwrap();
+    let staged = super::prepare_online_staging(capture, |_| Ok(())).unwrap();
+    let paths = staged.prepared.paths.clone();
+    let manifest = std::fs::read(&paths.manifest).unwrap();
+    let staging = std::fs::read(&paths.staging).unwrap();
+    // The attempt's own guard removes an unfinalized manifest and its staging when it is dropped,
+    // so they are put back as a killed process would have left them.
+    drop(staged);
+    drop(store);
+    std::fs::write(&paths.manifest, manifest).unwrap();
+    std::fs::write(&paths.staging, staging).unwrap();
+    let published = crate::compaction::publication::read_published_manifest(&paths)
+        .unwrap()
+        .unwrap();
+    assert!(!published.source_finalized);
+    let first = published.source_inventory[0]
+        .relative_path
+        .file_name()
+        .unwrap()
+        .to_owned();
+    assert!(published.source_inventory.len() >= 2);
+    std::fs::create_dir(&paths.previous).unwrap();
+    std::fs::rename(directory.path().join(&first), paths.previous.join(&first)).unwrap();
+
+    let without_lock = |mut snapshot: super::unpublished_attempt_tests::Namespace| {
+        snapshot.remove(std::path::Path::new(".pigment-lock"));
+        snapshot
+    };
+    let before = without_lock(namespace(directory.path()));
+    match DurableKeyValueStore::try_init_new(directory.path()) {
+        Err(crate::RecoveryError::AuthorityUndetermined { .. }) => {}
+        Err(other) => panic!("expected AuthorityUndetermined, got {other:?}"),
+        Ok(outcome) => panic!(
+            "a split beside an unfinalized Prepared opened {:?}",
+            outcome.status()
+        ),
+    }
+    assert_eq!(
+        without_lock(namespace(directory.path())),
+        before,
+        "a refused open changed the directory"
+    );
+}
+
+/// A manifest temporary beside a published family manifest is not a lone temporary (specs/015
+/// FR-3, online): recovery of the published manifest runs, and removes the manifest with the
+/// temporary, as at `1eb9de5`.
+#[test]
+fn a_family_manifest_temporary_beside_a_published_manifest_is_recovered_with_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let (paths, _) = finalized_prepared_before_its_first_move(directory.path());
+    std::fs::remove_file(&paths.staging).unwrap();
+    std::fs::remove_dir(&paths.previous).unwrap();
+    std::fs::write(&paths.manifest_next, b"an unpublished revision").unwrap();
+    let opened = DurableKeyValueStore::try_init_new(directory.path()).unwrap();
+    assert_eq!(opened.status(), crate::RecoveryStatus::Recovered);
+    drop(opened);
+    for path in [
+        &paths.manifest,
+        &paths.manifest_next,
+        &paths.staging,
+        &paths.previous,
+    ] {
+        assert!(!path.exists(), "an open reported success and left {path:?}");
+    }
+    assert_four_keys(directory.path());
+}
+
+/// A split the manifest cannot account for keeps its error and its bytes (a control for specs/015
+/// FR-5 from before the third review withdrew the restore; it pins the same refusal for splits a
+/// restore would also have refused).
+#[test]
+fn a_split_source_the_manifest_cannot_account_for_keeps_its_error_and_its_bytes() {
+    use super::unpublished_attempt_tests::namespace;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Damage {
+        MovedArtifactChanged,
+        PresentAtBothLocations,
+        ForeignFileInPrevious,
+        UnmovedArtifactChanged,
+    }
+    for damage in [
+        Damage::MovedArtifactChanged,
+        Damage::PresentAtBothLocations,
+        Damage::ForeignFileInPrevious,
+        Damage::UnmovedArtifactChanged,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let (paths, names) = finalized_prepared_before_its_first_move(directory.path());
+        let first = &names[0];
+        match damage {
+            Damage::MovedArtifactChanged => {
+                std::fs::rename(directory.path().join(first), paths.previous.join(first)).unwrap();
+                let moved = paths.previous.join(first);
+                let mut bytes = std::fs::read(&moved).unwrap();
+                let last = bytes.len() - 1;
+                bytes[last] ^= 0xff;
+                std::fs::write(&moved, bytes).unwrap();
+            }
+            Damage::PresentAtBothLocations => {
+                std::fs::copy(directory.path().join(first), paths.previous.join(first)).unwrap();
+            }
+            Damage::ForeignFileInPrevious => {
+                std::fs::rename(directory.path().join(first), paths.previous.join(first)).unwrap();
+                std::fs::write(paths.previous.join("foreign"), b"not a source artifact").unwrap();
+            }
+            Damage::UnmovedArtifactChanged => {
+                std::fs::rename(directory.path().join(first), paths.previous.join(first)).unwrap();
+                let unmoved = directory.path().join(names.last().unwrap());
+                let mut bytes = std::fs::read(&unmoved).unwrap();
+                let last = bytes.len() - 1;
+                bytes[last] ^= 0xff;
+                std::fs::write(&unmoved, bytes).unwrap();
+            }
+        }
+        let without_lock = |mut snapshot: super::unpublished_attempt_tests::Namespace| {
+            snapshot.remove(std::path::Path::new(".pigment-lock"));
+            snapshot
+        };
+        let before = without_lock(namespace(directory.path()));
+        match DurableKeyValueStore::try_init_new(directory.path()) {
+            Err(crate::RecoveryError::AuthorityUndetermined { .. }) => {}
+            Err(other) => panic!("{damage:?}: expected AuthorityUndetermined, got {other:?}"),
+            Ok(outcome) => panic!("{damage:?}: opened {:?}", outcome.status()),
+        }
+        assert_eq!(
+            without_lock(namespace(directory.path())),
+            before,
+            "{damage:?}: a refused open changed the directory"
+        );
+    }
+}
+
+/// specs/015, second and third reviews: an open of a family while another instance of it in this
+/// process is between its cutover's source moves and `PreviousPublished` finds a split it must not
+/// restore: the split is a live attempt's, not debris. The open is refused and changes nothing,
+/// and the cutover completes, as at `1eb9de5`.
+#[test]
+fn a_second_open_during_a_live_cutover_is_refused_and_the_cutover_completes() {
+    use super::unpublished_attempt_tests::namespace;
+    use crate::compaction::publication::{family_artifact_paths, online_source_move_pause};
+
+    let directory = tempfile::tempdir().unwrap();
+    let options = crate::DurableStoreOptions::default()
+        .with_wal_segment_size(crate::WalSegmentSize::try_from(170_u64).unwrap());
+    let first = DurableKeyValueStore::try_init_new_with_options(directory.path(), options)
+        .unwrap()
+        .into_store();
+    for index in 0..6 {
+        first
+            .try_put(format!("key-{index}").into_bytes(), b"value".to_vec())
+            .unwrap();
+    }
+    let paths = family_artifact_paths(&directory.path().join("kv.wal.dat")).unwrap();
+    let pause = online_source_move_pause::install(&paths.previous);
+    // Nothing is asserted while the cutover is parked, so a failure cannot leave it parked.
+    let (before, second, after, compacted) = std::thread::scope(|scope| {
+        let compaction =
+            scope.spawn(|| first.try_compact_online(crate::OnlineCompactionOptions::default()));
+        pause.wait_reached();
+        let before = namespace(directory.path());
+        let second =
+            DurableKeyValueStore::try_init_new(directory.path()).map(|outcome| outcome.status());
+        let after = namespace(directory.path());
+        pause.release();
+        (before, second, after, compaction.join().unwrap())
+    });
+    drop(pause);
+    assert!(
+        exists_in(&before, &paths.previous, directory.path()),
+        "the cutover must be parked after its source moves"
+    );
+    assert!(
+        matches!(
+            second,
+            Err(crate::RecoveryError::AuthorityUndetermined { .. })
+        ),
+        "a second open during a live cutover must be refused, got {second:?}"
+    );
+    assert_eq!(after, before, "the refused open changed the directory");
+    compacted.expect("the live cutover completes");
+    first
+        .try_put(b"after".to_vec(), b"accepted".to_vec())
+        .unwrap();
+    drop(first);
+    let reopened = DurableKeyValueStore::try_init_new(directory.path())
+        .unwrap()
+        .into_store();
+    for index in 0..6 {
+        assert_eq!(
+            reopened.get(format!("key-{index}").as_bytes()),
+            Some(b"value".to_vec())
+        );
+    }
+    assert_eq!(reopened.get(b"after"), Some(b"accepted".to_vec()));
+    for path in [
+        &paths.manifest,
+        &paths.manifest_next,
+        &paths.staging,
+        &paths.previous,
+    ] {
+        assert!(!path.exists(), "{path:?} remains");
+    }
+}
+
+fn exists_in(
+    snapshot: &super::unpublished_attempt_tests::Namespace,
+    path: &std::path::Path,
+    root: &std::path::Path,
+) -> bool {
+    snapshot.contains_key(path.strip_prefix(root).unwrap())
+}
+
+/// specs/015 FR-3, online, withdrawn by the third review: at the start of an online compaction, a
+/// lone family manifest temporary may be another open instance's live publication, in this
+/// process or in another where locks are not supported, so the compaction keeps the error it
+/// returned at `1eb9de5` and changes nothing, whether or not another instance of the family is
+/// open now.
+#[test]
+fn a_compaction_over_a_lone_family_temporary_keeps_its_error_and_its_bytes() {
+    use super::unpublished_attempt_tests::namespace;
+    use crate::compaction::publication::family_artifact_paths;
+    use crate::test_support::maintenance_fixtures::{active_name, FixtureFamily};
+
+    fn compact(store: &dyn std::any::Any) -> Result<(), crate::CompactionError> {
+        let options = crate::OnlineCompactionOptions::default;
+        if let Some(store) = store.downcast_ref::<DurableKeyValueStore<std::fs::File>>() {
+            return store.try_compact_online(options()).map(|_| ());
+        }
+        if let Some(store) = store.downcast_ref::<DurableKeySetStore<std::fs::File>>() {
+            return store.try_compact_online(options()).map(|_| ());
+        }
+        store
+            .downcast_ref::<DurableKeyMapStore<std::fs::File>>()
+            .unwrap()
+            .try_compact_online(options())
+            .map(|_| ())
+    }
+    fn open(directory: &std::path::Path, family: FixtureFamily) -> Box<dyn std::any::Any> {
+        match family {
+            FixtureFamily::KeyValue => Box::new(
+                DurableKeyValueStore::try_init_new(directory)
+                    .unwrap()
+                    .into_store(),
+            ),
+            FixtureFamily::KeySet => Box::new(
+                DurableKeySetStore::try_init_new(directory)
+                    .unwrap()
+                    .into_store(),
+            ),
+            FixtureFamily::KeyMap => Box::new(
+                DurableKeyMapStore::try_init_new(directory)
+                    .unwrap()
+                    .into_store(),
+            ),
+        }
+    }
+
+    for family in [
+        FixtureFamily::KeyValue,
+        FixtureFamily::KeySet,
+        FixtureFamily::KeyMap,
+    ] {
+        for beside_another in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            crate::test_support::maintenance_fixtures::create_current_v2(directory.path(), family);
+            let first = open(directory.path(), family);
+            let second = beside_another.then(|| open(directory.path(), family));
+            let paths = family_artifact_paths(&directory.path().join(active_name(family))).unwrap();
+            std::fs::write(&paths.manifest_next, b"an unpublished online Prepared").unwrap();
+            let before = namespace(directory.path());
+            let result = compact(first.as_ref());
+            assert!(
+                matches!(
+                    result,
+                    Err(crate::CompactionError::AuthorityUndetermined { .. })
+                ),
+                "{family:?} (another instance open: {beside_another}): a compaction over a lone \
+                 temporary must keep its error, got {result:?}"
+            );
+            assert_eq!(
+                namespace(directory.path()),
+                before,
+                "{family:?} (another instance open: {beside_another}): the refused compaction \
+                 changed the directory"
+            );
+            drop(second);
+        }
+    }
+}
+
+/// specs/015 FR-7 after the second review: a split whose previous directory the open cannot read
+/// keeps the error it returned at `1eb9de5`, not the read's I/O error, and changes nothing. (Since
+/// the third review withdrew FR-5's restore, no rule reads that directory to prove a split.)
+#[cfg(unix)]
+#[test]
+fn a_previous_directory_that_cannot_be_read_keeps_its_error_and_its_bytes() {
+    use super::unpublished_attempt_tests::{namespace, Unreadable};
+
+    let directory = tempfile::tempdir().unwrap();
+    let (paths, names) = finalized_prepared_before_its_first_move(directory.path());
+    std::fs::rename(
+        directory.path().join(&names[0]),
+        paths.previous.join(&names[0]),
+    )
+    .unwrap();
+    let without_lock = |mut snapshot: super::unpublished_attempt_tests::Namespace| {
+        snapshot.remove(std::path::Path::new(".pigment-lock"));
+        snapshot
+    };
+    let before = without_lock(namespace(directory.path()));
+    let Some(unreadable) = Unreadable::new(&paths.previous) else {
+        return;
+    };
+    let result =
+        DurableKeyValueStore::try_init_new(directory.path()).map(|outcome| outcome.status());
+    drop(unreadable);
+    assert!(
+        matches!(
+            result,
+            Err(crate::RecoveryError::AuthorityUndetermined { .. })
+        ),
+        "an unreadable previous directory: expected its current refusal, got {result:?}"
+    );
+    assert_eq!(
+        without_lock(namespace(directory.path())),
+        before,
+        "a refused open changed the directory"
+    );
+}
+
+/// specs/015 FR-5 after the third review: an open admitted before another instance of its family,
+/// and still recovering when that instance opens, compacts and parks between its cutover's source
+/// moves and `PreviousPublished`, finds that live split. It must not restore it: the open is
+/// refused and changes nothing, and the cutover completes, as at `1eb9de5`. (A rule that asked,
+/// when the first open was admitted, whether it was its family's only open instance would restore
+/// the split, fail the cutover and leave the store refusing to open.)
+#[test]
+fn an_open_still_recovering_when_a_later_instance_starts_its_cutover_leaves_that_cutover_alone() {
+    use super::recovery::recovery_pause;
+    use super::unpublished_attempt_tests::namespace;
+    use crate::compaction::publication::{family_artifact_paths, online_source_move_pause};
+
+    let directory = tempfile::tempdir().unwrap();
+    let options = crate::DurableStoreOptions::default()
+        .with_wal_segment_size(crate::WalSegmentSize::try_from(170_u64).unwrap());
+    {
+        let seed = DurableKeyValueStore::try_init_new_with_options(directory.path(), options)
+            .unwrap()
+            .into_store();
+        for index in 0..6 {
+            seed.try_put(format!("key-{index}").into_bytes(), b"value".to_vec())
+                .unwrap();
+        }
+    }
+    let paths = family_artifact_paths(&directory.path().join("kv.wal.dat")).unwrap();
+    let recovering =
+        recovery_pause::install(directory.path(), recovery_pause::Point::FamilyRecovery);
+    let moving = online_source_move_pause::install(&paths.previous);
+    // Nothing is asserted while either side is parked, so a failure cannot leave one parked.
+    let (first, before, after, compacted, written) = std::thread::scope(|scope| {
+        let first = scope.spawn(|| {
+            DurableKeyValueStore::try_init_new(directory.path()).map(|outcome| outcome.status())
+        });
+        recovering.wait_reached();
+        let second = DurableKeyValueStore::try_init_new_with_options(directory.path(), options)
+            .unwrap()
+            .into_store();
+        let (first, before, after, compacted) = std::thread::scope(|inner| {
+            let compaction = inner
+                .spawn(|| second.try_compact_online(crate::OnlineCompactionOptions::default()));
+            moving.wait_reached();
+            let before = namespace(directory.path());
+            recovering.release();
+            let first = first.join().unwrap();
+            let after = namespace(directory.path());
+            moving.release();
+            (first, before, after, compaction.join().unwrap())
+        });
+        let written = second.try_put(b"after".to_vec(), b"accepted".to_vec());
+        (first, before, after, compacted, written)
+    });
+    drop(moving);
+    drop(recovering);
+    assert!(
+        exists_in(&before, &paths.previous, directory.path()),
+        "the cutover must be parked after its source moves"
+    );
+    assert!(
+        matches!(
+            first,
+            Err(crate::RecoveryError::AuthorityUndetermined { .. })
+        ),
+        "an open still recovering when a later instance's cutover moved its source must be \
+         refused, got {first:?}"
+    );
+    assert_eq!(after, before, "the refused open changed the directory");
+    compacted.expect("the live cutover completes");
+    written.expect("the compacted instance accepts a write");
+    let reopened = DurableKeyValueStore::try_init_new(directory.path())
+        .unwrap()
+        .into_store();
+    for index in 0..6 {
+        assert_eq!(
+            reopened.get(format!("key-{index}").as_bytes()),
+            Some(b"value".to_vec())
+        );
+    }
+    assert_eq!(reopened.get(b"after"), Some(b"accepted".to_vec()));
+    for path in [
+        &paths.manifest,
+        &paths.manifest_next,
+        &paths.staging,
+        &paths.previous,
+    ] {
+        assert!(!path.exists(), "{path:?} remains");
+    }
+}
+
+/// Names the store directory for the child below.
+const LOCKS_UNSUPPORTED_STORE_ENV: &str = "PIGMENT_DB_TEST_LOCKS_UNSUPPORTED_STORE";
+
+/// Exit codes of the child below.
+const CHILD_OPEN_REFUSED: i32 = 0;
+const CHILD_OPEN_SUCCEEDED: i32 = 3;
+const CHILD_OPEN_FAILED_OTHERWISE: i32 = 4;
+
+/// The unit-test child for the test below: a second process on a filesystem where locks are not
+/// supported (specs/011 FR-11), which skips both lock files and opens the store.
+#[test]
+fn locks_unsupported_open_child() {
+    use crate::maintenance_coordination::lock_seams::inject_lock_error;
+
+    let Some(store_dir) =
+        std::env::var_os(LOCKS_UNSUPPORTED_STORE_ENV).map(std::path::PathBuf::from)
+    else {
+        return;
+    };
+    inject_lock_error(&store_dir, std::io::ErrorKind::Unsupported);
+    inject_lock_error(store_dir.parent().unwrap(), std::io::ErrorKind::Unsupported);
+    let result = DurableKeyValueStore::try_init_new(&store_dir).map(|outcome| outcome.status());
+    eprintln!("locks-unsupported child open: {result:?}");
+    std::process::exit(match result {
+        Err(crate::RecoveryError::AuthorityUndetermined { .. }) => CHILD_OPEN_REFUSED,
+        Ok(_) => CHILD_OPEN_SUCCEEDED,
+        Err(_) => CHILD_OPEN_FAILED_OTHERWISE,
+    });
+}
+
+/// specs/015 FR-5 after the third review: where locks are not supported (specs/011 FR-11),
+/// another process's open is excluded by nothing, and during a live cutover it finds the cutover's
+/// split. It must not restore it: it is refused and changes nothing, and the cutover completes, as
+/// at `1eb9de5`.
+#[test]
+fn a_process_without_locks_opening_during_a_live_cutover_leaves_it_alone() {
+    use super::unpublished_attempt_tests::namespace;
+    use crate::compaction::publication::{family_artifact_paths, online_source_move_pause};
+
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("store");
+    std::fs::create_dir(&directory).unwrap();
+    let options = crate::DurableStoreOptions::default()
+        .with_wal_segment_size(crate::WalSegmentSize::try_from(170_u64).unwrap());
+    let first = DurableKeyValueStore::try_init_new_with_options(&directory, options)
+        .unwrap()
+        .into_store();
+    for index in 0..6 {
+        first
+            .try_put(format!("key-{index}").into_bytes(), b"value".to_vec())
+            .unwrap();
+    }
+    let paths = family_artifact_paths(&directory.join("kv.wal.dat")).unwrap();
+    let without_locks = |mut snapshot: super::unpublished_attempt_tests::Namespace| {
+        snapshot.remove(std::path::Path::new(".store.pigment-lock"));
+        snapshot.remove(std::path::Path::new("store/.pigment-lock"));
+        snapshot
+    };
+    let pause = online_source_move_pause::install(&paths.previous);
+    // Nothing is asserted while the cutover is parked, so a failure cannot leave it parked.
+    let (before, child, after, compacted) = std::thread::scope(|scope| {
+        let compaction =
+            scope.spawn(|| first.try_compact_online(crate::OnlineCompactionOptions::default()));
+        pause.wait_reached();
+        let before = without_locks(namespace(root.path()));
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("compaction::online_tests::locks_unsupported_open_child")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env(LOCKS_UNSUPPORTED_STORE_ENV, &directory)
+            .status();
+        let after = without_locks(namespace(root.path()));
+        pause.release();
+        (before, child, after, compaction.join().unwrap())
+    });
+    drop(pause);
+    assert!(
+        exists_in(&before, &paths.previous, root.path()),
+        "the cutover must be parked after its source moves"
+    );
+    assert_eq!(
+        child.unwrap().code(),
+        Some(CHILD_OPEN_REFUSED),
+        "a process without locks opening during a live cutover must be refused"
+    );
+    assert_eq!(after, before, "the refused open changed the directory");
+    compacted.expect("the live cutover completes");
+    first
+        .try_put(b"after".to_vec(), b"accepted".to_vec())
+        .unwrap();
+    drop(first);
+    let reopened = DurableKeyValueStore::try_init_new(&directory)
+        .unwrap()
+        .into_store();
+    for index in 0..6 {
+        assert_eq!(
+            reopened.get(format!("key-{index}").as_bytes()),
+            Some(b"value".to_vec())
+        );
+    }
+    assert_eq!(reopened.get(b"after"), Some(b"accepted".to_vec()));
+}

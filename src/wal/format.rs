@@ -584,6 +584,17 @@ impl V2CodecProbe {
         Ok(physical_end)
     }
 
+    /// The length of the whole record that starts at `bytes`, from the payload length its header
+    /// declares; `None` when that field is not all there or the length overflows.
+    pub(crate) fn record_encoded_len(bytes: &[u8]) -> Option<usize> {
+        bytes
+            .get(6..14)
+            .and_then(|value| value.try_into().ok())
+            .map(u64::from_le_bytes)
+            .and_then(|value| usize::try_from(value).ok())
+            .and_then(|payload_len| Self::EMPTY_RECORD_LEN.checked_add(payload_len))
+    }
+
     pub(crate) fn record_physical_start_is_valid(bytes: &[u8], actual_start: u64) -> bool {
         let Some(header_start) = bytes
             .get(22..30)

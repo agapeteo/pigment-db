@@ -59,10 +59,12 @@ Current-V2 snapshot and delta encoders live beside current replay code in `src/w
 
 1. Resolve any existing maintenance manifest before ordinary WAL recovery.
 2. Acquire an exclusive same-process directory lease and capture exact current-format source inventories, bytes, logical states, and timestamp metadata.
-3. Atomically publish `Prepared`, construct a same-parent staging directory, synchronize as required, reopen it, and compare every family with the capture.
-4. Re-read every source name, length, and byte before publication; reject any difference.
+3. Construct a same-parent staging directory, synchronize as required, reopen it, and compare every family with the capture.
+4. Re-read every source name, length, and byte before publication; reject any difference. Then atomically publish `Prepared`, which for a closed attempt is always finalized.
 5. Move the source to the previous-generation location, establish `PreviousPublished`, then publish the replacement and establish `ReplacementPublished`.
 6. Reopen and confirm the replacement, enter `CleanupPending`, delete only manifest-owned checksum-matching obsolete artifacts, and remove the manifest last. Cleanup failure returns a successful outcome with pending cleanup.
+
+> Corrected 2026-10-02 (specs/015 FR-6): step 3 said `Prepared` was published before staging was built; the implementation builds and validates staging first, and a closed manifest cannot be unfinalized. Staging with no manifest and no previous generation, beside a complete canonical generation holding at least one family, is unpublished-attempt debris when it holds only active-segment files of the canonical families, each of which is byte for byte what a closed compaction of the canonical generation stages for its family, or the first bytes of that encoding ending inside its header or inside one of its records; the next open or compaction removes it (contracts/compaction-authority.md, "Classification without a trustworthy manifest", which states the full conditions). Amended 2026-10-03 after specs/015's second, third, fourth and fifth reviews.
 
 ### Online coordination sequence
 

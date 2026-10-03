@@ -427,6 +427,7 @@ impl DurableKeyValueStore<File> {
                 })?;
         let maintenance_recovered = crate::compaction::recovery::resolve_store_maintenance(
             &open_lease.maintenance_path(store_dir),
+            open_lease.identity(),
             crate::compaction::inspection::InspectedFamily::KeyValue,
         )?;
         open_lease

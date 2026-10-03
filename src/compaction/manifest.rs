@@ -1005,8 +1005,10 @@ mod tests {
         assert_eq!(read_published_manifest(&paths).unwrap(), Some(prepared));
     }
 
+    /// Until specs/015 the temporary survived the failure and blocked the next publication; FR-2
+    /// makes the publication remove the temporary it created.
     #[test]
-    fn failed_temp_publication_preserves_main_phase_and_unpublished_evidence() {
+    fn failed_temp_publication_preserves_main_phase_and_removes_its_temporary() {
         let parent = tempfile::tempdir().unwrap();
         let store_dir = parent.path().join("database");
         std::fs::create_dir(&store_dir).unwrap();
@@ -1029,11 +1031,9 @@ mod tests {
         });
         assert!(failure.is_err());
         assert_eq!(read_published_manifest(&paths).unwrap(), Some(prepared));
-        assert_eq!(
-            decode_manifest(&std::fs::read(&paths.manifest_next).unwrap()).unwrap(),
-            next
-        );
-        assert!(publish_manifest_buffered(&paths, &next).is_err());
+        assert!(!paths.manifest_next.exists());
+        publish_manifest_buffered(&paths, &next).unwrap();
+        assert_eq!(read_published_manifest(&paths).unwrap(), Some(next));
     }
 
     #[test]

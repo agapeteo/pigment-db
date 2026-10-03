@@ -351,6 +351,11 @@ const TRACKED_STORAGE_STATS_STEP: (&str, &[&str]) = (
     &["cargo test maintenance::tracked_storage_stats_tests:: -- --test-threads=1"],
 );
 
+const UNPUBLISHED_ATTEMPTS_STEP: (&str, &[&str]) = (
+    "Unpublished maintenance attempts",
+    &["cargo test compaction::unpublished_attempt_tests:: -- --test-threads=1"],
+);
+
 #[test]
 fn directory_ownership_tests_run_on_every_operating_system() {
     let (name, commands) = DIRECTORY_OWNERSHIP_STEP;
@@ -369,13 +374,26 @@ fn tracked_storage_stats_seam_tests_run_on_every_operating_system() {
     );
 }
 
-/// The two pins above, against copies of the workflow in which each pinned step is gated to one
+#[test]
+fn unpublished_attempt_tests_run_on_every_operating_system() {
+    let (name, commands) = UNPUBLISHED_ATTEMPTS_STEP;
+    assert!(
+        runs_on_every_runner(&recovery_workflow(), name, commands),
+        "recovery workflow must run the unpublished maintenance attempt unit tests on every OS"
+    );
+}
+
+/// The pins above, against copies of the workflow in which each pinned step is gated to one
 /// OS: by an `if:` after its commands, by one between its name and `run:`, and by one on the
 /// step's first line. Each copy must fail the pin, and the unchanged workflow must pass it.
 #[test]
 fn a_pinned_step_gated_to_one_operating_system_fails_its_pin() {
     let workflow = recovery_workflow();
-    for (name, commands) in [DIRECTORY_OWNERSHIP_STEP, TRACKED_STORAGE_STATS_STEP] {
+    for (name, commands) in [
+        DIRECTORY_OWNERSHIP_STEP,
+        TRACKED_STORAGE_STATS_STEP,
+        UNPUBLISHED_ATTEMPTS_STEP,
+    ] {
         assert!(runs_on_every_runner(&workflow, name, commands), "{name}");
         let header = format!("      - name: {name}\n");
         let last = format!("          {}\n", commands.last().unwrap());

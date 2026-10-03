@@ -2399,6 +2399,7 @@ fn every_closed_checkpoint_process_exit_reopens_exact_state_or_preserves_explici
     let points = [
         (MaintenancePhase::Prepared, MaintenanceCut::StagingCreate),
         (MaintenancePhase::Prepared, MaintenanceCut::StagingWrite),
+        (MaintenancePhase::Prepared, MaintenanceCut::StagingWriteTorn),
         (MaintenancePhase::Prepared, MaintenanceCut::StagingSync),
         (MaintenancePhase::Prepared, MaintenanceCut::StagingValidate),
         (MaintenancePhase::Prepared, MaintenanceCut::ManifestWrite),
@@ -2497,6 +2498,20 @@ fn every_closed_checkpoint_process_exit_reopens_exact_state_or_preserves_explici
                     snapshot
                 };
             let before_reopen = without_replacement_lock(snapshot_directory(root.path()).unwrap());
+            // Before `Prepared` is renamed into place the canonical directory has never moved, so
+            // these cuts must reopen it; only later cuts may preserve evidence instead
+            // (specs/015 FR-3, FR-6).
+            let before_prepared = phase == MaintenancePhase::Prepared
+                && matches!(
+                    cut,
+                    MaintenanceCut::StagingCreate
+                        | MaintenanceCut::StagingWrite
+                        | MaintenanceCut::StagingWriteTorn
+                        | MaintenanceCut::StagingSync
+                        | MaintenanceCut::StagingValidate
+                        | MaintenanceCut::ManifestWrite
+                        | MaintenanceCut::ManifestSync
+                );
             match reopen_after_checkpoint(&store_dir, family) {
                 Ok(status) => {
                     assert_eq!(status, crate::RecoveryStatus::Recovered);
@@ -2505,6 +2520,11 @@ fn every_closed_checkpoint_process_exit_reopens_exact_state_or_preserves_explici
                     );
                 }
                 Err(error) => {
+                    assert!(
+                        !before_prepared,
+                        "{family:?} {phase:?} {cut:?}: a cut before Prepared must reopen the \
+                         untouched source, not {error:?}"
+                    );
                     assert!(
                         matches!(
                             error,

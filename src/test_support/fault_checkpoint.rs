@@ -55,6 +55,10 @@ impl MaintenancePhase {
 pub(crate) enum MaintenanceCut {
     StagingCreate,
     StagingWrite,
+    /// A closed compaction killed inside its first family's staged bytes: the file holds all of
+    /// them but the last (specs/015, fifth review). A kill inside a large `write_all` leaves a
+    /// prefix of the bytes, which ends inside a record unless it falls on a record boundary.
+    StagingWriteTorn,
     StagingSync,
     StagingValidate,
     ManifestWrite,
@@ -64,6 +68,12 @@ pub(crate) enum MaintenanceCut {
     ReplacementPublish,
     ReopenValidation,
     Cleanup,
+    /// Closed `PreviousPublished` recovery, just after the rollback's restore rename moved the
+    /// previous generation back to the canonical path (specs/015 FR-4).
+    RollbackRestore,
+    /// Closed `PreviousPublished` recovery, once the rollback has removed staging and before it
+    /// removes the manifest (specs/015 FR-4).
+    RollbackCleanup,
 }
 
 impl MaintenanceCut {
@@ -71,6 +81,7 @@ impl MaintenanceCut {
         match self {
             Self::StagingCreate => "staging-create",
             Self::StagingWrite => "staging-write",
+            Self::StagingWriteTorn => "staging-write-torn",
             Self::StagingSync => "staging-sync",
             Self::StagingValidate => "staging-validate",
             Self::ManifestWrite => "manifest-write",
@@ -80,6 +91,8 @@ impl MaintenanceCut {
             Self::ReplacementPublish => "replacement-publish",
             Self::ReopenValidation => "reopen-validation",
             Self::Cleanup => "cleanup",
+            Self::RollbackRestore => "rollback-restore",
+            Self::RollbackCleanup => "rollback-cleanup",
         }
     }
 }
@@ -111,13 +124,15 @@ impl FaultCheckpointLog {
     }
 }
 
-pub(crate) fn exit_at_maintenance_fault(point: MaintenanceFaultPoint) {
-    if std::env::var_os(MAINTENANCE_CHILD_MODE_ENV).is_none() {
-        return;
-    }
-    if std::env::var(MAINTENANCE_PHASE_ENV).as_deref() == Ok(point.phase.name())
+/// Whether this process is a maintenance child asked to stop at `point`.
+pub(crate) fn maintenance_fault_requested(point: MaintenanceFaultPoint) -> bool {
+    std::env::var_os(MAINTENANCE_CHILD_MODE_ENV).is_some()
+        && std::env::var(MAINTENANCE_PHASE_ENV).as_deref() == Ok(point.phase.name())
         && std::env::var(MAINTENANCE_CUT_ENV).as_deref() == Ok(point.cut.name())
-    {
+}
+
+pub(crate) fn exit_at_maintenance_fault(point: MaintenanceFaultPoint) {
+    if maintenance_fault_requested(point) {
         let Some(pause_dir) = std::env::var_os(MAINTENANCE_PAUSE_ENV).map(PathBuf::from) else {
             std::process::exit(MAINTENANCE_EXIT_CODE);
         };
@@ -278,7 +293,7 @@ pub(crate) fn run_maintenance_checkpoint_child_with_evidence_root(
 /// terminated process's locks asynchronously, and refuses reads of a held one; elsewhere a lock
 /// is gone once its owner is reaped.
 #[cfg(windows)]
-fn wait_for_released_lock_files(root: &Path) {
+pub(crate) fn wait_for_released_lock_files(root: &Path) {
     fn lock_files(directory: &Path, found: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(directory) else {
             return;
@@ -365,6 +380,7 @@ mod tests {
         let cuts = [
             MaintenanceCut::StagingCreate,
             MaintenanceCut::StagingWrite,
+            MaintenanceCut::StagingWriteTorn,
             MaintenanceCut::StagingSync,
             MaintenanceCut::StagingValidate,
             MaintenanceCut::ManifestWrite,
@@ -374,8 +390,10 @@ mod tests {
             MaintenanceCut::ReplacementPublish,
             MaintenanceCut::ReopenValidation,
             MaintenanceCut::Cleanup,
+            MaintenanceCut::RollbackRestore,
+            MaintenanceCut::RollbackCleanup,
         ];
         assert_eq!(phases.map(MaintenancePhase::name).len(), 4);
-        assert_eq!(cuts.map(MaintenanceCut::name).len(), 11);
+        assert_eq!(cuts.map(MaintenanceCut::name).len(), 14);
     }
 }

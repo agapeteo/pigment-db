@@ -68,6 +68,9 @@ jobs:
       - name: Tracked storage stats seams
         run: |
           cargo test maintenance::tracked_storage_stats_tests:: -- --test-threads=1
+      - name: Unpublished maintenance attempts
+        run: |
+          cargo test compaction::unpublished_attempt_tests:: -- --test-threads=1
       - name: Physical durability capability and publication matrix
         run: cargo test --test durable_write_policy public_ -- --test-threads=1
       - name: Windows physical durability and buffered compatibility matrix

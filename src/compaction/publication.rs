@@ -518,6 +518,8 @@ pub(crate) fn publish_online_previous(
             },
         )?;
     }
+    #[cfg(test)]
+    online_source_move_pause::reached(&paths.previous);
     let mut next = manifest.clone();
     next.phase = ManifestPhase::PreviousPublished;
     publish_manifest_for_policy(paths, &next, manifest.durability)?;
@@ -703,12 +705,35 @@ fn publish_manifest_with_checkpoint(
     durability: DurabilityPolicy,
     mut checkpoint: impl FnMut(ManifestPublishStage) -> io::Result<()>,
 ) -> io::Result<()> {
+    #[cfg(test)]
+    let mut checkpoint = {
+        let publication = manifest_publication_faults::begin(&paths.manifest_next);
+        let temporary = paths.manifest_next.clone();
+        move |stage: ManifestPublishStage| {
+            manifest_publication_faults::at(&temporary, publication, stage)?;
+            checkpoint(stage)
+        }
+    };
     let encoded = encode_manifest(manifest)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("{error:?}")))?;
+    // Resolved once, before the temporary is created, so that this publication creates, renames
+    // and on failure removes the same entries whatever the process's working directory does
+    // meanwhile (specs/015 FR-2, fourth review). A path whose parent does not resolve is used as
+    // the caller spelled it, and then creating the temporary fails anyway.
+    let temporary_path =
+        super::resolved_beside(&paths.manifest_next).unwrap_or_else(|| paths.manifest_next.clone());
+    let manifest_path =
+        super::resolved_beside(&paths.manifest).unwrap_or_else(|| paths.manifest.clone());
+    // Declared before the file, so the file is closed before the temporary is removed.
+    let mut owned_temporary = UnpublishedManifestTemporary {
+        path: &temporary_path,
+        armed: false,
+    };
     let mut temporary = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&paths.manifest_next)?;
+        .open(&temporary_path)?;
+    owned_temporary.armed = true;
     checkpoint(ManifestPublishStage::Created)?;
     temporary.write_all(&encoded)?;
     checkpoint(ManifestPublishStage::Written)?;
@@ -728,15 +753,16 @@ fn publish_manifest_with_checkpoint(
         crate::test_support::fault_checkpoint::MaintenanceCut::ManifestSync,
     );
     drop(temporary);
-    let mode = match fs::symlink_metadata(&paths.manifest) {
+    let mode = match fs::symlink_metadata(&manifest_path) {
         Ok(_) => crate::durability::NamespaceMoveMode::ReplaceExisting,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             crate::durability::NamespaceMoveMode::NoReplace
         }
         Err(error) => return Err(error),
     };
-    crate::durability::move_namespace(&paths.manifest_next, &paths.manifest, durability, mode)?;
-    crate::durability::synchronize_namespace_after_move(&paths.manifest, durability)?;
+    crate::durability::move_namespace(&temporary_path, &manifest_path, durability, mode)?;
+    owned_temporary.armed = false;
+    crate::durability::synchronize_namespace_after_move(&manifest_path, durability)?;
     checkpoint(ManifestPublishStage::Renamed)?;
     #[cfg(test)]
     exit_at_manifest_fault(
@@ -744,6 +770,32 @@ fn publish_manifest_with_checkpoint(
         crate::test_support::fault_checkpoint::MaintenanceCut::ManifestPublish,
     );
     Ok(())
+}
+
+/// The manifest temporary one publication created, from its `create_new` until its rename
+/// (specs/015 FR-2). Dropped while still armed -- the publication failed or panicked before the
+/// rename -- it removes the temporary, which no manifest names and which never advances the
+/// durable phase. A temporary the publication did not create is never armed.
+struct UnpublishedManifestTemporary<'a> {
+    path: &'a Path,
+    armed: bool,
+}
+
+impl Drop for UnpublishedManifestTemporary<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match fs::remove_file(self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => log::warn!(
+                "could not remove unpublished manifest temporary {}: {error}; the next open or \
+                 compaction removes it",
+                self.path.display()
+            ),
+        }
+    }
 }
 
 fn synchronize_publication_parent(
@@ -804,3 +856,246 @@ pub(crate) fn read_published_manifest(
 
 #[cfg(test)]
 pub(crate) fn test_sentinel() {}
+
+/// Makes one manifest publication fail or panic at one stage (specs/015), so that the real closed
+/// and online paths can be driven through a failed publication. An injection names the temporary
+/// a publication writes, read through its canonical parent, so tests running in parallel do not
+/// see each other's, and counts that temporary's publications from the injection on.
+#[cfg(test)]
+pub(crate) mod manifest_publication_faults {
+    use super::ManifestPublishStage;
+    use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    /// What the chosen stage does instead of continuing.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Fault {
+        Error,
+        Panic,
+    }
+
+    struct Injected {
+        temporary: PathBuf,
+        publication: usize,
+        stage: ManifestPublishStage,
+        fault: Fault,
+        started: usize,
+    }
+
+    static INJECTED: Mutex<Vec<Injected>> = Mutex::new(Vec::new());
+
+    fn injected() -> MutexGuard<'static, Vec<Injected>> {
+        INJECTED.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn key(temporary: &Path) -> PathBuf {
+        match (
+            temporary
+                .parent()
+                .and_then(|parent| std::fs::canonicalize(parent).ok()),
+            temporary.file_name(),
+        ) {
+            (Some(parent), Some(name)) => parent.join(name),
+            _ => temporary.to_path_buf(),
+        }
+    }
+
+    /// Removes its injection when dropped.
+    pub(crate) struct Injection {
+        temporary: PathBuf,
+    }
+
+    impl Drop for Injection {
+        fn drop(&mut self) {
+            injected().retain(|injected| injected.temporary != self.temporary);
+        }
+    }
+
+    /// The `publication`-th publication (from 1) of `temporary` after this call meets `fault` at
+    /// `stage`. `Renamed` is reached only after the rename, so a fault there stands for a failure
+    /// after the new manifest is in place.
+    pub(crate) fn inject(
+        temporary: &Path,
+        publication: usize,
+        stage: ManifestPublishStage,
+        fault: Fault,
+    ) -> Injection {
+        let temporary = key(temporary);
+        let mut injected = injected();
+        assert!(
+            injected.iter().all(|other| other.temporary != temporary),
+            "one injection per manifest temporary"
+        );
+        injected.push(Injected {
+            temporary: temporary.clone(),
+            publication,
+            stage,
+            fault,
+            started: 0,
+        });
+        Injection { temporary }
+    }
+
+    /// Counts a publication of `temporary` and returns its ordinal, or 0 when nothing is injected.
+    pub(super) fn begin(temporary: &Path) -> usize {
+        if injected().is_empty() {
+            return 0;
+        }
+        let temporary = key(temporary);
+        let mut injected = injected();
+        match injected
+            .iter_mut()
+            .find(|injected| injected.temporary == temporary)
+        {
+            Some(injected) => {
+                injected.started += 1;
+                injected.started
+            }
+            None => 0,
+        }
+    }
+
+    /// Applies the fault injected for this publication at this stage, if any.
+    pub(super) fn at(
+        temporary: &Path,
+        publication: usize,
+        stage: ManifestPublishStage,
+    ) -> io::Result<()> {
+        if publication == 0 {
+            return Ok(());
+        }
+        let temporary = key(temporary);
+        let fault = injected()
+            .iter()
+            .find(|injected| {
+                injected.temporary == temporary
+                    && injected.publication == publication
+                    && injected.stage == stage
+            })
+            .map(|injected| injected.fault);
+        match fault {
+            None => Ok(()),
+            Some(Fault::Error) => Err(io::Error::other(format!(
+                "injected manifest publication failure at {stage:?}"
+            ))),
+            Some(Fault::Panic) => panic!("injected manifest publication panic at {stage:?}"),
+        }
+    }
+}
+
+/// Parks an online cutover once it has moved its source artifacts into the previous directory and
+/// before it publishes `PreviousPublished` (specs/015), so that a test can open the family while
+/// that cutover is live. A pause names the previous directory, read through its canonical parent,
+/// so tests running in parallel do not see each other's.
+#[cfg(test)]
+pub(crate) mod online_source_move_pause {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+    use std::time::Duration;
+
+    /// How long either side waits for the other. A cutover whose pause is never released goes on
+    /// after it, so a failing test cannot park it for ever.
+    const WATCHDOG: Duration = Duration::from_secs(30);
+
+    /// `(reached, released)`.
+    #[derive(Default)]
+    struct Gate {
+        state: Mutex<(bool, bool)>,
+        changed: Condvar,
+    }
+
+    impl Gate {
+        fn state(&self) -> MutexGuard<'_, (bool, bool)> {
+            self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+    }
+
+    type Installed = Vec<(PathBuf, Arc<Gate>)>;
+
+    static PAUSES: Mutex<Installed> = Mutex::new(Vec::new());
+
+    fn pauses() -> MutexGuard<'static, Installed> {
+        PAUSES.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn key(previous: &Path) -> PathBuf {
+        match (
+            previous
+                .parent()
+                .and_then(|parent| std::fs::canonicalize(parent).ok()),
+            previous.file_name(),
+        ) {
+            (Some(parent), Some(name)) => parent.join(name),
+            _ => previous.to_path_buf(),
+        }
+    }
+
+    /// A pause of the cutover whose previous directory is the one installed. Dropping it releases
+    /// the cutover and removes the pause.
+    pub(crate) struct Pause {
+        key: PathBuf,
+        gate: Arc<Gate>,
+    }
+
+    /// The next cutover moving its source into `previous` parks before `PreviousPublished`.
+    pub(crate) fn install(previous: &Path) -> Pause {
+        let key = key(previous);
+        let gate = Arc::new(Gate::default());
+        let mut pauses = pauses();
+        assert!(
+            pauses.iter().all(|(other, _)| *other != key),
+            "one pause per previous directory"
+        );
+        pauses.push((key.clone(), Arc::clone(&gate)));
+        Pause { key, gate }
+    }
+
+    impl Pause {
+        /// Waits until the cutover is parked.
+        pub(crate) fn wait_reached(&self) {
+            let state = self.gate.state();
+            let (state, _) = self
+                .gate
+                .changed
+                .wait_timeout_while(state, WATCHDOG, |(reached, _)| !*reached)
+                .unwrap_or_else(PoisonError::into_inner);
+            assert!(state.0, "the cutover never reached its source-move pause");
+        }
+
+        /// Lets the parked cutover go on.
+        pub(crate) fn release(&self) {
+            self.gate.state().1 = true;
+            self.gate.changed.notify_all();
+        }
+    }
+
+    impl Drop for Pause {
+        fn drop(&mut self) {
+            self.release();
+            pauses().retain(|(key, _)| *key != self.key);
+        }
+    }
+
+    /// Parks here while a pause is installed for `previous` and not released.
+    pub(super) fn reached(previous: &Path) {
+        if pauses().is_empty() {
+            return;
+        }
+        let key = key(previous);
+        let Some(gate) = pauses()
+            .iter()
+            .find(|(installed, _)| *installed == key)
+            .map(|(_, gate)| Arc::clone(gate))
+        else {
+            return;
+        };
+        let mut state = gate.state();
+        state.0 = true;
+        gate.changed.notify_all();
+        let _ = gate
+            .changed
+            .wait_timeout_while(state, WATCHDOG, |(_, released)| !*released)
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+}

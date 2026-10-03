@@ -94,7 +94,7 @@ struct FamilyArtifacts {
     sealed: BTreeMap<u64, PathBuf>,
 }
 
-fn family_for_active_name(name: &std::ffi::OsStr) -> Option<InspectedFamily> {
+pub(super) fn family_for_active_name(name: &std::ffi::OsStr) -> Option<InspectedFamily> {
     [
         InspectedFamily::KeyValue,
         InspectedFamily::KeySet,

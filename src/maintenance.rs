@@ -271,7 +271,9 @@ pub enum CompactionOperation {
     PublishReplacement,
     /// Reopening the published replacement.
     ReopenReplacement,
-    /// Removing descriptor-proven obsolete artifacts.
+    /// Removing obsolete maintenance artifacts: those a manifest's descriptors prove obsolete, and
+    /// the debris of an attempt that never published its manifest, once recovery has proved that
+    /// removing it loses nothing.
     Cleanup,
 }
 

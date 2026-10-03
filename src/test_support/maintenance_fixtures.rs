@@ -73,7 +73,7 @@ pub(crate) fn snapshot_directory(root: &Path) -> io::Result<DirectoryByteSnapsho
 /// These fixtures stand for a directory an earlier process wrote and closed, which the tests hand
 /// to the closed-compaction pipeline below its claim. The claim retires the directory's inner lock
 /// file before any of that pipeline runs (specs/011 FR-4), so the fixture does the same.
-fn forget_inner_lock(root: &Path) {
+pub(crate) fn forget_inner_lock(root: &Path) {
     match std::fs::remove_file(root.join(crate::maintenance_coordination::INNER_LOCK_NAME)) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

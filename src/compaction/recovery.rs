@@ -18,25 +18,38 @@ use super::publication::{
 };
 use crate::{CompactionError, CompactionOperation, RecoveryError, RecoveryOperation, StoreFamily};
 
-pub(crate) fn resolve_directory_maintenance(store_dir: &Path) -> Result<bool, RecoveryError> {
-    resolve_directory_maintenance_for_compaction(store_dir)
+/// Recovers the directory's closed maintenance. `locked` is the directory the caller's open lease
+/// or closed claim locked (its identity, specs/011): the closed discard acts only there.
+pub(crate) fn resolve_directory_maintenance(
+    store_dir: &Path,
+    locked: &Path,
+) -> Result<bool, RecoveryError> {
+    resolve_directory_maintenance_for_compaction(store_dir, locked)
         .map_err(|error| map_compaction_recovery_error(store_dir, error))
 }
 
 pub(crate) fn resolve_store_maintenance(
     store_dir: &Path,
+    locked: &Path,
     family: super::inspection::InspectedFamily,
 ) -> Result<bool, RecoveryError> {
     match fs::metadata(store_dir) {
         Ok(metadata) if !metadata.is_dir() => return Ok(false),
         _ => {}
     }
-    let directory_recovered = resolve_directory_maintenance(store_dir)?;
+    let directory_recovered = resolve_directory_maintenance(store_dir, locked)?;
+    #[cfg(test)]
+    recovery_pause::reached(store_dir, recovery_pause::Point::FamilyRecovery);
     let online_recovered = resolve_online_maintenance_for_compaction(store_dir, family)
         .map_err(|error| map_compaction_recovery_error(store_dir, error))?;
     Ok(directory_recovered || online_recovered)
 }
 
+/// Recovers a family's online maintenance. A lone manifest temporary and a source split by a
+/// cutover's moves keep their errors (specs/015, third review): a live online attempt of another
+/// open instance of the family -- in this process, or in another where locks are not supported
+/// (specs/011 FR-11) -- writes exactly that temporary and leaves exactly that split, and nothing
+/// lets recovery tell such an attempt from debris.
 pub(crate) fn resolve_online_maintenance_for_compaction(
     store_dir: &Path,
     family: super::inspection::InspectedFamily,
@@ -215,6 +228,7 @@ pub(crate) fn recover_online_cleanup_with_checkpoint(
 
 pub(crate) fn resolve_directory_maintenance_for_compaction(
     store_dir: &Path,
+    locked: &Path,
 ) -> Result<bool, CompactionError> {
     let paths = directory_artifact_paths(store_dir).map_err(|source| CompactionError::Io {
         operation: CompactionOperation::Inspect,
@@ -224,6 +238,9 @@ pub(crate) fn resolve_directory_maintenance_for_compaction(
     let mut manifest = match read_published_manifest(&paths) {
         Ok(Some(manifest)) => manifest,
         Ok(None) => {
+            if discard_unpublished_closed_attempt(store_dir, locked, &paths)? {
+                return Ok(true);
+            }
             return classify_untrusted_closed_authority(store_dir, &paths).map(|()| false);
         }
         Err(_) => {
@@ -256,6 +273,183 @@ pub(crate) fn resolve_directory_maintenance_for_compaction(
             }
         }
     }
+}
+
+/// What is at a path, read without following a final symlink.
+///
+/// The specs/015 rule that removes unpublished-attempt debris proves its state before it removes
+/// anything, and a path it cannot read proves nothing: `Unknown` makes it leave the state to the
+/// checks that follow, which answer as before specs/015. Only a removal that fails after the proof
+/// returns its I/O error (FR-7).
+enum PathEntry {
+    Absent,
+    Present(fs::Metadata),
+    Unknown,
+}
+
+impl PathEntry {
+    fn read(path: &Path) -> Self {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => Self::Present(metadata),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Self::Absent,
+            Err(_) => Self::Unknown,
+        }
+    }
+
+    fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+
+    /// Absent, or present and of the kind `kind` accepts.
+    fn is_absent_or(&self, kind: fn(&fs::Metadata) -> bool) -> bool {
+        match self {
+            Self::Absent => true,
+            Self::Present(metadata) => kind(metadata),
+            Self::Unknown => false,
+        }
+    }
+
+    /// Present and of the kind `kind` accepts.
+    fn is_present_and(&self, kind: fn(&fs::Metadata) -> bool) -> bool {
+        match self {
+            Self::Present(metadata) => kind(metadata),
+            Self::Absent | Self::Unknown => false,
+        }
+    }
+}
+
+/// The names of `directory`'s entries when every one is a regular file; `None` when one is not,
+/// or when the directory cannot be read.
+fn regular_file_names(directory: &Path) -> Option<Vec<OsString>> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(directory).ok()? {
+        let entry = entry.ok()?;
+        if !entry.file_type().ok()?.is_file() {
+            return None;
+        }
+        names.push(entry.file_name());
+    }
+    Some(names)
+}
+
+fn is_real_directory(metadata: &fs::Metadata) -> bool {
+    metadata.is_dir() && !metadata.file_type().is_symlink()
+}
+
+fn is_regular_file(metadata: &fs::Metadata) -> bool {
+    metadata.is_file() && !metadata.file_type().is_symlink()
+}
+
+/// Removes what a closed compaction leaves when it stops before its `Prepared` manifest is
+/// published (specs/015 FR-3), and reports whether it removed anything. The caller has read the
+/// main manifest and found none; nothing at all may be at its path either (a symlink to nothing
+/// is not an absent manifest). Publication moves the canonical directory only after `Prepared`
+/// is durable, so with no main manifest and no previous generation a complete canonical
+/// directory holding at least one family is the authority, and nothing names the staging. Only
+/// what compaction itself writes is removed: a staging directory holding nothing but
+/// active-segment files of families the canonical directory holds, and a regular
+/// `.manifest.next`. And the staging is removed only when each staged file is byte for byte what
+/// a closed compaction of the canonical directory stages for its family, or a write of those bytes
+/// stopped inside the header or a record (specs/015's third, fourth and fifth reviews): a
+/// canonical directory changed outside the exclusion -- truncated at a record boundary, or rolled
+/// back -- still validates, and the staging may then be the only copy of what it lost, a delete
+/// included.
+///
+/// Every path it reads or removes is resolved once, here, from the directory `locked` -- the one
+/// the caller's open lease or closed claim locked -- and only while the caller's spelling still
+/// names it. So the state it proves and the entries it removes are in the same directory, and in
+/// the one whose locks are held, whatever the working directory or a symlink on the caller's path
+/// does meanwhile (fourth review). Errors still name the caller's spelling.
+///
+/// Anything else -- a path it cannot read included -- leaves every path as it is, for the
+/// classification that follows.
+fn discard_unpublished_closed_attempt(
+    store_dir: &Path,
+    locked: &Path,
+    paths: &MaintenanceArtifactPaths,
+) -> Result<bool, CompactionError> {
+    #[cfg(test)]
+    recovery_pause::reached(store_dir, recovery_pause::Point::DiscardEntry);
+    let Ok(directory) = fs::canonicalize(store_dir) else {
+        return Ok(false);
+    };
+    if directory != locked {
+        return Ok(false);
+    }
+    #[cfg(test)]
+    recovery_pause::reached(&directory, recovery_pause::Point::DiscardIdentified);
+    let Ok(at) = directory_artifact_paths(&directory) else {
+        return Ok(false);
+    };
+    let staging = PathEntry::read(&at.staging);
+    let manifest_next = PathEntry::read(&at.manifest_next);
+    if staging.is_absent() && manifest_next.is_absent() {
+        return Ok(false);
+    }
+    if !PathEntry::read(&at.manifest).is_absent()
+        || !PathEntry::read(&at.previous).is_absent()
+        || !manifest_next.is_absent_or(is_regular_file)
+        || !staging.is_absent_or(is_real_directory)
+    {
+        return Ok(false);
+    }
+    let staged_names = if staging.is_absent() {
+        Vec::new()
+    } else {
+        let Some(names) = regular_file_names(&at.staging) else {
+            return Ok(false);
+        };
+        names
+    };
+    // The names first, before the canonical directory is validated: each must be an active
+    // segment's with a regular file of that name in the canonical directory.
+    if !staged_names.iter().all(|name| {
+        super::inspection::family_for_active_name(name).is_some()
+            && PathEntry::read(&directory.join(name)).is_present_and(is_regular_file)
+    }) {
+        return Ok(false);
+    }
+    let Ok(canonical) = super::inspection::inspect_generation(&directory) else {
+        return Ok(false);
+    };
+    let canonical_names = canonical
+        .families
+        .iter()
+        .map(|family| OsString::from(family.family.active_name()))
+        .collect::<BTreeSet<_>>();
+    if canonical_names.is_empty()
+        || !staged_names
+            .iter()
+            .all(|name| canonical_names.contains(name))
+    {
+        return Ok(false);
+    }
+    if !staged_names.is_empty()
+        && !super::staging_is_what_compaction_stages_or_a_torn_write_of_it(
+            &directory,
+            &at.staging,
+            &canonical,
+        )
+    {
+        return Ok(false);
+    }
+    #[cfg(test)]
+    recovery_pause::reached(&directory, recovery_pause::Point::DiscardProved);
+    if !staging.is_absent() {
+        fs::remove_dir_all(&at.staging).map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::Cleanup,
+            path: paths.staging.clone(),
+            source,
+        })?;
+    }
+    if !manifest_next.is_absent() {
+        fs::remove_file(&at.manifest_next).map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::Cleanup,
+            path: paths.manifest_next.clone(),
+            source,
+        })?;
+    }
+    Ok(true)
 }
 
 fn remove_unpublished_manifest_temp(
@@ -658,33 +852,66 @@ pub(crate) fn recover_previous_published_closed(
             path: store_dir.to_path_buf(),
             source,
         })?;
+        #[cfg(test)]
+        crate::test_support::fault_checkpoint::exit_at_maintenance_fault(
+            crate::test_support::fault_checkpoint::MaintenanceFaultPoint {
+                phase: crate::test_support::fault_checkpoint::MaintenancePhase::PreviousPublished,
+                cut: crate::test_support::fault_checkpoint::MaintenanceCut::RollbackRestore,
+            },
+        );
         if !generation_matches(store_dir, &manifest.source_inventory) {
             return Err(authority_undetermined(store_dir, paths));
         }
-        if path_exists(&paths.staging)? {
-            let metadata =
-                fs::symlink_metadata(&paths.staging).map_err(|source| CompactionError::Io {
-                    operation: CompactionOperation::Cleanup,
-                    path: paths.staging.clone(),
-                    source,
-                })?;
-            if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                return Err(authority_undetermined(store_dir, paths));
-            }
-            fs::remove_dir_all(&paths.staging).map_err(|source| CompactionError::Io {
+        return finish_closed_rollback(store_dir, paths);
+    }
+    // A rollback interrupted after its restore rename, before or after it removed staging
+    // (specs/015 FR-4). The forward path never leaves the source at the canonical path with no
+    // previous generation, so only the rollback did this: the source is the verified authority
+    // again, and any staging is what the rollback had already decided to discard.
+    if canonical_exists
+        && !previous_exists
+        && generation_matches(store_dir, &manifest.source_inventory)
+    {
+        return finish_closed_rollback(store_dir, paths);
+    }
+    Err(authority_undetermined(store_dir, paths))
+}
+
+/// The end of a closed rollback, once the verified source is back at the canonical path: remove
+/// the staging directory, then the manifest.
+fn finish_closed_rollback(
+    store_dir: &Path,
+    paths: &MaintenanceArtifactPaths,
+) -> Result<RecoveredAuthority, CompactionError> {
+    if path_exists(&paths.staging)? {
+        let metadata =
+            fs::symlink_metadata(&paths.staging).map_err(|source| CompactionError::Io {
                 operation: CompactionOperation::Cleanup,
                 path: paths.staging.clone(),
                 source,
             })?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(authority_undetermined(store_dir, paths));
         }
-        fs::remove_file(&paths.manifest).map_err(|source| CompactionError::Io {
+        fs::remove_dir_all(&paths.staging).map_err(|source| CompactionError::Io {
             operation: CompactionOperation::Cleanup,
-            path: paths.manifest.clone(),
+            path: paths.staging.clone(),
             source,
         })?;
-        return Ok(RecoveredAuthority::Previous);
     }
-    Err(authority_undetermined(store_dir, paths))
+    #[cfg(test)]
+    crate::test_support::fault_checkpoint::exit_at_maintenance_fault(
+        crate::test_support::fault_checkpoint::MaintenanceFaultPoint {
+            phase: crate::test_support::fault_checkpoint::MaintenancePhase::PreviousPublished,
+            cut: crate::test_support::fault_checkpoint::MaintenanceCut::RollbackCleanup,
+        },
+    );
+    fs::remove_file(&paths.manifest).map_err(|source| CompactionError::Io {
+        operation: CompactionOperation::Cleanup,
+        path: paths.manifest.clone(),
+        source,
+    })?;
+    Ok(RecoveredAuthority::Previous)
 }
 
 pub(crate) fn recover_replacement_published_closed(
@@ -1268,7 +1495,7 @@ fn path_exists(path: &Path) -> Result<bool, CompactionError> {
     }
 }
 
-fn generation_matches(location: &Path, descriptors: &[ArtifactDescriptor]) -> bool {
+pub(super) fn generation_matches(location: &Path, descriptors: &[ArtifactDescriptor]) -> bool {
     let Ok(metadata) = fs::symlink_metadata(location) else {
         return false;
     };
@@ -1366,3 +1593,126 @@ pub(crate) fn classify_untrusted_directory_generations(
 
 #[cfg(test)]
 pub(crate) fn test_sentinel() {}
+
+/// Parks the first arrival at one point of recovery for one store directory (specs/015), so that a
+/// test can act on the directory while that recovery is parked:
+/// - `FamilyRecovery`: an open whose directory-level recovery has run, before its family recovery
+///   (third review), so that the family can be opened again and an online attempt started;
+/// - `DiscardEntry` and `DiscardProved`: the closed discard (plan D3), on entry and once it has
+///   proved the debris redundant, before its first removal (fourth review), so that a test can
+///   change what the caller's path names, or run a second open through the same discard.
+///
+/// A pause names the store directory through its canonical path when it is reached, so tests
+/// running in parallel do not see each other's.
+#[cfg(test)]
+pub(crate) mod recovery_pause {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+    use std::time::Duration;
+
+    /// How long either side waits for the other, so a failing test cannot park an open for ever.
+    const WATCHDOG: Duration = Duration::from_secs(30);
+
+    /// Where recovery parks.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(crate) enum Point {
+        FamilyRecovery,
+        DiscardEntry,
+        /// Once the discard has found the caller's path naming the directory it locked, before
+        /// it reads anything there.
+        DiscardIdentified,
+        DiscardProved,
+    }
+
+    /// `(reached, released)`.
+    #[derive(Default)]
+    struct Gate {
+        state: Mutex<(bool, bool)>,
+        changed: Condvar,
+    }
+
+    impl Gate {
+        fn state(&self) -> MutexGuard<'_, (bool, bool)> {
+            self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+    }
+
+    type Installed = Vec<((PathBuf, Point), Arc<Gate>)>;
+
+    static PAUSES: Mutex<Installed> = Mutex::new(Vec::new());
+
+    fn pauses() -> MutexGuard<'static, Installed> {
+        PAUSES.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A pause of the next recovery of the installed directory at its point. Dropping it releases
+    /// that recovery.
+    pub(crate) struct Pause {
+        key: (PathBuf, Point),
+        gate: Arc<Gate>,
+    }
+
+    /// The next recovery of `store_dir` to reach `point` parks there; later ones pass.
+    pub(crate) fn install(store_dir: &Path, point: Point) -> Pause {
+        let key = (std::fs::canonicalize(store_dir).unwrap(), point);
+        let gate = Arc::new(Gate::default());
+        let mut pauses = pauses();
+        assert!(
+            pauses.iter().all(|(other, _)| *other != key),
+            "one pause per store directory and point"
+        );
+        pauses.push((key.clone(), Arc::clone(&gate)));
+        Pause { key, gate }
+    }
+
+    impl Pause {
+        /// Waits until a recovery is parked.
+        pub(crate) fn wait_reached(&self) {
+            let state = self.gate.state();
+            let (state, _) = self
+                .gate
+                .changed
+                .wait_timeout_while(state, WATCHDOG, |(reached, _)| !*reached)
+                .unwrap_or_else(PoisonError::into_inner);
+            assert!(state.0, "no recovery reached its pause at {:?}", self.key.1);
+        }
+
+        /// Lets the parked recovery go on.
+        pub(crate) fn release(&self) {
+            self.gate.state().1 = true;
+            self.gate.changed.notify_all();
+        }
+    }
+
+    impl Drop for Pause {
+        fn drop(&mut self) {
+            self.release();
+            pauses().retain(|(key, _)| *key != self.key);
+        }
+    }
+
+    /// Parks here, once, while a pause is installed for `store_dir` at `point`.
+    pub(super) fn reached(store_dir: &Path, point: Point) {
+        if pauses().is_empty() {
+            return;
+        }
+        let Ok(directory) = std::fs::canonicalize(store_dir) else {
+            return;
+        };
+        let key = (directory, point);
+        let gate = {
+            let mut pauses = pauses();
+            let Some(index) = pauses.iter().position(|(installed, _)| *installed == key) else {
+                return;
+            };
+            pauses.remove(index).1
+        };
+        let mut state = gate.state();
+        state.0 = true;
+        gate.changed.notify_all();
+        let _ = gate
+            .changed
+            .wait_timeout_while(state, WATCHDOG, |(_, released)| !*released)
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+}

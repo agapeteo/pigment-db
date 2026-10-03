@@ -965,6 +965,11 @@ impl OpenDirectoryLease {
     pub(crate) fn maintenance_path(&self, store_dir: &Path) -> PathBuf {
         maintenance_path_for(store_dir, &self.identity)
     }
+
+    /// The directory this lease's locks were taken for, resolved when it was admitted.
+    pub(crate) fn identity(&self) -> &Path {
+        &self.identity
+    }
 }
 
 impl Drop for OpenDirectoryLease {
@@ -983,6 +988,11 @@ pub(crate) struct ClosedDirectoryClaim {
 }
 
 impl ClosedDirectoryClaim {
+    /// The directory this claim's locks were taken for, resolved when it was admitted.
+    pub(crate) fn identity(&self) -> &Path {
+        &self.identity
+    }
+
     /// Takes the directory's inner lock once the claim has recovered earlier maintenance.
     pub(crate) fn ensure_inner_lock(&self) -> io::Result<()> {
         ensure_inner_lock(&self.identity)
