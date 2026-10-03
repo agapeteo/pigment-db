@@ -98,3 +98,143 @@ reinstalled), or confirm it against the writer's tracked chain rather than a fre
 treat a later mismatch caused only by rotation past the prefix as `Pending` rather than
 `AuthorityUndetermined`. This changes a recovery decision, so it needs its own specification and
 the recovery fault matrix (Principle II).
+
+## Deferred: two drafted specifications (2026-10-03)
+
+Found by the same investigation as specs/014 and specs/015, drafted, and deferred by the maintainer
+on 2026-10-03: once the motivating consumer compacts its stores online, neither blocks it. Each is
+recorded here with its evidence so it can be approved and numbered later. Neither has been reviewed.
+
+### Draft A: directory maintenance through any path spelling
+
+#### Directory maintenance through any spelling
+
+**Motivation (provenance):** found while measuring penpack finding V415. penpack opens its stores
+through a one-component relative path (`-d db`). A closed compaction given such a path (`"db"`)
+fails validation every time, with `InvalidArtifact` naming the staging copy of the key/value WAL,
+and open-time recovery of any closed-compaction manifest through such a path cannot verify anything
+and returns `AuthorityUndetermined`, even in the phases it recovers through `"./db"`.
+
+The cause: for a one-component relative path, `Path::parent()` is the empty path, not `"."`.
+Directory-level maintenance (closed compaction, `inspect_storage`, and manifest-driven recovery at
+open) places and verifies its sibling artifacts beside that parent, and verification canonicalizes
+it, which fails. Spec 011's lock layer and every open already read the directory through one rule
+(`maintenance_path_for`, which reads paths lexically and switches to the directory's identity where
+the spelling does not name it). Closed compaction and inspection never adopted that rule, so they
+also mishandle `"db/."` and an absolute path ending in `"/."` (the rename after `Prepared` fails with
+`EBUSY`), refuse `"."`, and compact a symlink's own name instead of the directory it names.
+
+##### User scenarios and requirements
+
+- **FR-1 (P1): one path rule for directory-level maintenance.**
+  - `compact_directory_in_place` and `inspect_storage` derive every artifact location from the same
+    maintenance path an open derives, for every spelling an open accepts: a one-component relative
+    path, a trailing separator, a trailing `"."`, `"./"` and `"../"` forms, and absolute paths.
+  - Recovery of a closed-compaction manifest at open succeeds through every such spelling in every
+    phase it succeeds through an absolute path.
+- **FR-2: no empty anchor.**
+  - Wherever maintenance verifies or synchronizes a parent directory, an empty parent means the
+    current directory. No future caller can reintroduce the empty-anchor failure.
+- **FR-3: the current directory and symlinks.**
+  - A spelling whose directory is the process's current directory (`"."`) is refused with an error
+    naming it, before any file is created.
+  - A spelling through a symlink compacts and inspects the directory the symlink names, beside that
+    directory's replacement lock, and leaves the symlink in place. Inspection and compaction through
+    the symlink see the directory's own maintenance evidence.
+- **FR-4: errors keep naming what the caller gave.**
+  - Error paths name the caller's spelling where today they do, as spec 011 requires; only the
+    location of artifacts and the identity used for verification change.
+- **FR-5: compatibility.**
+  - Manifests record leaf names only, so no manifest or persisted format changes, and binaries on
+    either side of this change recover each other's manifests for every lexical spelling.
+  - A symlink spelling's artifacts move from beside the link to beside the directory. Debris an
+    older version left beside a link (`.<link>.pigment-compact.*`) is no longer seen by closed
+    compaction, as opens already do not see it; this is stated in the rustdoc and release notes.
+  - Spec 011's Known limitation about closed maintenance through a symlink is retired.
+
+##### Acceptance
+
+- In a child process whose current directory is the store's parent, `compact_directory_in_place`
+  succeeds through `"store"`, `"store/"` and `"store/."`, under both durability policies, leaving no
+  maintenance artifact, and the store reopens with its state.
+- Through an absolute path ending in `"/."`, compaction succeeds and leaves no manifest or staging.
+- After a closed compaction is interrupted at `Prepared`, `PreviousPublished`,
+  `ReplacementPublished` and `CleanupPending`, an open through `"store"` in a child process recovers
+  (`Recovered`), with the expected state, and a later write survives a reopen through the absolute
+  path.
+- `"."` is refused by compaction and inspection with no file created.
+- Through a symlink (same directory and another directory, Unix): compaction succeeds with cleanup
+  complete, the link is still a link, the directory is compacted in place, no artifact is named for
+  the link, and a write through either spelling reads back through the other after reopening. With
+  stranded staging beside the directory, inspection and compaction through the link return the
+  directory's error and change nothing.
+- Full suites and builds pass on every operating system CI runs, including Windows' verbatim and
+  short-name spellings.
+
+### Draft B: replay and inspection memory
+
+#### Replay and inspection memory
+
+**Motivation (provenance):** penpack finding V415. A key/value WAL of 2.67 GB holding 27 MB of live
+data (two 1 GiB sealed segments and a 0.49 GiB active segment) cost, measured:
+- opening the store: 13 s and a 3.7 GB peak;
+- `inspect_storage` and `storage_stats()`: a 3.2 GB peak;
+- online compaction: a 3.3 GB peak above the store's resident size, and writers stalled for
+  seconds;
+- closed compaction: a 5.8 GB peak;
+- opening the key/set or key/sorted-map store of the same directory, whose WALs are 10 and 17 MB:
+  about 7 s each.
+
+The open's peak alone was within 0.2 GB of the machine's memory. A crash that tears the last record
+is worse: tail repair holds about twice the chain plus four copies of the active segment, which for
+that store projects to about 6.9 GiB, so the store could not have been reopened on that machine.
+
+The causes, all read at `9ba8871`:
+- Every reader loads the whole chain into one buffer, because the codecs take one slice, and several
+  keep the buffers the chain was built from as well.
+- Replay indexes every record before applying any, and keeps a set of every key ever written to
+  compute a flag that is usually already false.
+- Validation-only readers build the full logical state and drop it.
+- Every open of any family first inspects the whole directory, every family's chain, and discards
+  the result unless closed-compaction evidence exists (`classify_untrusted_closed_authority`
+  computes the canonical directory's evidence before checking whether any sibling evidence exists).
+- Online compaction reads and replays the whole WAL twice at capture and twice at cutover, all while
+  writers are excluded; closed compaction makes four full passes.
+
+##### User scenarios and requirements
+
+- **FR-1 (P1): an open reads only its own family, and only when it must.**
+  - Opening a family reads no other family's WAL when the directory holds no maintenance evidence.
+- **FR-2 (P1): peak memory follows records, not WAL size.**
+  - Opening a store, recovering a torn tail, `inspect_storage`, `storage_stats()` and online
+    compaction hold, beyond the store's logical state, at most the largest record group in the chain
+    plus a fixed buffer. A record's declared length is checked against the bytes remaining in its
+    artifact before anything is allocated for it.
+  - Replay keeps no per-key history beyond what its result needs.
+- **FR-3: fewer passes while writers wait.**
+  - Online compaction reads the source chain once at capture and once at cutover.
+- **FR-4: closed compaction.**
+  - Closed compaction keeps spec 008's exact-byte source recheck (FR-039) and therefore still holds
+    the source bytes; it drops its redundant passes. Bounding it further needs a change to that
+    requirement and is recorded, not done here.
+- **FR-5: outcomes do not change.**
+  - Every classification, offset, recovery status, authority decision, error and repaired byte is
+    exactly what it is today. No persisted format and no public signature changes. Frozen fixtures
+    remain inputs.
+
+##### Acceptance
+
+- Opening a key/set store beside a large key/value chain reads none of the key/value chain
+  (structural count), and its contents and recovery status are unchanged.
+- Release-only, ignored-by-default gates in a child process, by `VmHWM` delta, over the same live
+  state written with 64 MiB and 512 MiB of history:
+  - open, torn-tail open, `storage_stats()` and `inspect_storage`: the 512 MiB delta is at most
+    1.10 times the 64 MiB delta;
+  - an open after 1M historical keys (churned to 1k live) peaks at most 1.10 times the peak after
+    1k.
+  Each gate was observed failing at `9ba8871` before the change.
+- Online compaction takes one full source pass at capture and one at cutover while writers are
+  excluded (structural count).
+- Every existing recovery, truncated-WAL, segment, inspection and compaction suite passes
+  unchanged, and spec 004's startup timing gate still holds.
+- Full suites and builds pass on every operating system CI runs.
