@@ -483,6 +483,8 @@ pub(crate) fn publish_online_previous(
         path: paths.previous.clone(),
         source,
     })?;
+    #[cfg(test)]
+    let mut moved = 0;
     for descriptor in &manifest.source_inventory {
         let file_name = descriptor.relative_path.file_name().ok_or_else(|| {
             CompactionError::InvalidArtifact {
@@ -502,6 +504,11 @@ pub(crate) fn publish_online_previous(
             path: previous_path,
             source,
         })?;
+        #[cfg(test)]
+        {
+            moved += 1;
+            online_source_move_exit::moved(&paths.previous, moved);
+        }
     }
     if manifest.durability == DurabilityPolicy::Physical {
         crate::durability::synchronize_namespace_parent(&paths.previous, manifest.durability)
@@ -873,7 +880,13 @@ pub(crate) mod manifest_publication_faults {
     pub(crate) enum Fault {
         Error,
         Panic,
+        /// Ends the process at once with `KILLED_INSIDE_PUBLICATION`, running no destructor: what a
+        /// kill inside the publication leaves (specs/016).
+        Exit,
     }
+
+    /// The exit code of a process that `Fault::Exit` ended.
+    pub(crate) const KILLED_INSIDE_PUBLICATION: i32 = 91;
 
     struct Injected {
         temporary: PathBuf,
@@ -980,6 +993,58 @@ pub(crate) mod manifest_publication_faults {
                 "injected manifest publication failure at {stage:?}"
             ))),
             Some(Fault::Panic) => panic!("injected manifest publication panic at {stage:?}"),
+            Some(Fault::Exit) => std::process::exit(KILLED_INSIDE_PUBLICATION),
+        }
+    }
+}
+
+/// Ends the process just after an online cutover has moved a given number of its source artifacts
+/// into the previous directory (specs/016), so that a test can recover what a kill inside the
+/// cutover's source moves leaves. An injection names the previous directory, read through its
+/// canonical parent, so tests running in parallel do not see each other's.
+#[cfg(test)]
+pub(crate) mod online_source_move_exit {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    /// The exit code of a process that an injection ended.
+    pub(crate) const KILLED_INSIDE_SOURCE_MOVES: i32 = 92;
+
+    static INJECTED: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
+
+    fn injected() -> MutexGuard<'static, Vec<(PathBuf, usize)>> {
+        INJECTED.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn key(previous: &Path) -> PathBuf {
+        match (
+            previous
+                .parent()
+                .and_then(|parent| std::fs::canonicalize(parent).ok()),
+            previous.file_name(),
+        ) {
+            (Some(parent), Some(name)) => parent.join(name),
+            _ => previous.to_path_buf(),
+        }
+    }
+
+    /// The next cutover moving its source into `previous` ends the process once it has moved
+    /// `moves` artifacts.
+    pub(crate) fn inject(previous: &Path, moves: usize) {
+        injected().push((key(previous), moves));
+    }
+
+    /// Ends the process if an injection asks for it after `moved` moves into `previous`.
+    pub(super) fn moved(previous: &Path, moved: usize) {
+        if injected().is_empty() {
+            return;
+        }
+        let key = key(previous);
+        if injected()
+            .iter()
+            .any(|(installed, moves)| *installed == key && *moves == moved)
+        {
+            std::process::exit(KILLED_INSIDE_SOURCE_MOVES);
         }
     }
 }

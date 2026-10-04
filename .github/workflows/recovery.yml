@@ -56,6 +56,7 @@ jobs:
           cargo test --test i128_key -- --test-threads=1
           cargo test --test map_pop_return_values -- --test-threads=1
           cargo test --test numeric_increment_overflow -- --test-threads=1
+          cargo test --test one_family_instance -- --test-threads=1
           cargo test --test ordered_map_append -- --test-threads=1
           cargo test --test sorted_map_enumeration -- --test-threads=1
           cargo test --test tracked_storage_stats -- --test-threads=1
@@ -71,6 +72,9 @@ jobs:
       - name: Unpublished maintenance attempts
         run: |
           cargo test compaction::unpublished_attempt_tests:: -- --test-threads=1
+      - name: Online attempt recovery
+        run: |
+          cargo test compaction::online_attempt_recovery_tests:: -- --test-threads=1
       - name: Physical durability capability and publication matrix
         run: cargo test --test durable_write_policy public_ -- --test-threads=1
       - name: Windows physical durability and buffered compatibility matrix

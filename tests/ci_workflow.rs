@@ -32,6 +32,7 @@ fn recovery_workflow_runs_every_dedicated_issue_regression_target() {
         "i128_key",
         "map_pop_return_values",
         "numeric_increment_overflow",
+        "one_family_instance",
         "ordered_map_append",
         "sorted_map_enumeration",
         "tracked_storage_stats",
@@ -356,6 +357,11 @@ const UNPUBLISHED_ATTEMPTS_STEP: (&str, &[&str]) = (
     &["cargo test compaction::unpublished_attempt_tests:: -- --test-threads=1"],
 );
 
+const ONLINE_ATTEMPT_RECOVERY_STEP: (&str, &[&str]) = (
+    "Online attempt recovery",
+    &["cargo test compaction::online_attempt_recovery_tests:: -- --test-threads=1"],
+);
+
 #[test]
 fn directory_ownership_tests_run_on_every_operating_system() {
     let (name, commands) = DIRECTORY_OWNERSHIP_STEP;
@@ -383,6 +389,15 @@ fn unpublished_attempt_tests_run_on_every_operating_system() {
     );
 }
 
+#[test]
+fn online_attempt_recovery_tests_run_on_every_operating_system() {
+    let (name, commands) = ONLINE_ATTEMPT_RECOVERY_STEP;
+    assert!(
+        runs_on_every_runner(&recovery_workflow(), name, commands),
+        "recovery workflow must run the online attempt recovery unit tests on every OS"
+    );
+}
+
 /// The pins above, against copies of the workflow in which each pinned step is gated to one
 /// OS: by an `if:` after its commands, by one between its name and `run:`, and by one on the
 /// step's first line. Each copy must fail the pin, and the unchanged workflow must pass it.
@@ -393,6 +408,7 @@ fn a_pinned_step_gated_to_one_operating_system_fails_its_pin() {
         DIRECTORY_OWNERSHIP_STEP,
         TRACKED_STORAGE_STATS_STEP,
         UNPUBLISHED_ATTEMPTS_STEP,
+        ONLINE_ATTEMPT_RECOVERY_STEP,
     ] {
         assert!(runs_on_every_runner(&workflow, name, commands), "{name}");
         let header = format!("      - name: {name}\n");

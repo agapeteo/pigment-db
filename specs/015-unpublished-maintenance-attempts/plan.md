@@ -303,7 +303,9 @@ path, which spec 016 handles; this spec handles what the failure left behind.
     back beside a canonical directory that has since been written; the next open then refuses, with
     every generation present (the other closed-recovery branches lack the same barrier; "Not done
     here"). The canonical directory is never written.
-  - **D4, FR-3 online: withdrawn after the third review.** A lone family `.manifest.next` keeps its
+  - **D4, FR-3 online: withdrawn after the third review.** (Note, 2026-10-03: restored by specs/016
+    FR-2 at an open that is the only live writer of the family, under the exclusion this
+    paragraph says it lacked; see specs/016's plan.) A lone family `.manifest.next` keeps its
     error from `1eb9de5`, and nothing is removed. The rule removed it at an open, or at an online
     compaction's start, when the family had no manifest, staging or previous directory and a valid
     canonical family. But another open instance of the family writes exactly that temporary during
@@ -325,7 +327,8 @@ path, which spec 016 handles; this spec handles what the failure left behind.
     rollback's restore rename, which recovery takes only when the replacement did not validate. The
     canonical directory is then the verified last complete authority; staging is what the rollback
     already decided to remove.
-  - **D6, FR-5: withdrawn after the third review.** A finalized online `Prepared` whose source is
+  - **D6, FR-5: withdrawn after the third review.** (Note, 2026-10-03: restored by specs/016
+    FR-2, as for D4.) A finalized online `Prepared` whose source is
     split between the canonical directory and the previous directory keeps its error from
     `1eb9de5`, `AuthorityUndetermined`, and nothing is moved. The rule moved each verified artifact
     back. A live cutover of another open instance of the family leaves exactly that split between
@@ -336,7 +339,9 @@ path, which spec 016 handles; this spec handles what the failure left behind.
     - an open admitted alone, parked after its directory-level recovery while a second instance
       opened, compacted and parked between its moves, then restored that live split
       (`an_open_still_recovering_when_a_later_instance_starts_its_cutover_leaves_that_cutover_alone`,
-      through a new test-only pause between directory and family recovery);
+      through a new test-only pause between directory and family recovery; renamed by specs/016 to
+      `a_later_instance_cannot_open_while_an_open_of_its_family_is_still_recovering`, since its FR-1
+      refuses the later instance);
     - a second process whose locks are skipped (specs/011 FR-11, simulated by injecting
       `Unsupported`) restored a live split
       (`a_process_without_locks_opening_during_a_live_cutover_leaves_it_alone`).
@@ -447,7 +452,11 @@ path, which spec 016 handles; this spec handles what the failure left behind.
   are skipped. Both rules are withdrawn and the per-family count is removed with them: the
   registry is as at `1eb9de5`. A sound version needs a family's recovery excluded from its other
   instances' online attempts, which is new coordination state (Principles III and IV) and its own
-  specification. Lock order is unchanged.
+  specification. Lock order is unchanged. (Note, 2026-10-03: specs/016 is that specification. Its
+  FR-1 keeps the families each open holds in the registry entry, so one instance of a family is
+  open per directory per process, and its gate reads that and specs/011's inner lock once
+  directory recovery is done; its plan's II and IV record the state, the lock order and the
+  progress tests.)
 
   Deterministic tests for D3's concurrency (added after the fourth review, which found the race
   between two first opens of different families pinned only by 300 random runs): a test-only
@@ -844,7 +853,10 @@ path, which spec 016 handles; this spec handles what the failure left behind.
 - Relative store paths whose parent is `""` (spec 016). Since the second review FR-1 holds for them
   and for a symlinked store path (D1); the compaction itself still fails for a relative path, and
   for a symlinked path its artifacts are named beside the link, where an open, which looks beside
-  the directory the link names, never sees them. Spec 016 owns both.
+  the directory the link names, never sees them. Spec 016 owns both. (Note, 2026-10-03: "spec 016"
+  here, in the Motivation note and in D3's paragraph names the planned path-spelling work, now the
+  deferred Draft A in `reviews/opus-5.5-maintenance-2026-10-02.md`; the number went to
+  specs/016-online-attempt-recovery.)
 - The cost of `classify_untrusted_closed_authority` reading and validating every WAL chain of the
   canonical directory at every open, even when no maintenance sibling exists (found by the same
   investigation; a separate change with its own measurement).
@@ -854,7 +866,8 @@ path, which spec 016 handles; this spec handles what the failure left behind.
   compaction proceed (D1's decision handles its consequence for this spec; the behaviour itself is
   unchanged).
 - From the first review, each found to predate this spec and to need its own specification:
-  - **A second live instance of one family on one directory in one process.** The process registry
+  - **A second live instance of one family on one directory in one process.** (Note, 2026-10-03:
+    closed by specs/016 FR-1, which refuses such an open before any recovery.) The process registry
     counts opens and refuses only against a closed claim (specs/011 FR-10), so a second
     `try_init_new` of a family already open in the process succeeds. Measured at `1eb9de5`, with no
     change from this spec involved: two such key/value instances writing leave a WAL the next open
@@ -892,7 +905,9 @@ path, which spec 016 handles; this spec handles what the failure left behind.
     refusal with every generation still present, not a loss.
 
 - From the third review:
-  - **FR-3 online and FR-5 (withdrawn, D4 and D6).** A process killed inside an online first
+  - **FR-3 online and FR-5 (withdrawn, D4 and D6).** (Note, 2026-10-03: closed for opens by
+    specs/016; an online compaction's start keeps both errors.) A process killed inside an online
+    first
     publication leaves a lone family `.manifest.next`, and one killed inside a cutover's source
     moves leaves a split source; both keep `AuthorityUndetermined` as at `1eb9de5`. Recovering them
     safely needs a family's recovery excluded from its other instances' online attempts in this

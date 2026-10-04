@@ -1,7 +1,7 @@
 //! Ownership of file-backed store directories: within a process through a registry of open leases
 //! and closed-maintenance claims, and across processes through lock files (specs/011).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -10,6 +10,8 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+use crate::compaction::inspection::InspectedFamily;
 
 #[derive(Debug)]
 pub(crate) struct MaintenanceCoordinator {
@@ -202,6 +204,8 @@ enum Slot {
 
 struct OwnershipState {
     open_leases: usize,
+    /// The families this process holds open in the directory, one instance each (specs/016 FR-1).
+    open_families: BTreeSet<InspectedFamily>,
     closed_claimed: bool,
     /// Whether this entry's owners take lock files at all: false only for the staging reopen that
     /// a closed claim covers.
@@ -218,6 +222,7 @@ impl OwnershipState {
     fn new(takes_locks: bool, inner: Option<LockFile>, replacement: Option<LockFile>) -> Self {
         Self {
             open_leases: 0,
+            open_families: BTreeSet::new(),
             closed_claimed: false,
             takes_locks,
             inner: inner.map_or(InnerLock::Absent, InnerLock::Held),
@@ -325,6 +330,11 @@ fn still_at(held: Option<FileId>, path: &Path) -> bool {
     if let Some(directory) = path.parent() {
         lock_seams::before_held_lock_check(directory);
     }
+    held_file_is_at(held, path)
+}
+
+/// `still_at` without its test seam, for a reader that only asks.
+fn held_file_is_at(held: Option<FileId>, path: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -946,6 +956,9 @@ fn ensure_inner_lock(identity: &Path) -> io::Result<()> {
 #[derive(Debug)]
 pub(crate) struct OpenDirectoryLease {
     identity: PathBuf,
+    /// The family this open holds in the directory: no other instance of it may be opened there
+    /// in this process until the lease is dropped (specs/016 FR-1).
+    family: InspectedFamily,
 }
 
 impl OpenDirectoryLease {
@@ -970,11 +983,58 @@ impl OpenDirectoryLease {
     pub(crate) fn identity(&self) -> &Path {
         &self.identity
     }
+
+    /// Whether this open is the only live writer of its family on its directory (specs/016
+    /// FR-2): this process holds the family (FR-1), so no other instance of it is open here, and
+    /// holds specs/011's inner lock, still the file at the directory's lock path, which every
+    /// other process's open of the directory holds for as long as it is open.
+    ///
+    /// Not where specs/011 skipped that lock because the platform or filesystem cannot take it
+    /// (its FR-11): nothing then excludes another process (specs/016 FR-3). Nor while the inner
+    /// lock is not held: an open that found directory-level maintenance recovers it under the
+    /// replacement lock alone, and takes the inner lock only afterwards (specs/011 FR-5).
+    pub(crate) fn family_writers(&self) -> FamilyWriters<'_> {
+        let held = {
+            let registry = lock_registry();
+            match registry.get(&self.identity) {
+                Some(Slot::Owned(state))
+                    if state.takes_locks && state.open_families.contains(&self.family) =>
+                {
+                    match &state.inner {
+                        // A lock specs/011 skipped (FR-11) excludes no other process (FR-3).
+                        InnerLock::Held(lock) if lock.locked => Some(lock.id),
+                        InnerLock::Held(_) | InnerLock::Absent | InnerLock::Acquiring => None,
+                    }
+                }
+                _ => None,
+            }
+        };
+        match held {
+            Some(id) if held_file_is_at(id, &self.identity.join(INNER_LOCK_NAME)) => {
+                FamilyWriters::OnlyThis {
+                    locked: &self.identity,
+                }
+            }
+            _ => FamilyWriters::NotExcluded,
+        }
+    }
+}
+
+/// Whether an open is the only live writer of its family on its directory (specs/016 FR-2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FamilyWriters<'a> {
+    /// No other instance of the family is open on `locked`, the directory the open locked, in
+    /// this process or in another, so no online attempt of the family there is live but this
+    /// open's own.
+    OnlyThis { locked: &'a Path },
+    /// Nothing here excludes another live writer of the family.
+    NotExcluded,
 }
 
 impl Drop for OpenDirectoryLease {
     fn drop(&mut self) {
         release(&self.identity, |state| {
+            state.open_families.remove(&self.family);
             state.open_leases = state.open_leases.saturating_sub(1);
             state.open_leases == 0 && !state.closed_claimed
         });
@@ -1043,12 +1103,31 @@ impl Drop for ClosedDirectoryClaim {
 
 #[cfg(test)]
 pub(crate) fn acquire_open_lease(store_dir: &Path) -> io::Result<OpenDirectoryLease> {
-    acquire_open_lease_with(store_dir, ProcessLockPolicy::Take)
+    acquire_open_lease_with(
+        store_dir,
+        ProcessLockPolicy::Take,
+        InspectedFamily::KeyValue,
+    )
 }
 
+/// How a refusal names a family.
+fn family_named(family: InspectedFamily) -> &'static str {
+    match family {
+        InspectedFamily::KeyValue => "key/value",
+        InspectedFamily::KeySet => "key/set",
+        InspectedFamily::KeyMap => "key/sorted-map",
+    }
+}
+
+/// Admits an open of `family` in the directory `store_dir` names, taking the directory's locks
+/// when this process holds none of them yet (specs/011), and the family itself: an open of a
+/// family this process already holds open in the directory is refused here, before any recovery,
+/// with the kind specs/011 gives another process's open, `WouldBlock`, naming the directory and
+/// the family (specs/016 FR-1). The directory is known by its identity, whatever the spelling.
 pub(crate) fn acquire_open_lease_with(
     store_dir: &Path,
     policy: ProcessLockPolicy,
+    family: InspectedFamily,
 ) -> io::Result<OpenDirectoryLease> {
     let identity = canonical_directory_identity(store_dir)?;
     let takes_locks = policy == ProcessLockPolicy::Take;
@@ -1069,14 +1148,26 @@ pub(crate) fn acquire_open_lease_with(
                     "closed maintenance already owns this directory",
                 ));
             }
+            if state.open_families.contains(&family) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "the {} family of store directory {} is already open in this process; \
+                         one instance of a family may be open per directory, so share it",
+                        family_named(family),
+                        identity.display()
+                    ),
+                ));
+            }
             state.open_leases = state
                 .open_leases
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("open-store lease count overflow"))?;
+            state.open_families.insert(family);
             Ok(())
         },
     )?;
-    Ok(OpenDirectoryLease { identity })
+    Ok(OpenDirectoryLease { identity, family })
 }
 
 #[allow(dead_code)]
@@ -1571,5 +1662,224 @@ mod lock_error_tests {
 
         assert!(panicked.is_err(), "the injected panic must have fired");
         assert_eq!(reopened, Ok(Ok(())), "the directory must open again");
+    }
+}
+
+#[cfg(test)]
+mod family_hold_tests {
+    //! specs/016 FR-1: one open instance of a family per directory per process. The hold is taken
+    //! where an open is admitted, under the registry's mutex, so a second open of the family never
+    //! waits on the first one's recovery and never leaves the family held when it fails.
+
+    use super::lock_seams::{inject_panic, Stall};
+    use crate::compaction::recovery::recovery_pause::{self, Point};
+    use crate::key_set_store::DurableKeySetStore;
+    use crate::key_value_store::DurableKeyValueStore;
+    use std::io;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn refused_as_open_in_this_process(
+        result: &Result<crate::RecoveryStatus, crate::RecoveryError>,
+    ) -> bool {
+        matches!(
+            result,
+            Err(crate::RecoveryError::Io { source, .. })
+                if source.kind() == io::ErrorKind::WouldBlock
+                    && source.to_string().contains("key/value")
+        )
+    }
+
+    fn open_key_value(
+        directory: &std::path::Path,
+    ) -> Result<crate::RecoveryStatus, crate::RecoveryError> {
+        DurableKeyValueStore::try_init_new(directory).map(|outcome| outcome.status())
+    }
+
+    /// An open of a family while the first open of it is still creating the directory's registry
+    /// entry -- its lock-file I/O stalled -- waits for that entry and is then refused, because the
+    /// first open was admitted with the family. Another family's open of the directory goes on.
+    #[test]
+    fn an_open_behind_a_pending_entry_is_refused_once_the_family_is_held() {
+        let directory = tempfile::tempdir().unwrap();
+        drop(DurableKeyValueStore::try_init_new(directory.path()).unwrap());
+        let stall = Stall::install(directory.path());
+        let path = directory.path().to_path_buf();
+        let first = std::thread::spawn(move || {
+            DurableKeyValueStore::try_init_new(&path).map(|outcome| outcome.into_store())
+        });
+        stall.wait_entered();
+        let path = directory.path().to_path_buf();
+        let second = std::thread::spawn(move || open_key_value(&path));
+        let path = directory.path().to_path_buf();
+        let other_family = std::thread::spawn(move || {
+            DurableKeySetStore::try_init_new(&path).map(|outcome| outcome.into_store())
+        });
+        stall.release();
+        let first = first.join().unwrap();
+        let second = second.join().unwrap();
+        let other_family = other_family.join().unwrap();
+
+        assert!(first.is_ok(), "{:?}", first.err());
+        assert!(
+            refused_as_open_in_this_process(&second),
+            "a second open of the family must be refused, got {second:?}"
+        );
+        assert!(other_family.is_ok(), "{:?}", other_family.err());
+    }
+
+    /// An open of a family while the first open of it is parked inside its recovery is refused at
+    /// once, without waiting for that recovery (deterministic progress), and the family opens again
+    /// once the first instance is dropped.
+    #[test]
+    fn an_open_still_recovering_holds_its_family_and_a_second_open_does_not_wait_for_it() {
+        let directory = tempfile::tempdir().unwrap();
+        drop(DurableKeyValueStore::try_init_new(directory.path()).unwrap());
+        let pause = recovery_pause::install(directory.path(), Point::FamilyRecovery);
+        let path = directory.path().to_path_buf();
+        let first = std::thread::spawn(move || {
+            DurableKeyValueStore::try_init_new(&path).map(|outcome| outcome.into_store())
+        });
+        pause.wait_reached();
+        let (answered, answer) = mpsc::channel();
+        let path = directory.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = answered.send(open_key_value(&path));
+        });
+        let second = answer.recv_timeout(Duration::from_secs(5));
+        pause.release();
+        let first = first.join().unwrap();
+
+        let second = second.expect("a second open waited for the first open's recovery");
+        assert!(
+            refused_as_open_in_this_process(&second),
+            "a second open of a family still recovering must be refused, got {second:?}"
+        );
+        let first = first.expect("the first open completes");
+        drop(first);
+        assert!(open_key_value(directory.path()).is_ok());
+    }
+
+    /// An open that panics after it was admitted -- here while it takes the inner lock after
+    /// recovering directory-level debris -- leaves the family free: the next open proceeds.
+    #[test]
+    fn an_open_that_panics_after_admission_leaves_its_family_free() {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("store");
+        std::fs::create_dir(&store).unwrap();
+        drop(DurableKeyValueStore::try_init_new(&store).unwrap());
+        std::fs::write(
+            root.path().join(".store.pigment-compact.manifest.next"),
+            b"an unpublished closed Prepared",
+        )
+        .unwrap();
+        // The inner lock is taken only after directory recovery, in the store directory itself.
+        inject_panic(&store);
+        let panicked = std::panic::catch_unwind(|| open_key_value(&store));
+        assert!(panicked.is_err(), "the injected panic must have fired");
+
+        let (answered, answer) = mpsc::channel();
+        let path = store.clone();
+        std::thread::spawn(move || {
+            let _ = answered.send(open_key_value(&path).map_err(|error| error.to_string()));
+        });
+        let reopened = answer.recv_timeout(Duration::from_secs(5));
+        assert!(
+            matches!(reopened, Ok(Ok(_))),
+            "a panicked open kept its family: {reopened:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod family_writers_tests {
+    //! specs/016 FR-2 and FR-3: an open is the only live writer of its family on its directory
+    //! when its process holds the family and a real inner lock that is still the file at the
+    //! directory's lock path.
+
+    use super::lock_seams::inject_lock_error;
+    use super::{acquire_open_lease_with, FamilyWriters, ProcessLockPolicy};
+    use crate::compaction::inspection::InspectedFamily;
+
+    fn store() -> (tempfile::TempDir, std::path::PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let store = root.path().join("store");
+        std::fs::create_dir(&store).unwrap();
+        (root, store)
+    }
+
+    #[test]
+    fn a_lease_holding_its_family_and_a_real_inner_lock_is_its_only_writer() {
+        let (_root, store) = store();
+        let lease =
+            acquire_open_lease_with(&store, ProcessLockPolicy::Take, InspectedFamily::KeySet)
+                .unwrap();
+        let identity = std::fs::canonicalize(&store).unwrap();
+        assert_eq!(
+            lease.family_writers(),
+            FamilyWriters::OnlyThis { locked: &identity }
+        );
+    }
+
+    /// FR-3: a lock specs/011 skipped (FR-11) excludes no other process.
+    #[test]
+    fn a_skipped_inner_lock_excludes_no_other_writer() {
+        let (_root, store) = store();
+        inject_lock_error(&store, std::io::ErrorKind::Unsupported);
+        let lease =
+            acquire_open_lease_with(&store, ProcessLockPolicy::Take, InspectedFamily::KeyValue)
+                .unwrap();
+        assert_eq!(lease.family_writers(), FamilyWriters::NotExcluded);
+    }
+
+    /// The staging reopen a closed claim covers takes no lock of its own.
+    #[test]
+    fn an_open_that_takes_no_lock_excludes_no_other_writer() {
+        let (_root, store) = store();
+        let lease = acquire_open_lease_with(
+            &store,
+            ProcessLockPolicy::CoveredByClosedClaim,
+            InspectedFamily::KeyMap,
+        )
+        .unwrap();
+        assert_eq!(lease.family_writers(), FamilyWriters::NotExcluded);
+    }
+
+    /// An open that finds directory-level maintenance holds only the replacement lock until it
+    /// has recovered it and taken the inner lock (specs/011 FR-5).
+    #[test]
+    fn an_open_recovering_directory_maintenance_is_not_yet_the_only_writer() {
+        let (root, store) = store();
+        drop(crate::key_value_store::DurableKeyValueStore::try_init_new(&store).unwrap());
+        std::fs::write(
+            root.path().join(".store.pigment-compact.manifest.next"),
+            b"an unpublished closed Prepared",
+        )
+        .unwrap();
+        let lease =
+            acquire_open_lease_with(&store, ProcessLockPolicy::Take, InspectedFamily::KeyValue)
+                .unwrap();
+        assert_eq!(lease.family_writers(), FamilyWriters::NotExcluded);
+        lease.ensure_inner_lock().unwrap();
+        let identity = std::fs::canonicalize(&store).unwrap();
+        assert_eq!(
+            lease.family_writers(),
+            FamilyWriters::OnlyThis { locked: &identity }
+        );
+    }
+
+    /// A held inner lock that is no longer the file at the lock path -- the directory's lock file
+    /// was replaced, as a compaction that retired the directory leaves it -- excludes nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_inner_lock_no_longer_at_its_path_excludes_no_other_writer() {
+        let (_root, store) = store();
+        let lease =
+            acquire_open_lease_with(&store, ProcessLockPolicy::Take, InspectedFamily::KeyValue)
+                .unwrap();
+        let lock = store.join(super::INNER_LOCK_NAME);
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::write(&lock, b"").unwrap();
+        assert_eq!(lease.family_writers(), FamilyWriters::NotExcluded);
     }
 }

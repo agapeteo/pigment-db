@@ -46,6 +46,16 @@ pub(super) fn namespace(root: &Path) -> Namespace {
             } else if kind.is_dir() {
                 snapshot.insert(relative, Entry::Directory);
                 visit(root, &path, snapshot);
+            } else if cfg!(windows)
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".pigment-lock"))
+            {
+                // Windows refuses every read of a locked range, even through the holder's own
+                // second handle, so a lock file is recorded by its presence there (specs/011),
+                // as `tests/directory_lock.rs` records it.
+                snapshot.insert(relative, Entry::File(b"<lock file>".to_vec()));
             } else {
                 snapshot.insert(relative, Entry::File(std::fs::read(&path).unwrap()));
             }
@@ -140,6 +150,14 @@ fn assert_refused_unchanged(
         before,
         "{label}: a refused open changed the directory"
     );
+}
+
+/// specs/016 FR-1's refusal of a second instance of a family: `Io` of kind `WouldBlock`.
+fn refused_as_a_second_instance(error: &crate::RecoveryError) -> bool {
+    matches!(
+        error,
+        crate::RecoveryError::Io { source, .. } if source.kind() == std::io::ErrorKind::WouldBlock
+    )
 }
 
 fn undetermined(error: &crate::RecoveryError) -> bool {
@@ -1291,14 +1309,16 @@ fn debris_that_cannot_be_removed_fails_the_open_with_the_removal_error() {
     assert_no_closed_debris(&paths, "after the next open");
 }
 
-/// FR-3, online, withdrawn by the third review: a lone family manifest temporary, with no family
-/// manifest, staging or previous directory beside a valid family, keeps the error it returned at
-/// `1eb9de5`, and the open changes nothing -- alone, beside another open instance of the family,
-/// and beside an open instance of another family. Another open instance's live first publication
-/// writes exactly that temporary, in this process or in another where locks are not supported,
-/// and nothing lets recovery tell it from debris.
+/// FR-3, online, withdrawn by specs/015's third review and restored by specs/016 FR-2: a lone
+/// family manifest temporary, with nothing at the family manifest's path and no staging or
+/// previous directory beside a valid family, is what an online attempt killed inside its first
+/// publication leaves. An open that is the only live writer of the family -- it holds the family
+/// in this process (specs/016 FR-1) and the directory's inner lock (specs/011) -- removes it and
+/// reports `Recovered`, alone and beside an open instance of another family, which cannot own
+/// it. Beside an open instance of the same family the open is refused as a second instance, and
+/// changes nothing. At `1eb9de5` every case answered `AuthorityUndetermined`.
 #[test]
-fn a_lone_online_manifest_temporary_keeps_its_error_and_its_bytes() {
+fn a_lone_online_manifest_temporary_is_removed_at_open_unless_its_family_is_open() {
     for family in ALL_FAMILIES {
         let other_family = match family {
             FixtureFamily::KeyValue => FixtureFamily::KeySet,
@@ -1306,18 +1326,37 @@ fn a_lone_online_manifest_temporary_keeps_its_error_and_its_bytes() {
             FixtureFamily::KeyMap => FixtureFamily::KeyValue,
         };
         for held in [None, Some(family), Some(other_family)] {
+            let label = format!("{family:?}, with {held:?} held open: a lone online temporary");
             let (root, store_dir) = store_with(&ALL_FAMILIES, false);
             let held_open = held.map(|held| hold_open(&store_dir, held));
             let paths = online_paths(&store_dir, family);
             std::fs::write(&paths.manifest_next, b"an unpublished online Prepared").unwrap();
-            assert_refused_unchanged(
-                root.path(),
-                &store_dir,
-                family,
-                &format!("{family:?}, with {held:?} held open: a lone online temporary"),
-                undetermined,
+            if held == Some(family) {
+                assert_refused_unchanged(
+                    root.path(),
+                    &store_dir,
+                    family,
+                    &label,
+                    refused_as_a_second_instance,
+                );
+                drop(held_open);
+                continue;
+            }
+            let mut expected = without_open_locks(namespace(root.path()));
+            expected.remove(paths.manifest_next.strip_prefix(root.path()).unwrap());
+            let opened = open_family(&store_dir, family);
+            assert_eq!(
+                opened.as_ref().ok(),
+                Some(&crate::RecoveryStatus::Recovered),
+                "{label}: {opened:?}"
+            );
+            assert_eq!(
+                without_open_locks(namespace(root.path())),
+                expected,
+                "{label}: the open removed more than the temporary"
             );
             drop(held_open);
+            assert_reopens_exactly(&store_dir, &ALL_FAMILIES);
         }
     }
 }

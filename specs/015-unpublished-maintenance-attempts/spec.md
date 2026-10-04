@@ -270,6 +270,12 @@ is durable.
     not by rare coincidence; closing it needs a production change, which plan.md's "Not done here"
     records for its own decision;
   - the soundness reason in the fifth review's torn-write amendment is corrected where it stands.
+- 2026-10-03, by specs/016 (a separate, approved specification; this note records where it
+  changes this one): the two states FR-3 (online) and FR-5 described, withdrawn above, recover
+  again, at an open that is the only live writer of the family -- its process holds the family,
+  one instance per directory (specs/016 FR-1), and a real inner lock of the directory (specs/011)
+  -- with FR-5's checks and this specification's path resolution. Where specs/011 takes no lock,
+  and at an online compaction's start, they keep their errors from `1eb9de5`, as above.
 - The amendments dated 2026-10-03 were made during implementation, in response to its reviews.
   They narrow or withdraw requirements approved on 2026-10-02, change the return semantics named
   in the Status line, and await the approver's sign-off, which this document does not record. So

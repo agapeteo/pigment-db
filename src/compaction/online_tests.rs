@@ -1518,16 +1518,15 @@ fn assert_four_keys(directory: &std::path::Path) {
     }
 }
 
-/// specs/015 FR-5, withdrawn by the third review: a finalized online `Prepared` whose source
-/// artifacts are split between the canonical directory and the previous directory -- by a cutover
-/// stopped part-way through its moves, or by one still moving them in another open instance of the
-/// family -- keeps the error it returned at `1eb9de5`, and the open changes nothing. Recovery
-/// cannot tell a live cutover's split from a stopped one's without coordination this spec does not
-/// add.
+/// specs/015 FR-5, withdrawn by its third review and restored by specs/016 FR-2: a finalized
+/// online `Prepared` whose source artifacts are split between the canonical directory and the
+/// previous directory -- by a cutover whose process was killed part-way through its moves -- is
+/// recovered by an open that is the only live writer of the family: each moved artifact, verified
+/// against the manifest, is moved back, the attempt is abandoned, and the open reports
+/// `Recovered` with every key. At `1eb9de5` it answered `AuthorityUndetermined`. (A live cutover's
+/// split is another instance's, which specs/016 FR-1 refuses to open.)
 #[test]
-fn a_finalized_prepared_split_by_its_source_move_keeps_its_error_and_its_bytes() {
-    use super::unpublished_attempt_tests::namespace;
-
+fn a_finalized_prepared_split_by_its_source_move_restores_the_source() {
     for (label, moved) in [
         ("after the first move", 1),
         ("after every move", usize::MAX),
@@ -1537,21 +1536,23 @@ fn a_finalized_prepared_split_by_its_source_move_keeps_its_error_and_its_bytes()
         for name in names.iter().take(moved) {
             std::fs::rename(directory.path().join(name), paths.previous.join(name)).unwrap();
         }
-        let without_lock = |mut snapshot: super::unpublished_attempt_tests::Namespace| {
-            snapshot.remove(std::path::Path::new(".pigment-lock"));
-            snapshot
-        };
-        let before = without_lock(namespace(directory.path()));
         match DurableKeyValueStore::try_init_new(directory.path()) {
-            Err(crate::RecoveryError::AuthorityUndetermined { .. }) => {}
-            Err(other) => panic!("{label}: expected AuthorityUndetermined, got {other:?}"),
-            Ok(outcome) => panic!("{label}: a split source opened {:?}", outcome.status()),
+            Ok(outcome) => assert_eq!(
+                outcome.status(),
+                crate::RecoveryStatus::Recovered,
+                "{label}"
+            ),
+            Err(error) => panic!("{label}: a split source kept its store closed: {error:?}"),
         }
-        assert_eq!(
-            without_lock(namespace(directory.path())),
-            before,
-            "{label}: a refused open changed the directory"
-        );
+        for path in [
+            &paths.manifest,
+            &paths.manifest_next,
+            &paths.staging,
+            &paths.previous,
+        ] {
+            assert!(!path.exists(), "{label}: {path:?} remains");
+        }
+        assert_four_keys(directory.path());
     }
 }
 
@@ -1708,9 +1709,11 @@ fn a_split_source_the_manifest_cannot_account_for_keeps_its_error_and_its_bytes(
 }
 
 /// specs/015, second and third reviews: an open of a family while another instance of it in this
-/// process is between its cutover's source moves and `PreviousPublished` finds a split it must not
-/// restore: the split is a live attempt's, not debris. The open is refused and changes nothing,
-/// and the cutover completes, as at `1eb9de5`.
+/// process is between its cutover's source moves and `PreviousPublished` would find a split it
+/// must not restore: the split is a live attempt's, not debris. Since specs/016 FR-1 the open is
+/// refused before any recovery, as a second instance of the family (`WouldBlock`, naming the
+/// directory and the family; at `1eb9de5` it was refused by recovery, `AuthorityUndetermined`).
+/// It changes nothing, and the cutover completes.
 #[test]
 fn a_second_open_during_a_live_cutover_is_refused_and_the_cutover_completes() {
     use super::unpublished_attempt_tests::namespace;
@@ -1747,10 +1750,7 @@ fn a_second_open_during_a_live_cutover_is_refused_and_the_cutover_completes() {
         "the cutover must be parked after its source moves"
     );
     assert!(
-        matches!(
-            second,
-            Err(crate::RecoveryError::AuthorityUndetermined { .. })
-        ),
+        refused_as_a_second_instance(&second),
         "a second open during a live cutover must be refused, got {second:?}"
     );
     assert_eq!(after, before, "the refused open changed the directory");
@@ -1779,6 +1779,19 @@ fn a_second_open_during_a_live_cutover_is_refused_and_the_cutover_completes() {
     }
 }
 
+/// specs/016 FR-1's refusal of a second key/value instance: `Io` of kind `WouldBlock`, naming
+/// the family.
+fn refused_as_a_second_instance(
+    result: &Result<crate::RecoveryStatus, crate::RecoveryError>,
+) -> bool {
+    matches!(
+        result,
+        Err(crate::RecoveryError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::WouldBlock
+                && source.to_string().contains("key/value")
+    )
+}
+
 fn exists_in(
     snapshot: &super::unpublished_attempt_tests::Namespace,
     path: &std::path::Path,
@@ -1788,10 +1801,10 @@ fn exists_in(
 }
 
 /// specs/015 FR-3, online, withdrawn by the third review: at the start of an online compaction, a
-/// lone family manifest temporary may be another open instance's live publication, in this
-/// process or in another where locks are not supported, so the compaction keeps the error it
-/// returned at `1eb9de5` and changes nothing, whether or not another instance of the family is
-/// open now.
+/// lone family manifest temporary keeps the error it returned at `1eb9de5`, and the compaction
+/// changes nothing. specs/016 recovers it at an open, not at a compaction's start (its plan,
+/// Decisions). Since specs/016 FR-1 another instance of the family cannot be opened beside the
+/// compacting one: that open is refused before any recovery.
 #[test]
 fn a_compaction_over_a_lone_family_temporary_keeps_its_error_and_its_bytes() {
     use super::unpublished_attempt_tests::namespace;
@@ -1841,7 +1854,27 @@ fn a_compaction_over_a_lone_family_temporary_keeps_its_error_and_its_bytes() {
             let directory = tempfile::tempdir().unwrap();
             crate::test_support::maintenance_fixtures::create_current_v2(directory.path(), family);
             let first = open(directory.path(), family);
-            let second = beside_another.then(|| open(directory.path(), family));
+            if beside_another {
+                let second = match family {
+                    FixtureFamily::KeyValue => {
+                        DurableKeyValueStore::try_init_new(directory.path()).map(|_| ())
+                    }
+                    FixtureFamily::KeySet => {
+                        DurableKeySetStore::try_init_new(directory.path()).map(|_| ())
+                    }
+                    FixtureFamily::KeyMap => {
+                        DurableKeyMapStore::try_init_new(directory.path()).map(|_| ())
+                    }
+                };
+                assert!(
+                    matches!(
+                        &second,
+                        Err(crate::RecoveryError::Io { source, .. })
+                            if source.kind() == std::io::ErrorKind::WouldBlock
+                    ),
+                    "{family:?}: a second instance of the family must be refused, got {second:?}"
+                );
+            }
             let paths = family_artifact_paths(&directory.path().join(active_name(family))).unwrap();
             std::fs::write(&paths.manifest_next, b"an unpublished online Prepared").unwrap();
             let before = namespace(directory.path());
@@ -1860,7 +1893,6 @@ fn a_compaction_over_a_lone_family_temporary_keeps_its_error_and_its_bytes() {
                 "{family:?} (another instance open: {beside_another}): the refused compaction \
                  changed the directory"
             );
-            drop(second);
         }
     }
 }
@@ -1905,17 +1937,18 @@ fn a_previous_directory_that_cannot_be_read_keeps_its_error_and_its_bytes() {
     );
 }
 
-/// specs/015 FR-5 after the third review: an open admitted before another instance of its family,
-/// and still recovering when that instance opens, compacts and parks between its cutover's source
-/// moves and `PreviousPublished`, finds that live split. It must not restore it: the open is
-/// refused and changes nothing, and the cutover completes, as at `1eb9de5`. (A rule that asked,
-/// when the first open was admitted, whether it was its family's only open instance would restore
-/// the split, fail the cutover and leave the store refusing to open.)
+/// specs/015 FR-5 after the third review, and specs/016 FR-1: an open admitted before another
+/// instance of its family, and still recovering, was the third review's way past a gate read at
+/// admission -- the later instance opened, compacted and parked between its cutover's source
+/// moves, and the recovering open restored that live split. Since FR-1 the later instance cannot
+/// be opened while the first open holds the family: it is refused before any recovery and
+/// changes nothing, so no cutover can start; the first open completes, and its own compaction
+/// and a write survive a reopen.
 #[test]
-fn an_open_still_recovering_when_a_later_instance_starts_its_cutover_leaves_that_cutover_alone() {
+fn a_later_instance_cannot_open_while_an_open_of_its_family_is_still_recovering() {
     use super::recovery::recovery_pause;
     use super::unpublished_attempt_tests::namespace;
-    use crate::compaction::publication::{family_artifact_paths, online_source_move_pause};
+    use crate::compaction::publication::family_artifact_paths;
 
     let directory = tempfile::tempdir().unwrap();
     let options = crate::DurableStoreOptions::default()
@@ -1932,47 +1965,33 @@ fn an_open_still_recovering_when_a_later_instance_starts_its_cutover_leaves_that
     let paths = family_artifact_paths(&directory.path().join("kv.wal.dat")).unwrap();
     let recovering =
         recovery_pause::install(directory.path(), recovery_pause::Point::FamilyRecovery);
-    let moving = online_source_move_pause::install(&paths.previous);
-    // Nothing is asserted while either side is parked, so a failure cannot leave one parked.
-    let (first, before, after, compacted, written) = std::thread::scope(|scope| {
+    // Nothing is asserted while the first open is parked, so a failure cannot leave it parked.
+    let (first, before, later, after) = std::thread::scope(|scope| {
         let first = scope.spawn(|| {
-            DurableKeyValueStore::try_init_new(directory.path()).map(|outcome| outcome.status())
+            DurableKeyValueStore::try_init_new(directory.path()).map(|outcome| outcome.into_store())
         });
         recovering.wait_reached();
-        let second = DurableKeyValueStore::try_init_new_with_options(directory.path(), options)
-            .unwrap()
-            .into_store();
-        let (first, before, after, compacted) = std::thread::scope(|inner| {
-            let compaction = inner
-                .spawn(|| second.try_compact_online(crate::OnlineCompactionOptions::default()));
-            moving.wait_reached();
-            let before = namespace(directory.path());
-            recovering.release();
-            let first = first.join().unwrap();
-            let after = namespace(directory.path());
-            moving.release();
-            (first, before, after, compaction.join().unwrap())
-        });
-        let written = second.try_put(b"after".to_vec(), b"accepted".to_vec());
-        (first, before, after, compacted, written)
+        let before = namespace(directory.path());
+        let later = DurableKeyValueStore::try_init_new_with_options(directory.path(), options)
+            .map(|outcome| outcome.status());
+        let after = namespace(directory.path());
+        recovering.release();
+        (first.join().unwrap(), before, later, after)
     });
-    drop(moving);
     drop(recovering);
     assert!(
-        exists_in(&before, &paths.previous, directory.path()),
-        "the cutover must be parked after its source moves"
-    );
-    assert!(
-        matches!(
-            first,
-            Err(crate::RecoveryError::AuthorityUndetermined { .. })
-        ),
-        "an open still recovering when a later instance's cutover moved its source must be \
-         refused, got {first:?}"
+        refused_as_a_second_instance(&later),
+        "a later instance of a family still being recovered must be refused, got {later:?}"
     );
     assert_eq!(after, before, "the refused open changed the directory");
-    compacted.expect("the live cutover completes");
-    written.expect("the compacted instance accepts a write");
+    let first = first.expect("the recovering open completes");
+    first
+        .try_compact_online(crate::OnlineCompactionOptions::default())
+        .expect("the first instance compacts");
+    first
+        .try_put(b"after".to_vec(), b"accepted".to_vec())
+        .unwrap();
+    drop(first);
     let reopened = DurableKeyValueStore::try_init_new(directory.path())
         .unwrap()
         .into_store();
@@ -2023,10 +2042,11 @@ fn locks_unsupported_open_child() {
     });
 }
 
-/// specs/015 FR-5 after the third review: where locks are not supported (specs/011 FR-11),
-/// another process's open is excluded by nothing, and during a live cutover it finds the cutover's
-/// split. It must not restore it: it is refused and changes nothing, and the cutover completes, as
-/// at `1eb9de5`.
+/// specs/015 FR-5 after the third review, and specs/016 FR-3: where locks are not supported
+/// (specs/011 FR-11), another process's open is excluded by nothing, and during a live cutover it
+/// finds the cutover's split. It must not restore it: since specs/016 restores a dead cutover's
+/// split only for an open holding a real inner lock, it is refused and changes nothing, and the
+/// cutover completes, as at `1eb9de5`.
 #[test]
 fn a_process_without_locks_opening_during_a_live_cutover_leaves_it_alone() {
     use super::unpublished_attempt_tests::namespace;

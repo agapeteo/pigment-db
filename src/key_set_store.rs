@@ -297,6 +297,14 @@ impl DurableKeySetStore<File> {
     /// being replaced), and fails with [`RecoveryError::Io`] of kind
     /// [`std::io::ErrorKind::WouldBlock`] while another process holds them. The files stay; their
     /// names and locking are a compatibility contract (specs/011).
+    ///
+    /// One instance of the key/set family is open per directory per process. While one is open,
+    /// or still being opened (the hold is taken when the open is admitted, before its recovery,
+    /// which may yet fail), every other open of the family there, through any spelling of the
+    /// directory, fails before any recovery with [`RecoveryError::Io`] of kind
+    /// [`std::io::ErrorKind::WouldBlock`] naming the directory and the family; share the open
+    /// instance instead. Dropping it, or the failure of the open holding it, ends the hold
+    /// (specs/016).
     pub fn try_init_new(
         store_dir: impl AsRef<Path>,
     ) -> Result<RecoveryOutcome<Self>, RecoveryError> {
@@ -343,17 +351,21 @@ impl DurableKeySetStore<File> {
         process_lock: crate::maintenance_coordination::ProcessLockPolicy,
     ) -> Result<RecoveryOutcome<Self>, RecoveryError> {
         let store_dir = store_dir.as_ref();
-        let open_lease =
-            crate::maintenance_coordination::acquire_open_lease_with(store_dir, process_lock)
-                .map_err(|source| RecoveryError::Io {
-                    operation: crate::RecoveryOperation::Inspect,
-                    path: store_dir.to_path_buf(),
-                    source,
-                })?;
+        let open_lease = crate::maintenance_coordination::acquire_open_lease_with(
+            store_dir,
+            process_lock,
+            crate::compaction::inspection::InspectedFamily::KeySet,
+        )
+        .map_err(|source| RecoveryError::Io {
+            operation: crate::RecoveryOperation::Inspect,
+            path: store_dir.to_path_buf(),
+            source,
+        })?;
         let maintenance_recovered = crate::compaction::recovery::resolve_store_maintenance(
             &open_lease.maintenance_path(store_dir),
             open_lease.identity(),
             crate::compaction::inspection::InspectedFamily::KeySet,
+            || open_lease.family_writers(),
         )?;
         open_lease
             .ensure_inner_lock()

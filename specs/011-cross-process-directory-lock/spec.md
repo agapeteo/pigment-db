@@ -138,6 +138,15 @@ This is spec 011. Earlier work used the number 010 three times:
   - Anything else of that name, such as a directory, is foreign.
 - **FR-10 In-process behaviour is unchanged.** One process opens all three families of a directory
   under one set of locks, and a closed claim still excludes open leases in the same process.
+  - Note added 2026-10-03 by specs/016 FR-1: one instance of each family. A second open of a
+    family whose directory the process already holds open for that family is now refused before
+    any recovery, with this spec's refusal shape (`RecoveryError::Io`, `Inspect`, `WouldBlock`),
+    naming the directory and the family. Opens of the other families still share the directory's
+    locks as above. Since specs/016 FR-2, an open that holds its family and a real inner lock,
+    still the file at the directory's lock path, read once directory recovery is done, is the only
+    live writer of its family, which is what lets it recover a killed online attempt's leftovers;
+    where a lock is skipped (FR-11 below) it does not. (Wording corrected by specs/016's first
+    review: the earlier text omitted the last two conditions.)
 - **FR-11 Locking support.**
   - Where std reports a lock as `ErrorKind::Unsupported`, that lock is skipped and a warning is
     logged. std reports it for these:

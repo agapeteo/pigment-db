@@ -139,6 +139,14 @@ leaves the parent directory byte-identical apart from the lock files the open it
     instance of the family, beside an instance of another family; it absorbs the two gate tests,
     which are removed), `a_finalized_prepared_split_by_its_source_move_keeps_its_error_and_its_bytes`
     and `a_compaction_over_a_lone_family_temporary_keeps_its_error_and_its_bytes` (each family).
+    (Note, 2026-10-03: specs/016 renamed three of these where its FR-1 and FR-2 change what they
+    expect: `an_open_still_recovering_when_a_later_instance_starts_its_cutover_leaves_that_cutover_alone`
+    is `a_later_instance_cannot_open_while_an_open_of_its_family_is_still_recovering`,
+    `a_lone_online_manifest_temporary_keeps_its_error_and_its_bytes` is
+    `a_lone_online_manifest_temporary_is_removed_at_open_unless_its_family_is_open`, and
+    `a_finalized_prepared_split_by_its_source_move_keeps_its_error_and_its_bytes` is
+    `a_finalized_prepared_split_by_its_source_move_restores_the_source`; specs/015's
+    verification.md, "Note, 2026-10-03: specs/016", maps each.)
   - Documents: plan.md D1, D3, D4, D6, III, IV (with a measured bound for D3), V, Decisions and
     "Not done here"; the D1 and D3 doc comments; spec.md Amendments (FR-3 closed and FR-1 amended,
     FR-3 online and FR-5 withdrawn, FR-7 worded, sign-off of the review amendments pending); spec

@@ -1910,6 +1910,8 @@ mod closed_tests;
 #[cfg(test)]
 mod inspection_tests;
 #[cfg(test)]
+mod online_attempt_recovery_tests;
+#[cfg(test)]
 mod online_tests;
 #[cfg(test)]
 mod recovery_tests;

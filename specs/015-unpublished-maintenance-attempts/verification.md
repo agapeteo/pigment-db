@@ -1181,3 +1181,23 @@ refusal opens were not re-measured: no production code changed.
 - macOS and Windows: not run (T011). This round adds to the module CI runs on every operating
   system: nine more paused child compactions (the D1 test's new cases), one more large-store
   same-length case per family, and a store of 290 records opened six times.
+
+## Note, 2026-10-03: specs/016
+specs/016 restores FR-3 (online) and FR-5 at an open that is the only live writer of the family,
+and refuses a second instance of a family in one process (its FR-1). It rewrote these tests named
+above, each recorded in specs/016's verification.md:
+- `a_lone_online_manifest_temporary_keeps_its_error_and_its_bytes` is now
+  `a_lone_online_manifest_temporary_is_removed_at_open_unless_its_family_is_open`;
+- `online_tests::a_finalized_prepared_split_by_its_source_move_keeps_its_error_and_its_bytes` is now
+  `..._restores_the_source`;
+- `online_tests::an_open_still_recovering_when_a_later_instance_starts_its_cutover_leaves_that_cutover_alone`
+  is now `a_later_instance_cannot_open_while_an_open_of_its_family_is_still_recovering`;
+- `online_tests::a_second_open_during_a_live_cutover_is_refused_and_the_cutover_completes` and
+  `a_compaction_over_a_lone_family_temporary_keeps_its_error_and_its_bytes` expect specs/016's
+  refusal of the second instance;
+- the module's namespace snapshot records a held lock file by its presence on Windows.
+
+"Spec 016" in this record's earlier sections (the relative and symlinked store paths) names the
+planned path-spelling work, now the deferred Draft A in
+`reviews/opus-5.5-maintenance-2026-10-02.md`, not specs/016-online-attempt-recovery (added by
+specs/016's first review).

@@ -16,6 +16,7 @@ use super::publication::{
     directory_artifact_paths, publish_manifest_for_policy, read_published_manifest,
     MaintenanceArtifactPaths,
 };
+use crate::maintenance_coordination::FamilyWriters;
 use crate::{CompactionError, CompactionOperation, RecoveryError, RecoveryOperation, StoreFamily};
 
 /// Recovers the directory's closed maintenance. `locked` is the directory the caller's open lease
@@ -28,10 +29,15 @@ pub(crate) fn resolve_directory_maintenance(
         .map_err(|error| map_compaction_recovery_error(store_dir, error))
 }
 
-pub(crate) fn resolve_store_maintenance(
+/// Recovers an open's directory-level maintenance, then its family's online maintenance.
+/// `family_writers` says, once directory recovery is done, whether the open is the only live
+/// writer of its family (specs/016 FR-2): only then does family recovery recover what a dead
+/// online attempt left.
+pub(crate) fn resolve_store_maintenance<'a>(
     store_dir: &Path,
     locked: &Path,
     family: super::inspection::InspectedFamily,
+    family_writers: impl FnOnce() -> FamilyWriters<'a>,
 ) -> Result<bool, RecoveryError> {
     match fs::metadata(store_dir) {
         Ok(metadata) if !metadata.is_dir() => return Ok(false),
@@ -40,19 +46,43 @@ pub(crate) fn resolve_store_maintenance(
     let directory_recovered = resolve_directory_maintenance(store_dir, locked)?;
     #[cfg(test)]
     recovery_pause::reached(store_dir, recovery_pause::Point::FamilyRecovery);
-    let online_recovered = resolve_online_maintenance_for_compaction(store_dir, family)
+    let dead_attempts = match family_writers() {
+        FamilyWriters::OnlyThis { locked } => DeadAttempts::Recover { locked },
+        FamilyWriters::NotExcluded => DeadAttempts::KeepTheirErrors,
+    };
+    let online_recovered = resolve_online_maintenance(store_dir, family, dead_attempts)
         .map_err(|error| map_compaction_recovery_error(store_dir, error))?;
     Ok(directory_recovered || online_recovered)
 }
 
-/// Recovers a family's online maintenance. A lone manifest temporary and a source split by a
-/// cutover's moves keep their errors (specs/015, third review): a live online attempt of another
-/// open instance of the family -- in this process, or in another where locks are not supported
-/// (specs/011 FR-11) -- writes exactly that temporary and leaves exactly that split, and nothing
-/// lets recovery tell such an attempt from debris.
+/// What family recovery does with the two states only a killed online attempt leaves -- a lone
+/// manifest temporary, and a finalized `Prepared` whose source the cutover's moves split
+/// (specs/016 FR-2).
+#[derive(Clone, Copy, Debug)]
+enum DeadAttempts<'a> {
+    /// Recovers them, acting only in `locked`, the directory the open locked: the open is the
+    /// only live writer of the family there, so no live attempt can own them.
+    Recover { locked: &'a Path },
+    /// Leaves them with the errors they returned at `1eb9de5`: a live online attempt of another
+    /// instance of the family writes exactly that temporary and leaves exactly that split, and
+    /// nothing here excludes one.
+    KeepTheirErrors,
+}
+
+/// Recovers a family's online maintenance at the start of an online compaction. specs/016
+/// recovers a dead attempt's leftovers at an open, not here (its plan, Decisions): they keep
+/// their errors.
 pub(crate) fn resolve_online_maintenance_for_compaction(
     store_dir: &Path,
     family: super::inspection::InspectedFamily,
+) -> Result<bool, CompactionError> {
+    resolve_online_maintenance(store_dir, family, DeadAttempts::KeepTheirErrors)
+}
+
+fn resolve_online_maintenance(
+    store_dir: &Path,
+    family: super::inspection::InspectedFamily,
+    dead_attempts: DeadAttempts<'_>,
 ) -> Result<bool, CompactionError> {
     let paths = super::publication::family_artifact_paths(&store_dir.join(family.active_name()))
         .map_err(|source| CompactionError::Io {
@@ -63,6 +93,11 @@ pub(crate) fn resolve_online_maintenance_for_compaction(
     let mut manifest = match read_published_manifest(&paths) {
         Ok(Some(manifest)) => manifest,
         Ok(None) => {
+            if let DeadAttempts::Recover { locked } = dead_attempts {
+                if discard_dead_first_publication(store_dir, locked, &paths, family)? {
+                    return Ok(true);
+                }
+            }
             if [&paths.manifest_next, &paths.staging, &paths.previous]
                 .into_iter()
                 .any(|path| path_exists(path).unwrap_or(true))
@@ -77,6 +112,11 @@ pub(crate) fn resolve_online_maintenance_for_compaction(
     validate_online_manifest_binding(store_dir, &paths, &manifest, family)?;
     match manifest.phase {
         ManifestPhase::Prepared => {
+            if let (true, DeadAttempts::Recover { locked }) =
+                (manifest.source_finalized, dead_attempts)
+            {
+                restore_split_online_source(store_dir, locked, &manifest)?;
+            }
             recover_prepared_online(store_dir, &paths, &manifest)?;
         }
         ManifestPhase::PreviousPublished => {
@@ -450,6 +490,158 @@ fn discard_unpublished_closed_attempt(
         })?;
     }
     Ok(true)
+}
+
+/// Removes a family's manifest temporary left alone by an online attempt killed inside its first
+/// publication (specs/016 FR-2), and reports whether it did. The caller has read the family
+/// manifest and found none, and runs this only for an open that is the only live writer of the
+/// family on `locked`, the directory it locked (`DeadAttempts::Recover`): no live attempt of the
+/// family can be writing the temporary.
+///
+/// Online publication moves a source artifact only under a finalized `Prepared`, so with nothing
+/// at the family manifest's path and no family staging or previous directory, a valid canonical
+/// family is the authority, and the temporary, which never advanced a phase, names nothing.
+/// Every path is resolved once, from `locked`, and only while the caller's spelling still names
+/// it, as specs/015's closed discard does. Anything else -- a path it cannot read included --
+/// leaves every path as it is, and the state keeps its error.
+fn discard_dead_first_publication(
+    store_dir: &Path,
+    locked: &Path,
+    paths: &MaintenanceArtifactPaths,
+    family: super::inspection::InspectedFamily,
+) -> Result<bool, CompactionError> {
+    let Ok(directory) = fs::canonicalize(store_dir) else {
+        return Ok(false);
+    };
+    if directory != locked {
+        return Ok(false);
+    }
+    #[cfg(test)]
+    recovery_pause::reached(&directory, recovery_pause::Point::DeadAttemptIdentified);
+    let Ok(at) = super::publication::family_artifact_paths(&directory.join(family.active_name()))
+    else {
+        return Ok(false);
+    };
+    if !PathEntry::read(&at.manifest_next).is_present_and(is_regular_file)
+        || !PathEntry::read(&at.manifest).is_absent()
+        || !PathEntry::read(&at.staging).is_absent()
+        || !PathEntry::read(&at.previous).is_absent()
+        || super::inspection::inspect_open_family(&directory, family).is_err()
+    {
+        return Ok(false);
+    }
+    fs::remove_file(&at.manifest_next).map_err(|source| CompactionError::Io {
+        operation: CompactionOperation::Cleanup,
+        path: paths.manifest_next.clone(),
+        source,
+    })?;
+    Ok(true)
+}
+
+/// Moves back the source artifacts that a finalized online `Prepared`'s cutover had already moved
+/// into the previous directory when its process was killed (specs/016 FR-2), as closed recovery
+/// restores a moved source; the abandonment that follows then finds the whole source in place.
+/// The caller runs this only for an open that is the only live writer of the family on `locked`
+/// (`DeadAttempts::Recover`): no live cutover of the family can be between its moves.
+///
+/// Everything is checked before the first move, and anything the manifest cannot account for
+/// leaves every path as it is, for the checks that follow: the previous directory must be a real
+/// directory, each of its entries a regular file named for a source artifact, matching that
+/// artifact's descriptor and absent from the store, and every other source artifact must match
+/// in the store. The source was frozen under exclusive coordination before the finalized manifest
+/// was published, and its writer detached before any artifact moved, so the restored artifacts
+/// are the exact source. Every path is resolved once, from `locked`, and only while the caller's
+/// spelling still names it. A path it cannot read proves nothing.
+///
+/// The move asks for no-replace, which only Windows' write-through move (Physical) honours; every
+/// other move is a rename that replaces its destination. What keeps a destination from being
+/// replaced is the check before the first move, which holds because nothing else writes the
+/// family's artifacts meanwhile.
+fn restore_split_online_source(
+    store_dir: &Path,
+    locked: &Path,
+    manifest: &CompactionManifest,
+) -> Result<(), CompactionError> {
+    let Ok(directory) = fs::canonicalize(store_dir) else {
+        return Ok(());
+    };
+    if directory != locked {
+        return Ok(());
+    }
+    #[cfg(test)]
+    recovery_pause::reached(&directory, recovery_pause::Point::DeadAttemptIdentified);
+    let ManifestScope::Family { active_name, .. } = &manifest.scope else {
+        return Ok(());
+    };
+    let Ok(at) = super::publication::family_artifact_paths(&directory.join(active_name)) else {
+        return Ok(());
+    };
+    let PathEntry::Present(previous) = PathEntry::read(&at.previous) else {
+        return Ok(());
+    };
+    let Some(previous_name) = at.previous.file_name() else {
+        return Ok(());
+    };
+    if !is_real_directory(&previous) {
+        return Ok(());
+    }
+    let mut by_name = std::collections::BTreeMap::new();
+    for descriptor in &manifest.source_inventory {
+        let Some(name) = descriptor.relative_path.file_name() else {
+            return Ok(());
+        };
+        if by_name.insert(OsString::from(name), descriptor).is_some() {
+            return Ok(());
+        }
+    }
+    let Some(names) = regular_file_names(&at.previous) else {
+        return Ok(());
+    };
+    let mut moved = BTreeSet::new();
+    for name in names {
+        let Some(descriptor) = by_name.get(&name) else {
+            return Ok(());
+        };
+        let mut at_previous = (*descriptor).clone();
+        at_previous.relative_path = PathBuf::from(previous_name).join(&name);
+        if verify_descriptor(&directory, &at_previous).is_err()
+            || !PathEntry::read(&directory.join(&descriptor.relative_path)).is_absent()
+        {
+            return Ok(());
+        }
+        moved.insert(name);
+    }
+    if moved.is_empty() {
+        return Ok(());
+    }
+    for (name, descriptor) in &by_name {
+        if !moved.contains(name) && verify_descriptor(&directory, descriptor).is_err() {
+            return Ok(());
+        }
+    }
+    for name in &moved {
+        let relative = &by_name[name].relative_path;
+        crate::durability::move_namespace(
+            &at.previous.join(name),
+            &directory.join(relative),
+            manifest.durability,
+            crate::durability::NamespaceMoveMode::NoReplace,
+        )
+        .map_err(|source| CompactionError::Io {
+            operation: CompactionOperation::PublishPrevious,
+            path: store_dir.join(relative),
+            source,
+        })?;
+    }
+    for synchronized in [at.previous.as_path(), directory.as_path()] {
+        crate::durability::synchronize_namespace_parent(synchronized, manifest.durability)
+            .map_err(|source| CompactionError::Io {
+                operation: CompactionOperation::PublishPrevious,
+                path: store_dir.to_path_buf(),
+                source,
+            })?;
+    }
+    Ok(())
 }
 
 fn remove_unpublished_manifest_temp(
@@ -1600,7 +1792,10 @@ pub(crate) fn test_sentinel() {}
 ///   (third review), so that the family can be opened again and an online attempt started;
 /// - `DiscardEntry` and `DiscardProved`: the closed discard (plan D3), on entry and once it has
 ///   proved the debris redundant, before its first removal (fourth review), so that a test can
-///   change what the caller's path names, or run a second open through the same discard.
+///   change what the caller's path names, or run a second open through the same discard;
+/// - `DeadAttemptIdentified`: either rule of specs/016 FR-2, once it has found the caller's path
+///   naming the directory the open locked (that spec's first review), so that a test can point
+///   the path at another directory before the rule reads or acts.
 ///
 /// A pause names the store directory through its canonical path when it is reached, so tests
 /// running in parallel do not see each other's.
@@ -1622,6 +1817,9 @@ pub(crate) mod recovery_pause {
         /// it reads anything there.
         DiscardIdentified,
         DiscardProved,
+        /// Once a dead online attempt's rule (specs/016 FR-2) has found the caller's path naming
+        /// the directory it locked, before it reads anything there.
+        DeadAttemptIdentified,
     }
 
     /// `(reached, released)`.
