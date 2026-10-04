@@ -68,7 +68,7 @@ leaves the parent directory byte-identical apart from the lock files the open it
   then the step in `recovery.yml`.
 - [x] T010 Full suite, doc tests, `cargo fmt --check`, Clippy, neutralization probes. Record
   everything in verification.md.
-- [ ] T011 macOS and Windows: the new CI step and the changed recovery tests on a CI run of the
+- [x] T011 macOS and Windows: the new CI step and the changed recovery tests on a CI run of the
   published revision (not run here; Linux only).
 - [x] T012 First review (2026-10-03). Each behaviour change observed RED as an assertion failure
   first; each new control observed passing at `1eb9de5` and caught by a probe of the rule it pins:

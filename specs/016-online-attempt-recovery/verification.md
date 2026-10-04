@@ -344,3 +344,8 @@ failed barrier.
 - macOS and Windows (T012): the new tests run there through the existing steps, and the Windows
   wait for a dead child's locks, the Physical kill test (where a Physical move is write-through)
   and the read-only tests on macOS have not run.
+
+## CI on the published revision
+ GitHub Actions run 37166904585 on `96415c4` (published 2026-10-04): Minimum supported Rust,
+and Recovery on ubuntu-latest, macos-latest and windows-latest, all green. The `one_family_instance` target and the "Online attempt recovery" step run on every operating
+system, and spec 015's Windows failure is gone. penpack pins `96415c4`. Closes T012.

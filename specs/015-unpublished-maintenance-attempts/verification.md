@@ -1201,3 +1201,10 @@ above, each recorded in specs/016's verification.md:
 planned path-spelling work, now the deferred Draft A in
 `reviews/opus-5.5-maintenance-2026-10-02.md`, not specs/016-online-attempt-recovery (added by
 specs/016's first review).
+
+## CI on the published revision
+Run 37150002283 on `ce7f0f9` failed on windows-latest only, in the "Unpublished maintenance attempts"
+step: `a_lone_online_manifest_temporary_keeps_its_error_and_its_bytes` panicked at the namespace
+snapshot, which read a held `.pigment-lock` (OS error 33, a byte-range lock). Spec 016's commit
+makes the snapshot record lock files by presence. GitHub Actions run 37166904585 on `96415c4` (published 2026-10-04): Minimum supported Rust,
+and Recovery on ubuntu-latest, macos-latest and windows-latest, all green. The step runs on every operating system. Closes T011.

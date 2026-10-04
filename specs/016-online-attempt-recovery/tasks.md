@@ -70,7 +70,7 @@ parent directory byte-identical apart from the lock files the open itself takes.
   changes their statements; spec.md's Status line and Amendments.
 - [x] T011 Full suite, doc tests, `cargo fmt --check`, Clippy, both builds, the clean-open
   measurement, neutralization probes. Record everything in verification.md.
-- [ ] T012 macOS and Windows: the two new CI targets on a CI run of the published revision (not run
+- [x] T012 macOS and Windows: the two new CI targets on a CI run of the published revision (not run
   here; Linux only).
 - [x] T013 First review (verification.md, "Review 1 (final)"). No production behaviour changed;
   each new test observed passing on the tree and failing under a probe of the property it pins:
