@@ -678,6 +678,23 @@ impl<W: Write> DetachedWalWriter<W> {
 }
 
 impl<W: Write> WalStorage<W> {
+    /// Checks mutation health without adding a WAL event or a durability barrier.
+    /// A successful check is only an instant observation, not a persistence ACK.
+    pub(crate) fn check_conditional_mutation_ready(&self) -> std::io::Result<()> {
+        let state = self.wal_state.read().map_err(|_| {
+            std::io::Error::other("WAL state lock is poisoned; reopen and recover before mutation")
+        })?;
+        ensure_ready(&state.health)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_conditional_health_probe(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.wal_state.write().unwrap();
+            panic!("conditional test deliberately poisons the WAL health lock");
+        }));
+    }
+
     pub(crate) fn take_online_writer(&self, token: u64) -> std::io::Result<DetachedWalWriter<W>> {
         let mut state = self
             .wal_state
