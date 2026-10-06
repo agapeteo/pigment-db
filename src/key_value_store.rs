@@ -32,6 +32,20 @@ pub enum CompareExchangeResult {
     Conflict,
 }
 
+#[derive(Clone, Debug)]
+pub enum ConditionalAction {
+    Keep,
+    Put(Vec<u8>),
+    Delete,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConditionalResult {
+    Applied,
+    Unchanged,
+    Conflict,
+}
+
 #[cfg(test)]
 use crate::test_support::mutation_schedule::{MutationObserver, MutationPhase};
 
@@ -662,6 +676,62 @@ impl<W: Write> DurableKeyValueStore<W> {
         }
     }
 
+    /// Conditionally changes one exact-byte key using its ordinary WAL event format.
+    ///
+    /// None requires absence; Some(empty) requires an existing empty value.
+    /// Conflict and Unchanged have no persistence acknowledgement. Applied follows
+    /// the opened Buffered/Physical policy. Existing batch exclusion is retained.
+    pub fn try_compare_exchange_one(
+        &self,
+        key: Vec<u8>,
+        expected: Option<&[u8]>,
+        action: ConditionalAction,
+    ) -> std::io::Result<ConditionalResult> {
+        let _maintenance = self.maintenance.shared();
+        let _transaction = self.transaction.read();
+        match self.store.entry(key) {
+            Entry::Occupied(mut entry) => {
+                if Some(entry.get().as_slice()) != expected {
+                    return Ok(ConditionalResult::Conflict);
+                }
+                self.wal.check_conditional_mutation_ready()?;
+                match action {
+                    ConditionalAction::Keep => Ok(ConditionalResult::Unchanged),
+                    ConditionalAction::Put(value) => {
+                        if entry.get() == &value {
+                            return Ok(ConditionalResult::Unchanged);
+                        }
+                        let (_, value) =
+                            self.wal.try_store_put_event(entry.key().clone(), value)?;
+                        *entry.get_mut() = value;
+                        Ok(ConditionalResult::Applied)
+                    }
+                    ConditionalAction::Delete => {
+                        self.wal.try_store_delete_event(entry.key())?;
+                        entry.remove();
+                        Ok(ConditionalResult::Applied)
+                    }
+                }
+            }
+            Entry::Vacant(entry) => {
+                if expected.is_some() {
+                    return Ok(ConditionalResult::Conflict);
+                }
+                self.wal.check_conditional_mutation_ready()?;
+                match action {
+                    ConditionalAction::Keep => Ok(ConditionalResult::Unchanged),
+                    ConditionalAction::Put(value) => {
+                        let (_, value) =
+                            self.wal.try_store_put_event(entry.key().clone(), value)?;
+                        entry.insert(value);
+                        Ok(ConditionalResult::Applied)
+                    }
+                    ConditionalAction::Delete => Ok(ConditionalResult::Unchanged),
+                }
+            }
+        }
+    }
+
     /// Atomically checks and replaces 1..=16 distinct keys.
     ///
     /// None expectations require absence; Some(empty) requires an existing empty value.
@@ -1033,6 +1103,10 @@ mod mutation_ordering_tests;
 #[cfg(test)]
 #[path = "atomic_kv_tests.rs"]
 mod atomic_kv_tests;
+
+#[cfg(test)]
+#[path = "conditional_key_tests.rs"]
+mod conditional_key_tests;
 
 mod tests {
     #[test]
